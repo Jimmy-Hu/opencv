@@ -13,7 +13,7 @@ using namespace cv;
 /**
  * @function main
  */
-int main ( int, char** argv )
+int main ( int argc, char** argv )
 {
   /// Declare variables
   Mat src, dst;
@@ -25,10 +25,13 @@ int main ( int, char** argv )
   int kernel_size;
   const char* window_name = "filter2D Demo";
 
-  int c;
-
   //![load]
-  src = imread( argv[1], IMREAD_COLOR ); // Load an image
+  String imageName("../data/lena.jpg"); // by default
+  if (argc > 1)
+  {
+    imageName = argv[1];
+  }
+  src = imread( imageName, IMREAD_COLOR ); // Load an image
 
   if( src.empty() )
     { return -1; }
@@ -45,9 +48,9 @@ int main ( int, char** argv )
   int ind = 0;
   for(;;)
        {
-         c = waitKey(500);
+         char c = (char)waitKey(500);
          /// Press 'ESC' to exit the program
-         if( (char)c == 27 )
+         if( c == 27 )
            { break; }
 
          //![update_kernel]

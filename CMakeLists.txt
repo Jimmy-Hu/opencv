@@ -6,12 +6,19 @@
 #
 # ----------------------------------------------------------------------------
 
+# Disable in-source builds to prevent source tree corruption.
+if(" ${CMAKE_SOURCE_DIR}" STREQUAL " ${CMAKE_BINARY_DIR}")
+  message(FATAL_ERROR "
+FATAL: In-source builds are not allowed.
+       You should create separate directory for build files.
+")
+endif()
 
 
 include(cmake/OpenCVMinDepVersions.cmake)
 
 if(CMAKE_GENERATOR MATCHES Xcode AND XCODE_VERSION VERSION_GREATER 4.3)
-  cmake_minimum_required(VERSION 2.8.8 FATAL_ERROR)
+  cmake_minimum_required(VERSION 3.0 FATAL_ERROR)
 elseif(CMAKE_SYSTEM_NAME MATCHES WindowsPhone OR CMAKE_SYSTEM_NAME MATCHES WindowsStore)
   cmake_minimum_required(VERSION 3.1 FATAL_ERROR)
   #Required to resolve linker error issues due to incompatibility with CMake v3.0+ policies.
@@ -22,22 +29,24 @@ else()
   cmake_minimum_required(VERSION "${MIN_VER_CMAKE}" FATAL_ERROR)
 endif()
 
-# Following block can broke build in case of cross-compilng
+# Following block can break build in case of cross-compilng
 # but CMAKE_CROSSCOMPILING variable will be set only on project(OpenCV) command
-# so we will try to detect crosscompiling by presense of CMAKE_TOOLCHAIN_FILE
-if(NOT CMAKE_TOOLCHAIN_FILE)
-  # it _must_ go before project(OpenCV) in order to work
-  if(WIN32)
+# so we will try to detect cross-compiling by presense of CMAKE_TOOLCHAIN_FILE
+if(NOT DEFINED CMAKE_INSTALL_PREFIX)
+  if(NOT CMAKE_TOOLCHAIN_FILE)
+    # it _must_ go before project(OpenCV) in order to work
+    if(WIN32)
+      set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "Installation Directory")
+    else()
+      set(CMAKE_INSTALL_PREFIX "/usr/local" CACHE PATH "Installation Directory")
+    endif()
+  else(NOT CMAKE_TOOLCHAIN_FILE)
+    #Android: set output folder to ${CMAKE_BINARY_DIR}
+    set( LIBRARY_OUTPUT_PATH_ROOT ${CMAKE_BINARY_DIR} CACHE PATH "root for library output, set this to change where android libs are compiled to" )
+    # any cross-compiling
     set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "Installation Directory")
-  else()
-    set(CMAKE_INSTALL_PREFIX "/usr/local" CACHE PATH "Installation Directory")
-  endif()
-else(NOT CMAKE_TOOLCHAIN_FILE)
-  #Android: set output folder to ${CMAKE_BINARY_DIR}
-  set( LIBRARY_OUTPUT_PATH_ROOT ${CMAKE_BINARY_DIR} CACHE PATH "root for library output, set this to change where android libs are compiled to" )
-  # any crosscompiling
-  set(CMAKE_INSTALL_PREFIX "${CMAKE_BINARY_DIR}/install" CACHE PATH "Installation Directory")
-endif(NOT CMAKE_TOOLCHAIN_FILE)
+  endif(NOT CMAKE_TOOLCHAIN_FILE)
+endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES WindowsPhone OR CMAKE_SYSTEM_NAME MATCHES WindowsStore)
   set(WINRT TRUE)
@@ -76,6 +85,10 @@ if(POLICY CMP0022)
   cmake_policy(SET CMP0022 OLD)
 endif()
 
+if(POLICY CMP0023)
+  cmake_policy(SET CMP0023 NEW)
+endif()
+
 if(POLICY CMP0026)
   # silence cmake 3.0+ warnings about reading LOCATION attribute
   cmake_policy(SET CMP0026 OLD)
@@ -83,6 +96,22 @@ endif()
 
 if(POLICY CMP0042)
   cmake_policy(SET CMP0042 NEW)
+endif()
+
+if(POLICY CMP0046)
+  cmake_policy(SET CMP0046 OLD)
+endif()
+
+if(POLICY CMP0051)
+  cmake_policy(SET CMP0051 NEW)
+endif()
+
+if(POLICY CMP0056)
+  cmake_policy(SET CMP0056 NEW)
+endif()
+
+if(POLICY CMP0067)
+  cmake_policy(SET CMP0067 NEW)
 endif()
 
 include(cmake/OpenCVUtils.cmake)
@@ -105,17 +134,20 @@ ocv_cmake_eval(DEBUG_PRE ONCE)
 
 ocv_clear_vars(OpenCVModules_TARGETS)
 
+include(cmake/OpenCVDownload.cmake)
+
 # ----------------------------------------------------------------------------
 # Break in case of popular CMake configuration mistakes
 # ----------------------------------------------------------------------------
 if(NOT CMAKE_SIZEOF_VOID_P GREATER 0)
   message(FATAL_ERROR "CMake fails to deterimine the bitness of target platform.
-  Please check your CMake and compiler installation. If you are crosscompiling then ensure that your CMake toolchain file correctly sets the compiler details.")
+  Please check your CMake and compiler installation. If you are cross-compiling then ensure that your CMake toolchain file correctly sets the compiler details.")
 endif()
 
 # ----------------------------------------------------------------------------
 # Detect compiler and target platform architecture
 # ----------------------------------------------------------------------------
+OCV_OPTION(ENABLE_CXX11 "Enable C++11 compilation mode" "${OPENCV_CXX11}")
 include(cmake/OpenCVDetectCXXCompiler.cmake)
 
 # Add these standard paths to the search paths for FIND_LIBRARY
@@ -172,6 +204,7 @@ OCV_OPTION(WITH_1394           "Include IEEE1394 support"                    ON 
 OCV_OPTION(WITH_AVFOUNDATION   "Use AVFoundation for Video I/O (iOS/Mac)"    ON   IF APPLE)
 OCV_OPTION(WITH_CARBON         "Use Carbon for UI instead of Cocoa"          OFF  IF APPLE )
 OCV_OPTION(WITH_CAROTENE       "Use NVidia carotene acceleration library for ARM platform"                   ON  IF (ARM OR AARCH64) AND NOT IOS AND NOT (CMAKE_VERSION VERSION_LESS "2.8.11"))
+OCV_OPTION(WITH_CPUFEATURES    "Use cpufeatures Android library"             ON   IF ANDROID)
 OCV_OPTION(WITH_VTK            "Include VTK library support (and build opencv_viz module eiher)"             ON  IF (NOT ANDROID AND NOT IOS AND NOT WINRT AND NOT CMAKE_CROSSCOMPILING) )
 OCV_OPTION(WITH_CUDA           "Include NVidia Cuda Runtime support"                                         ON  IF (NOT IOS AND NOT WINRT) )
 OCV_OPTION(WITH_CUFFT          "Include NVidia Cuda Fast Fourier Transform (FFT) library support"            ON  IF (NOT IOS AND NOT WINRT) )
@@ -185,9 +218,10 @@ OCV_OPTION(WITH_GSTREAMER_0_10 "Enable Gstreamer 0.10 support (instead of 1.x)" 
 OCV_OPTION(WITH_GTK            "Include GTK support"                         ON   IF (UNIX AND NOT APPLE AND NOT ANDROID) )
 OCV_OPTION(WITH_GTK_2_X        "Use GTK version 2"                           OFF  IF (UNIX AND NOT APPLE AND NOT ANDROID) )
 OCV_OPTION(WITH_IPP            "Include Intel IPP support"                   NOT MINGW IF (X86_64 OR X86) AND NOT WINRT )
+OCV_OPTION(WITH_HALIDE         "Include Halide support"                      OFF)
 OCV_OPTION(WITH_JASPER         "Include JPEG2K support"                      ON   IF (NOT IOS) )
 OCV_OPTION(WITH_JPEG           "Include JPEG support"                        ON)
-OCV_OPTION(WITH_WEBP           "Include WebP support"                        ON   IF (NOT IOS AND NOT WINRT) )
+OCV_OPTION(WITH_WEBP           "Include WebP support"                        ON   IF (NOT WINRT) )
 OCV_OPTION(WITH_OPENEXR        "Include ILM support via OpenEXR"             ON   IF (NOT IOS AND NOT WINRT) )
 OCV_OPTION(WITH_OPENGL         "Include OpenGL support"                      OFF  IF (NOT ANDROID AND NOT WINRT) )
 OCV_OPTION(WITH_OPENVX         "Include OpenVX support"                      OFF)
@@ -225,9 +259,11 @@ OCV_OPTION(WITH_IPP_A          "Include Intel IPP_A support"                 OFF
 OCV_OPTION(WITH_MATLAB         "Include Matlab support"                      ON   IF (NOT ANDROID AND NOT IOS AND NOT WINRT))
 OCV_OPTION(WITH_VA             "Include VA support"                          OFF  IF (UNIX AND NOT ANDROID) )
 OCV_OPTION(WITH_VA_INTEL       "Include Intel VA-API/OpenCL support"         OFF  IF (UNIX AND NOT ANDROID) )
+OCV_OPTION(WITH_MFX            "Include Intel Media SDK support"             OFF   IF (UNIX AND NOT ANDROID) )
 OCV_OPTION(WITH_GDAL           "Include GDAL Support"                        OFF  IF (NOT ANDROID AND NOT IOS AND NOT WINRT) )
 OCV_OPTION(WITH_GPHOTO2        "Include gPhoto2 library support"             ON   IF (UNIX AND NOT ANDROID) )
-OCV_OPTION(WITH_LAPACK         "Include Lapack library support"              ON   IF (NOT ANDROID) )
+OCV_OPTION(WITH_LAPACK         "Include Lapack library support"              ON   IF (NOT ANDROID AND NOT IOS) )
+OCV_OPTION(WITH_ITT            "Include Intel ITT support"                   ON   IF (NOT APPLE_FRAMEWORK) )
 
 # OpenCV build components
 # ===================================================
@@ -254,6 +290,8 @@ OCV_OPTION(BUILD_JPEG               "Build libjpeg from source"          WIN32 O
 OCV_OPTION(BUILD_PNG                "Build libpng from source"           WIN32 OR ANDROID OR APPLE )
 OCV_OPTION(BUILD_OPENEXR            "Build openexr from source"          (WIN32 OR ANDROID OR APPLE) AND NOT WINRT)
 OCV_OPTION(BUILD_TBB                "Download and build TBB from source" ANDROID )
+OCV_OPTION(BUILD_IPP_IW             "Build IPP IW from source"           NOT MINGW IF (X86_64 OR X86) AND NOT WINRT )
+OCV_OPTION(BUILD_ITT                "Build Intel ITT from source"        NOT MINGW IF (X86_64 OR X86) AND NOT WINRT AND NOT APPLE_FRAMEWORK )
 
 # OpenCV installation options
 # ===================================================
@@ -274,26 +312,19 @@ OCV_OPTION(ENABLE_COVERAGE            "Enable coverage collection with  GCov"   
 OCV_OPTION(ENABLE_OMIT_FRAME_POINTER  "Enable -fomit-frame-pointer for GCC"                      ON   IF CMAKE_COMPILER_IS_GNUCXX AND NOT (APPLE AND CMAKE_COMPILER_IS_CLANGCXX) )
 OCV_OPTION(ENABLE_POWERPC             "Enable PowerPC for GCC"                                   ON   IF (CMAKE_COMPILER_IS_GNUCXX AND CMAKE_SYSTEM_PROCESSOR MATCHES powerpc.*) )
 OCV_OPTION(ENABLE_FAST_MATH           "Enable -ffast-math (not recommended for GCC 4.6.x)"       OFF  IF (CMAKE_COMPILER_IS_GNUCXX AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_SSE                 "Enable SSE instructions"                                  ON   IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_SSE2                "Enable SSE2 instructions"                                 ON   IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_SSE3                "Enable SSE3 instructions"                                 ON   IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX OR CV_ICC) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_SSSE3               "Enable SSSE3 instructions"                                OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_SSE41               "Enable SSE4.1 instructions"                               OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX OR CV_ICC) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_SSE42               "Enable SSE4.2 instructions"                               OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_POPCNT              "Enable POPCNT instructions"                               OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_AVX                 "Enable AVX instructions"                                  OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_AVX2                "Enable AVX2 instructions"                                 OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_FMA3                "Enable FMA3 instructions"                                 OFF  IF ((MSVC OR CMAKE_COMPILER_IS_GNUCXX) AND (X86 OR X86_64)) )
-OCV_OPTION(ENABLE_NEON                "Enable NEON instructions"                                 "${NEON}" IF CMAKE_COMPILER_IS_GNUCXX AND (ARM OR AARCH64 OR IOS) )
+OCV_OPTION(ENABLE_NEON                "Enable NEON instructions"                                 (NEON OR ANDROID_ARM_NEON OR AARCH64) IF CMAKE_COMPILER_IS_GNUCXX AND (ARM OR AARCH64 OR IOS) )
 OCV_OPTION(ENABLE_VFPV3               "Enable VFPv3-D32 instructions"                            OFF  IF CMAKE_COMPILER_IS_GNUCXX AND (ARM OR AARCH64 OR IOS) )
 OCV_OPTION(ENABLE_NOISY_WARNINGS      "Show all warnings even if they are too noisy"             OFF )
 OCV_OPTION(OPENCV_WARNINGS_ARE_ERRORS "Treat warnings as errors"                                 OFF )
 OCV_OPTION(ANDROID_EXAMPLES_WITH_LIBS "Build binaries of Android examples with native libraries" OFF  IF ANDROID )
 OCV_OPTION(ENABLE_IMPL_COLLECTION     "Collect implementation data on function call"             OFF )
 OCV_OPTION(ENABLE_INSTRUMENTATION     "Instrument functions to collect calls trace and performance" OFF )
+OCV_OPTION(ENABLE_GNU_STL_DEBUG       "Enable GNU STL Debug mode (defines _GLIBCXX_DEBUG)"       OFF IF ((NOT CMAKE_VERSION VERSION_LESS "2.8.11") AND CMAKE_COMPILER_IS_GNUCXX) )
+OCV_OPTION(ENABLE_BUILD_HARDENING     "Enable hardening of the resulting binaries (against security attacks, detects memory corruption, etc)" OFF)
 OCV_OPTION(GENERATE_ABI_DESCRIPTOR    "Generate XML file for abi_compliance_checker tool" OFF IF UNIX)
-
-OCV_OPTION(DOWNLOAD_EXTERNAL_TEST_DATA "Download external test data (Python executable and OPENCV_TEST_DATA_PATH environment variable may be required)" OFF )
+OCV_OPTION(CV_ENABLE_INTRINSICS       "Use intrinsic-based optimized code" ON )
+OCV_OPTION(CV_DISABLE_OPTIMIZATION    "Disable explicit optimized code (dispatched code/intrinsics/loop unrolling/etc)" OFF )
+OCV_OPTION(CV_TRACE                   "Enable OpenCV code trace" ON)
 
 
 if(ENABLE_IMPL_COLLECTION)
@@ -492,6 +523,9 @@ if(CMAKE_GENERATOR MATCHES "Makefiles|Ninja" AND "${CMAKE_BUILD_TYPE}" STREQUAL 
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
+# --- Python Support ---
+include(cmake/OpenCVDetectPython.cmake)
+
 include(cmake/OpenCVCompilerOptions.cmake)
 
 
@@ -512,9 +546,12 @@ endif(WIN32 AND NOT MINGW)
 #       CHECK FOR SYSTEM LIBRARIES, OPTIONS, ETC..
 # ----------------------------------------------------------------------------
 if(UNIX)
-  find_package(PkgConfig QUIET)
+  if(NOT APPLE_FRAMEWORK)
+    find_package(PkgConfig QUIET)
+  endif()
   include(CheckFunctionExists)
   include(CheckIncludeFile)
+  include(CheckSymbolExists)
 
   if(NOT APPLE)
     CHECK_INCLUDE_FILE(pthread.h HAVE_LIBPTHREAD)
@@ -529,6 +566,12 @@ if(UNIX)
     endif()
   else()
     set(HAVE_LIBPTHREAD YES)
+  endif()
+
+  CHECK_SYMBOL_EXISTS(posix_memalign stdlib.h HAVE_POSIX_MEMALIGN)
+  CHECK_INCLUDE_FILE(malloc.h HAVE_MALLOC_H)
+  if(HAVE_MALLOC_H)
+    CHECK_SYMBOL_EXISTS(memalign malloc.h HAVE_MEMALIGN)
   endif()
 endif()
 
@@ -552,10 +595,16 @@ endif()
 #  Detect 3rd-party libraries
 # ----------------------------------------------------------------------------
 
+if(ANDROID AND WITH_CPUFEATURES)
+  add_subdirectory(3rdparty/cpufeatures)
+  set(HAVE_CPUFEATURES 1)
+endif()
+
 include(cmake/OpenCVFindLibsGrfmt.cmake)
 include(cmake/OpenCVFindLibsGUI.cmake)
 include(cmake/OpenCVFindLibsVideo.cmake)
 include(cmake/OpenCVFindLibsPerf.cmake)
+include(cmake/OpenCVFindLAPACK.cmake)
 
 # ----------------------------------------------------------------------------
 #  Detect other 3rd-party libraries/tools
@@ -567,9 +616,6 @@ if(BUILD_DOCS)
 else()
   unset(DOXYGEN_FOUND CACHE)
 endif()
-
-# --- Python Support ---
-include(cmake/OpenCVDetectPython.cmake)
 
 # --- Java Support ---
 include(cmake/OpenCVDetectApacheAnt.cmake)
@@ -592,6 +638,11 @@ endif()
 # --- OpenCL ---
 if(WITH_OPENCL)
   include(cmake/OpenCVDetectOpenCL.cmake)
+endif()
+
+# --- Halide ---
+if(WITH_HALIDE)
+  include(cmake/OpenCVDetectHalide.cmake)
 endif()
 
 # --- DirectX ---
@@ -682,9 +733,23 @@ if(HAVE_CUDA)
     set(OPENCV_LINKER_LIBS ${OPENCV_LINKER_LIBS} ${CUDA_cufft_LIBRARY})
   endif()
   foreach(p ${CUDA_LIBS_PATH})
-    set(OPENCV_LINKER_LIBS ${OPENCV_LINKER_LIBS} ${CMAKE_LIBRARY_PATH_FLAG}${p})
+    if(MSVC AND CMAKE_GENERATOR MATCHES "Ninja|JOM")
+      set(OPENCV_LINKER_LIBS ${OPENCV_LINKER_LIBS} ${CMAKE_LIBRARY_PATH_FLAG}"${p}")
+    else()
+      set(OPENCV_LINKER_LIBS ${OPENCV_LINKER_LIBS} ${CMAKE_LIBRARY_PATH_FLAG}${p})
+    endif()
   endforeach()
 endif()
+
+
+# ----------------------------------------------------------------------------
+# Code trace support
+# ----------------------------------------------------------------------------
+if(CV_TRACE)
+  include(cmake/OpenCVDetectTrace.cmake)
+endif()
+
+
 # ----------------------------------------------------------------------------
 # Solution folders:
 # ----------------------------------------------------------------------------
@@ -735,7 +800,9 @@ endif()
 include(cmake/OpenCVGenHeaders.cmake)
 
 # Generate opencv.pc for pkg-config command
-include(cmake/OpenCVGenPkgconfig.cmake)
+if(NOT OPENCV_SKIP_PKGCONFIG_GENERATION)
+  include(cmake/OpenCVGenPkgconfig.cmake)
+endif()
 
 # Generate OpenCV.mk for ndk-build (Android build tool)
 include(cmake/OpenCVGenAndroidMK.cmake)
@@ -859,6 +926,33 @@ if(NOT CMAKE_GENERATOR MATCHES "Xcode|Visual Studio")
   status("    Configuration:"  ${CMAKE_BUILD_TYPE})
 endif()
 
+
+# ========================= CPU code generation mode =========================
+status("")
+status("  CPU/HW features:")
+status("    Baseline:"  "${CPU_BASELINE_FINAL}")
+if(NOT CPU_BASELINE STREQUAL CPU_BASELINE_FINAL)
+  status("      requested:"  "${CPU_BASELINE}")
+endif()
+if(CPU_BASELINE_REQUIRE)
+  status("      required:"  "${CPU_BASELINE_REQUIRE}")
+endif()
+if(CPU_BASELINE_DISABLE)
+  status("      disabled:"  "${CPU_BASELINE_DISABLE}")
+endif()
+if(CPU_DISPATCH_FINAL OR CPU_DISPATCH)
+  status("    Dispatched code generation:"  "${CPU_DISPATCH_FINAL}")
+  if(NOT CPU_DISPATCH STREQUAL CPU_DISPATCH_FINAL)
+    status("      requested:"  "${CPU_DISPATCH}")
+  endif()
+  if(CPU_DISPATCH_REQUIRE)
+    status("      required:"  "${CPU_DISPATCH_REQUIRE}")
+  endif()
+  foreach(OPT ${CPU_DISPATCH_FINAL})
+    status("      ${OPT} (${CPU_${OPT}_USAGE_COUNT} files):"  "+ ${CPU_DISPATCH_${OPT}_INCLUDED}")
+  endforeach()
+endif()
+
 # ========================== C/C++ options ==========================
 if(CMAKE_CXX_COMPILER_VERSION)
   set(OPENCV_COMPILER_STR "${CMAKE_CXX_COMPILER} ${CMAKE_CXX_COMPILER_ARG1} (ver ${CMAKE_CXX_COMPILER_VERSION})")
@@ -874,6 +968,9 @@ string(STRIP "${OPENCV_COMPILER_STR}" OPENCV_COMPILER_STR)
 status("")
 status("  C/C++:")
 status("    Built as dynamic libs?:" BUILD_SHARED_LIBS THEN YES ELSE NO)
+if(ENABLE_CXX11 OR HAVE_CXX11)
+status("    C++11:" HAVE_CXX11 THEN YES ELSE NO)
+endif()
 status("    C++ Compiler:"           ${OPENCV_COMPILER_STR})
 status("    C++ flags (Release):"    ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_RELEASE})
 status("    C++ flags (Debug):"      ${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_DEBUG})
@@ -1070,7 +1167,7 @@ endif(DEFINED WITH_1394)
 
 if(DEFINED WITH_FFMPEG OR HAVE_FFMPEG)
   if(WIN32)
-    status("    FFMPEG:"       WITH_FFMPEG         THEN "YES (prebuilt binaries)"                  ELSE NO)
+    status("    FFMPEG:"       HAVE_FFMPEG         THEN "YES (prebuilt binaries)"                  ELSE NO)
   else()
     status("    FFMPEG:"       HAVE_FFMPEG         THEN YES ELSE NO)
   endif()
@@ -1169,6 +1266,10 @@ if(DEFINED WITH_INTELPERC)
   status("    Intel PerC:"     HAVE_INTELPERC      THEN "YES"                                 ELSE NO)
 endif(DEFINED WITH_INTELPERC)
 
+if(DEFINED WITH_MFX)
+  status("    Intel Media SDK:" HAVE_MFX      THEN "YES (${MFX_LIBRARY})" ELSE NO)
+endif()
+
 if(DEFINED WITH_GPHOTO2)
   status("    gPhoto2:"        HAVE_GPHOTO2        THEN "YES"                                 ELSE NO)
 endif(DEFINED WITH_GPHOTO2)
@@ -1194,23 +1295,41 @@ endif()
 status("")
 status("  Parallel framework:" TRUE THEN "${CV_PARALLEL_FRAMEWORK}" ELSE NO)
 
+if(CV_TRACE OR OPENCV_TRACE)
+  set(__msg "")
+  if(HAVE_ITT)
+    set(__msg "with Intel ITT")
+  endif()
+  status("")
+  status("  Trace: " OPENCV_TRACE THEN "YES (${__msg})" ELSE NO)
+endif()
 
 # ========================== Other third-party libraries ==========================
 status("")
 status("  Other third-party libraries:")
 
 if(WITH_IPP AND HAVE_IPP)
-  status("    Use IPP:" "${IPP_VERSION_STR} [${IPP_VERSION_MAJOR}.${IPP_VERSION_MINOR}.${IPP_VERSION_BUILD}]")
-  status("         at:" "${IPP_ROOT_DIR}")
+  status("    Use Intel IPP:" "${IPP_VERSION_STR} [${IPP_VERSION_MAJOR}.${IPP_VERSION_MINOR}.${IPP_VERSION_BUILD}]")
+  status("               at:" "${IPP_ROOT_DIR}")
   if(NOT HAVE_IPP_ICV_ONLY)
-    status("     linked:" BUILD_WITH_DYNAMIC_IPP THEN "dynamic" ELSE "static")
+    status("           linked:" BUILD_WITH_DYNAMIC_IPP THEN "dynamic" ELSE "static")
+  endif()
+  if(HAVE_IPP_IW)
+    if(BUILD_IPP_IW)
+      status("    Use Intel IPP IW:" "build (${IW_VERSION_MAJOR}.${IW_VERSION_MINOR}.${IW_VERSION_UPDATE})")
+    else()
+      status("    Use Intel IPP IW:" "prebuilt binaries (${IW_VERSION_MAJOR}.${IW_VERSION_MINOR}.${IW_VERSION_UPDATE})")
+    endif()
+  else()
+    status("    Use Intel IPP IW:"   NO)
   endif()
 else()
-  status("    Use IPP:"   WITH_IPP AND NOT HAVE_IPP THEN "IPP not found or implicitly disabled" ELSE NO)
+  status("    Use Intel IPP:"      WITH_IPP AND NOT HAVE_IPP THEN "IPP not found or implicitly disabled" ELSE NO)
+  status("    Use Intel IPP IW:"   WITH_IPP AND NOT HAVE_IPP AND HAVE_IPP_IW THEN "IPP not found or implicitly disabled" ELSE NO)
 endif()
 
 if(DEFINED WITH_IPP_A)
-status("    Use IPP Async:"  HAVE_IPP_A       THEN "YES" ELSE NO)
+status("    Use Intel IPP Async:"  HAVE_IPP_A       THEN "YES" ELSE NO)
 endif(DEFINED WITH_IPP_A)
 
 if(DEFINED WITH_VA)
@@ -1222,12 +1341,15 @@ status("    Use Intel VA-API/OpenCL:"  HAVE_VA_INTEL       THEN "YES (MSDK: ${VA
 endif(DEFINED WITH_VA_INTEL)
 
 if(DEFINED WITH_LAPACK)
-status("    Use Lapack:"      HAVE_LAPACK     THEN "YES" ELSE NO)
+status("    Use Lapack:"      HAVE_LAPACK     THEN "YES (${LAPACK_LIBRARIES})" ELSE NO)
 endif(DEFINED WITH_LAPACK)
 
 status("    Use Eigen:"      HAVE_EIGEN       THEN "YES (ver ${EIGEN_WORLD_VERSION}.${EIGEN_MAJOR_VERSION}.${EIGEN_MINOR_VERSION})" ELSE NO)
 status("    Use Cuda:"       HAVE_CUDA        THEN "YES (ver ${CUDA_VERSION_STRING})" ELSE NO)
 status("    Use OpenCL:"     HAVE_OPENCL      THEN YES ELSE NO)
+if(WITH_HALIDE OR HAVE_HALIDE)
+status("    Use Halide:"     HAVE_HALIDE      THEN "YES (${HALIDE_LIBRARIES} ${HALIDE_INCLUDE_DIRS})" ELSE NO)
+endif()
 status("    Use OpenVX:"     HAVE_OPENVX      THEN "YES (${OPENVX_LIBRARIES})" ELSE "NO")
 status("    Use custom HAL:" OpenCV_USED_HAL  THEN "YES (${OpenCV_USED_HAL})" ELSE "NO")
 
@@ -1347,13 +1469,6 @@ status("-----------------------------------------------------------------")
 status("")
 
 ocv_finalize_status()
-
-# ----------------------------------------------------------------------------
-# Warn in the case of in-source build
-# ----------------------------------------------------------------------------
-if("${CMAKE_CURRENT_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_BINARY_DIR}")
-  message(WARNING "The source directory is the same as binary directory. \"make clean\" may damage the source tree")
-endif()
 
 # ----------------------------------------------------------------------------
 # CPack stuff

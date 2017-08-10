@@ -30,10 +30,15 @@ void Threshold_Demo( int, void* );
 /**
  * @function main
  */
-int main( int, char** argv )
+int main( int argc, char** argv )
 {
   //! [load]
-  src = imread( argv[1], IMREAD_COLOR ); // Load an image
+  String imageName("../data/stuff.jpg"); // by default
+  if (argc > 1)
+  {
+      imageName = argv[1];
+  }
+  src = imread( imageName, IMREAD_COLOR ); // Load an image
 
   if( src.empty() )
     { return -1; }
@@ -60,9 +65,8 @@ int main( int, char** argv )
   /// Wait until user finishes program
   for(;;)
     {
-      int c;
-      c = waitKey( 20 );
-      if( (char)c == 27 )
+      char c = (char)waitKey( 20 );
+      if( c == 27 )
     { break; }
     }
 

@@ -1306,7 +1306,8 @@ void CV_ProjectPointsTest_C::project( const Mat& opoints, const Mat& rvec, const
     dpdf.create(npoints*2, 2, CV_64F);
     dpdc.create(npoints*2, 2, CV_64F);
     dpddist.create(npoints*2, distCoeffs.rows + distCoeffs.cols - 1, CV_64F);
-    CvMat _objectPoints = opoints, _imagePoints = Mat(ipoints);
+    Mat imagePoints(ipoints);
+    CvMat _objectPoints = opoints, _imagePoints = imagePoints;
     CvMat _rvec = rvec, _tvec = tvec, _cameraMatrix = cameraMatrix, _distCoeffs = distCoeffs;
     CvMat _dpdrot = dpdrot, _dpdt = dpdt, _dpdf = dpdf, _dpdc = dpdc, _dpddist = dpddist;
 
@@ -1569,7 +1570,8 @@ void CV_StereoCalibrationTest::run( int )
         {
             ts->printf( cvtest::TS::LOG, "The file %s can not be opened or has invalid content\n", filepath.c_str() );
             ts->set_failed_test_info( f ? cvtest::TS::FAIL_INVALID_TEST_DATA : cvtest::TS::FAIL_MISSING_TEST_DATA );
-            fclose(f);
+            if (f)
+                fclose(f);
             return;
         }
 

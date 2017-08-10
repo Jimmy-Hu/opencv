@@ -40,6 +40,8 @@
 //M*/
 #include "precomp.hpp"
 
+#include <stdint.h>
+
 namespace cv
 {
 
@@ -109,14 +111,14 @@ bool clipLine( Size2l img_size, Point2l& pt1, Point2l& pt2 )
         if( c1 & 12 )
         {
             a = c1 < 8 ? 0 : bottom;
-            x1 +=  (a - y1) * (x2 - x1) / (y2 - y1);
+            x1 += (int64)((double)(a - y1) * (x2 - x1) / (y2 - y1));
             y1 = a;
             c1 = (x1 < 0) + (x1 > right) * 2;
         }
         if( c2 & 12 )
         {
             a = c2 < 8 ? 0 : bottom;
-            x2 += (a - y2) * (x2 - x1) / (y2 - y1);
+            x2 += (int64)((double)(a - y2) * (x2 - x1) / (y2 - y1));
             y2 = a;
             c2 = (x2 < 0) + (x2 > right) * 2;
         }
@@ -125,14 +127,14 @@ bool clipLine( Size2l img_size, Point2l& pt1, Point2l& pt2 )
             if( c1 )
             {
                 a = c1 == 1 ? 0 : right;
-                y1 += (a - x1) * (y2 - y1) / (x2 - x1);
+                y1 += (int64)((double)(a - x1) * (y2 - y1) / (x2 - x1));
                 x1 = a;
                 c1 = 0;
             }
             if( c2 )
             {
                 a = c2 == 1 ? 0 : right;
-                y2 += (a - x2) * (y2 - y1) / (x2 - x1);
+                y2 += (int64)((double)(a - x2) * (y2 - y1) / (x2 - x1));
                 x2 = a;
                 c2 = 0;
             }
@@ -176,6 +178,9 @@ LineIterator::LineIterator(const Mat& img, Point pt1, Point pt2,
         {
             ptr = img.data;
             err = plusDelta = minusDelta = plusStep = minusStep = count = 0;
+            ptr0 = 0;
+            step = 0;
+            elemSize = 0;
             return;
         }
     }
@@ -309,7 +314,7 @@ LineAA( Mat& img, Point2l pt1, Point2l pt2, const void* color )
 
     if( !((nch == 1 || nch == 3 || nch == 4) && img.depth() == CV_8U) )
     {
-        Line(img, Point((int)(pt1.x<<XY_SHIFT), (int)(pt1.y<<XY_SHIFT)), Point((int)(pt2.x<<XY_SHIFT), (int)(pt2.y<<XY_SHIFT)), color);
+        Line(img, Point((int)(pt1.x>>XY_SHIFT), (int)(pt1.y>>XY_SHIFT)), Point((int)(pt2.x>>XY_SHIFT), (int)(pt2.y>>XY_SHIFT)), color);
         return;
     }
 
@@ -1069,22 +1074,36 @@ EllipseEx( Mat& img, Point2l center, Size2l axes,
 *                                Polygons filling                                        *
 \****************************************************************************************/
 
-/* helper macros: filling horizontal row */
-#define ICV_HLINE( ptr, xl, xr, color, pix_size )            \
-{                                                            \
-    uchar* hline_ptr = (uchar*)(ptr) + (xl)*(pix_size);      \
-    uchar* hline_max_ptr = (uchar*)(ptr) + (xr)*(pix_size);  \
-                                                             \
-    for( ; hline_ptr <= hline_max_ptr; hline_ptr += (pix_size))\
-    {                                                        \
-        int hline_j;                                         \
-        for( hline_j = 0; hline_j < (pix_size); hline_j++ )  \
-        {                                                    \
-            hline_ptr[hline_j] = ((uchar*)color)[hline_j];   \
-        }                                                    \
-    }                                                        \
+static inline void ICV_HLINE_X(uchar* ptr, int xl, int xr, const uchar* color, int pix_size)
+{
+    uchar* hline_min_ptr = (uchar*)(ptr) + (xl)*(pix_size);
+    uchar* hline_end_ptr = (uchar*)(ptr) + (xr+1)*(pix_size);
+    uchar* hline_ptr = hline_min_ptr;
+    if (pix_size == 1)
+      memset(hline_min_ptr, *color, hline_end_ptr-hline_min_ptr);
+    else//if (pix_size != 1)
+    {
+      if (hline_min_ptr < hline_end_ptr)
+      {
+        memcpy(hline_ptr, color, pix_size);
+        hline_ptr += pix_size;
+      }//end if (hline_min_ptr < hline_end_ptr)
+      size_t sizeToCopy = pix_size;
+      while(hline_ptr < hline_end_ptr)
+      {
+        memcpy(hline_ptr, hline_min_ptr, sizeToCopy);
+        hline_ptr += sizeToCopy;
+        sizeToCopy = std::min(2*sizeToCopy, static_cast<size_t>(hline_end_ptr-hline_ptr));
+      }//end while(hline_ptr < hline_end_ptr)
+    }//end if (pix_size != 1)
 }
+//end ICV_HLINE_X()
 
+static inline void ICV_HLINE(uchar* ptr, int xl, int xr, const void* color, int pix_size)
+{
+  ICV_HLINE_X(ptr, xl, xr, reinterpret_cast<const uchar*>(color), pix_size);
+}
+//end ICV_HLINE()
 
 /* filling convex polygon. v - array of vertices, ntps - number of points */
 static void
@@ -1099,7 +1118,7 @@ FillConvexPoly( Mat& img, const Point2l* v, int npts, const void* color, int lin
     edge[2];
 
     int delta = 1 << shift >> 1;
-    int i, y, imin = 0, left = 0, right = 1;
+    int i, y, imin = 0;
     int edges = npts;
     int64 xmin, xmax, ymin, ymax;
     uchar* ptr = img.ptr();
@@ -1171,6 +1190,9 @@ FillConvexPoly( Mat& img, const Point2l* v, int npts, const void* color, int lin
     edge[0].di = 1;
     edge[1].di = npts - 1;
 
+    edge[0].x = edge[1].x = -XY_ONE;
+    edge[0].dx = edge[1].dx = 0;
+
     ptr += img.step*y;
 
     do
@@ -1181,44 +1203,49 @@ FillConvexPoly( Mat& img, const Point2l* v, int npts, const void* color, int lin
             {
                 if( y >= edge[i].ye )
                 {
-                    int idx = edge[i].idx, di = edge[i].di;
-                    int64 xs = 0, xe;
+                    int idx0 = edge[i].idx, di = edge[i].di;
+                    int idx = idx0 + di;
+                    if (idx >= npts) idx -= npts;
                     int ty = 0;
 
-                    for(;;)
+                    for (; edges-- > 0; )
                     {
                         ty = (int)((v[idx].y + delta) >> shift);
-                        if( ty > y || edges == 0 )
+                        if (ty > y)
+                        {
+                            int64 xs = v[idx0].x;
+                            int64 xe = v[idx].x;
+                            if (shift != XY_SHIFT)
+                            {
+                                xs <<= XY_SHIFT - shift;
+                                xe <<= XY_SHIFT - shift;
+                            }
+
+                            edge[i].ye = ty;
+                            edge[i].dx = ((xe - xs)*2 + (ty - y)) / (2 * (ty - y));
+                            edge[i].x = xs;
+                            edge[i].idx = idx;
                             break;
-                        xs = v[idx].x;
+                        }
+                        idx0 = idx;
                         idx += di;
-                        idx -= ((idx < npts) - 1) & npts;   /* idx -= idx >= npts ? npts : 0 */
-                        edges--;
+                        if (idx >= npts) idx -= npts;
                     }
-
-                    xs <<= XY_SHIFT - shift;
-                    xe = v[idx].x << (XY_SHIFT - shift);
-
-                    /* no more edges */
-                    if( y >= ty)
-                        return;
-
-                    edge[i].ye = ty;
-                    edge[i].dx = ((xe - xs)*2 + (ty - y)) / (2 * (ty - y));
-                    edge[i].x = xs;
-                    edge[i].idx = idx;
                 }
             }
         }
 
-        if( edge[left].x > edge[right].x )
-        {
-            left ^= 1;
-            right ^= 1;
-        }
+        if (edges < 0)
+            break;
 
-        if( y >= 0 )
+        if (y >= 0)
         {
+            int left = 0, right = 1;
+            if (edge[0].x > edge[1].x)
+            {
+                left = 1, right = 0;
+            }
+
             int xx1 = (int)((edge[left].x + delta1) >> XY_SHIFT);
             int xx2 = (int)((edge[right].x + delta2) >> XY_SHIFT);
 
@@ -1231,9 +1258,13 @@ FillConvexPoly( Mat& img, const Point2l* v, int npts, const void* color, int lin
                 ICV_HLINE( ptr, xx1, xx2, color, pix_size );
             }
         }
+        else
+        {
+            // TODO optimize scan for negative y
+        }
 
-        edge[left].x += edge[left].dx;
-        edge[right].x += edge[right].dx;
+        edge[0].x += edge[0].dx;
+        edge[1].x += edge[1].dx;
         ptr += img.step;
     }
     while( ++y <= (int)ymax );
@@ -2569,6 +2600,7 @@ cvDrawContours( void* _img, CvSeq* contour,
         void* clr = (contour->flags & CV_SEQ_FLAG_HOLE) == 0 ? ext_buf : hole_buf;
 
         cvStartReadSeq( contour, &reader, 0 );
+        CV_Assert(reader.ptr != NULL);
         if( thickness < 0 )
             pts.resize(0);
 

@@ -24,7 +24,7 @@ if(HAVE_DOC_GENERATOR)
   endforeach()
   ocv_list_sort(BASE_MODULES)
   ocv_list_sort(EXTRA_MODULES)
-  set(FIXED_ORDER_MODULES core imgproc imgcodecs videoio highgui video calib3d features2d objdetect ml flann photo stitching)
+  set(FIXED_ORDER_MODULES core imgproc imgcodecs videoio highgui video calib3d features2d objdetect dnn ml flann photo stitching)
   list(REMOVE_ITEM BASE_MODULES ${FIXED_ORDER_MODULES})
   set(BASE_MODULES ${FIXED_ORDER_MODULES} ${BASE_MODULES})
 endif(HAVE_DOC_GENERATOR)
@@ -170,5 +170,11 @@ if(BUILD_DOCS AND DOXYGEN_FOUND)
   install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/doxygen/html
     DESTINATION "${OPENCV_DOC_INSTALL_PATH}"
     COMPONENT "docs" OPTIONAL
+  )
+
+  # Alias to build/install docs only
+  add_custom_target(install_docs
+      DEPENDS doxygen
+      COMMAND "${CMAKE_COMMAND}" -DCMAKE_INSTALL_COMPONENT=docs -P "${CMAKE_BINARY_DIR}/cmake_install.cmake"
   )
 endif()

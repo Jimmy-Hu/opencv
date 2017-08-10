@@ -21,13 +21,15 @@ RNG rng(12345);
 /**
  * @function main
  */
-int main( int, char** argv )
+int main( int argc, char** argv )
 {
-
-  int c;
-
   //![load]
-  src = imread( argv[1], IMREAD_COLOR ); // Load an image
+  String imageName("../data/lena.jpg"); // by default
+  if (argc > 1)
+  {
+      imageName = argv[1];
+  }
+  src = imread( imageName, IMREAD_COLOR ); // Load an image
 
   if( src.empty() )
     {
@@ -59,13 +61,12 @@ int main( int, char** argv )
   for(;;)
        {
          //![check_keypress]
-         c = waitKey(500);
-
-         if( (char)c == 27 )
+         char c = (char)waitKey(500);
+         if( c == 27 )
            { break; }
-         else if( (char)c == 'c' )
+         else if( c == 'c' )
            { borderType = BORDER_CONSTANT; }
-         else if( (char)c == 'r' )
+         else if( c == 'r' )
            { borderType = BORDER_REPLICATE; }
          //![check_keypress]
 
