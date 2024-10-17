@@ -38,6 +38,7 @@
  */
 
 #include "common.hpp"
+#include "vround_helper.hpp"
 
 namespace CAROTENE_NS {
 
@@ -135,7 +136,7 @@ namespace CAROTENE_NS {
 
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC1(u8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -185,7 +186,7 @@ CVTS_FUNC1(u8, 16,
 #else
 CVTS_FUNC1(u8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -209,10 +210,10 @@ CVTS_FUNC1(u8, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        int32x4_t vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        int32x4_t vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        int32x4_t vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        int32x4_t vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         uint16x8_t vRes1_u16 = vcombine_u16(vqmovun_s32(vline1_s32), vqmovun_s32(vline2_s32));
         uint16x8_t vRes2_u16 = vcombine_u16(vqmovun_s32(vline3_s32), vqmovun_s32(vline4_s32));
         vst1q_u8(_dst + i, vcombine_u8(vqmovn_u16(vRes1_u16), vqmovn_u16(vRes2_u16)));
@@ -220,7 +221,7 @@ CVTS_FUNC1(u8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC(u8, s8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -270,7 +271,7 @@ CVTS_FUNC(u8, s8, 16,
 #else
 CVTS_FUNC(u8, s8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -294,10 +295,10 @@ CVTS_FUNC(u8, s8, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        int32x4_t vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        int32x4_t vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        int32x4_t vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        int32x4_t vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         int16x8_t vRes1_u16 = vcombine_s16(vqmovn_s32(vline1_s32), vqmovn_s32(vline2_s32));
         int16x8_t vRes2_u16 = vcombine_s16(vqmovn_s32(vline3_s32), vqmovn_s32(vline4_s32));
         vst1q_s8(_dst + i, vcombine_s8(vqmovn_s16(vRes1_u16), vqmovn_s16(vRes2_u16)));
@@ -305,7 +306,7 @@ CVTS_FUNC(u8, s8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC(u8, u16, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -355,7 +356,7 @@ CVTS_FUNC(u8, u16, 16,
 #else
 CVTS_FUNC(u8, u16, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -379,17 +380,17 @@ CVTS_FUNC(u8, u16, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        int32x4_t vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        int32x4_t vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        int32x4_t vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        int32x4_t vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         vst1q_u16(_dst + i + 0, vcombine_u16(vqmovun_s32(vline1_s32), vqmovun_s32(vline2_s32)));
         vst1q_u16(_dst + i + 8, vcombine_u16(vqmovun_s32(vline3_s32), vqmovun_s32(vline4_s32)));
     }
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC(u8, s16, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -439,7 +440,7 @@ CVTS_FUNC(u8, s16, 16,
 #else
 CVTS_FUNC(u8, s16, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -463,17 +464,17 @@ CVTS_FUNC(u8, s16, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        int32x4_t vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        int32x4_t vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        int32x4_t vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        int32x4_t vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         vst1q_s16(_dst + i + 0, vcombine_s16(vqmovn_s32(vline1_s32), vqmovn_s32(vline2_s32)));
         vst1q_s16(_dst + i + 8, vcombine_s16(vqmovn_s32(vline3_s32), vqmovn_s32(vline4_s32)));
     }
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u8, s32, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -526,7 +527,7 @@ CVTS_FUNC(u8, s32, 16,
 #else
 CVTS_FUNC(u8, s32, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -550,10 +551,10 @@ CVTS_FUNC(u8, s32, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        int32x4_t vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        int32x4_t vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        int32x4_t vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        int32x4_t vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         vst1q_s32(_dst + i + 0,  vline1_s32);
         vst1q_s32(_dst + i + 4,  vline2_s32);
         vst1q_s32(_dst + i + 8,  vline3_s32);
@@ -562,7 +563,7 @@ CVTS_FUNC(u8, s32, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u8, f32, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta);,
@@ -643,7 +644,7 @@ CVTS_FUNC(u8, f32, 16,
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC(s8, u8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -693,7 +694,7 @@ CVTS_FUNC(s8, u8, 16,
 #else
 CVTS_FUNC(s8, u8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -717,10 +718,10 @@ CVTS_FUNC(s8, u8, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         uint16x8_t vRes1_u16 = vcombine_u16(vqmovun_s32(vline1_s32), vqmovun_s32(vline2_s32));
         uint16x8_t vRes2_u16 = vcombine_u16(vqmovun_s32(vline3_s32), vqmovun_s32(vline4_s32));
         vst1q_u8(_dst + i, vcombine_u8(vqmovn_u16(vRes1_u16), vqmovn_u16(vRes2_u16)));
@@ -728,7 +729,7 @@ CVTS_FUNC(s8, u8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC1(s8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -778,7 +779,7 @@ CVTS_FUNC1(s8, 16,
 #else
 CVTS_FUNC1(s8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -802,10 +803,10 @@ CVTS_FUNC1(s8, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         int16x8_t vRes1_s16 = vcombine_s16(vqmovn_s32(vline1_s32), vqmovn_s32(vline2_s32));
         int16x8_t vRes2_s16 = vcombine_s16(vqmovn_s32(vline3_s32), vqmovn_s32(vline4_s32));
         vst1q_s8(_dst + i, vcombine_s8(vqmovn_s16(vRes1_s16), vqmovn_s16(vRes2_s16)));
@@ -813,7 +814,7 @@ CVTS_FUNC1(s8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC(s8, u16, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -863,7 +864,7 @@ CVTS_FUNC(s8, u16, 16,
 #else
 CVTS_FUNC(s8, u16, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -887,10 +888,10 @@ CVTS_FUNC(s8, u16, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         uint16x8_t vRes1_u16 = vcombine_u16(vqmovun_s32(vline1_s32), vqmovun_s32(vline2_s32));
         uint16x8_t vRes2_u16 = vcombine_u16(vqmovun_s32(vline3_s32), vqmovun_s32(vline4_s32));
         vst1q_u16(_dst + i + 0, vRes1_u16);
@@ -899,7 +900,7 @@ CVTS_FUNC(s8, u16, 16,
 })
 #endif
 
-#if defined(__GNUC__) && defined(__arm__)
+#if !defined(__aarch64__) && defined(__GNUC__) && defined(__arm__)
 CVTS_FUNC(s8, s16, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -949,7 +950,7 @@ CVTS_FUNC(s8, s16, 16,
 #else
 CVTS_FUNC(s8, s16, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -973,10 +974,10 @@ CVTS_FUNC(s8, s16, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         int16x8_t vRes1_s16 = vcombine_s16(vqmovn_s32(vline1_s32), vqmovn_s32(vline2_s32));
         int16x8_t vRes2_s16 = vcombine_s16(vqmovn_s32(vline3_s32), vqmovn_s32(vline4_s32));
         vst1q_s16(_dst + i + 0, vRes1_s16);
@@ -985,7 +986,7 @@ CVTS_FUNC(s8, s16, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s8, s32, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1038,7 +1039,7 @@ CVTS_FUNC(s8, s32, 16,
 #else
 CVTS_FUNC(s8, s32, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 16)
     {
@@ -1062,10 +1063,10 @@ CVTS_FUNC(s8, s32, 16,
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
         vline3_f32 = vaddq_f32(vline3_f32, vshift);
         vline4_f32 = vaddq_f32(vline4_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
-        vline3_s32 = vcvtq_s32_f32(vline3_f32);
-        vline4_s32 = vcvtq_s32_f32(vline4_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
+        vline3_s32 = internal::vroundq_s32_f32(vline3_f32);
+        vline4_s32 = internal::vroundq_s32_f32(vline4_f32);
         vst1q_s32(_dst + i + 0,  vline1_s32);
         vst1q_s32(_dst + i + 4,  vline2_s32);
         vst1q_s32(_dst + i + 8,  vline3_s32);
@@ -1074,7 +1075,7 @@ CVTS_FUNC(s8, s32, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s8, f32, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta);,
@@ -1155,7 +1156,7 @@ CVTS_FUNC(s8, f32, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u16, u8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1190,7 +1191,7 @@ CVTS_FUNC(u16, u8, 16,
 #else
 CVTS_FUNC(u16, u8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1204,8 +1205,8 @@ CVTS_FUNC(u16, u8, 16,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         uint8x8_t vRes = vqmovun_s16(vcombine_s16(vRes1, vRes2));
@@ -1214,7 +1215,7 @@ CVTS_FUNC(u16, u8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u16, s8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1249,7 +1250,7 @@ CVTS_FUNC(u16, s8, 16,
 #else
 CVTS_FUNC(u16, s8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1263,8 +1264,8 @@ CVTS_FUNC(u16, s8, 16,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         int8x8_t vRes = vqmovn_s16(vcombine_s16(vRes1, vRes2));
@@ -1273,7 +1274,7 @@ CVTS_FUNC(u16, s8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC1(u16, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1307,7 +1308,7 @@ CVTS_FUNC1(u16, 16,
 #else
 CVTS_FUNC1(u16, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1321,8 +1322,8 @@ CVTS_FUNC1(u16, 16,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         uint16x4_t vRes1 = vqmovun_s32(vline1_s32);
         uint16x4_t vRes2 = vqmovun_s32(vline2_s32);
         vst1q_u16(_dst + i, vcombine_u16(vRes1, vRes2));
@@ -1330,7 +1331,7 @@ CVTS_FUNC1(u16, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u16, s16, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1364,7 +1365,7 @@ CVTS_FUNC(u16, s16, 8,
 #else
 CVTS_FUNC(u16, s16, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1378,8 +1379,8 @@ CVTS_FUNC(u16, s16, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         vst1q_s16(_dst + i, vcombine_s16(vRes1, vRes2));
@@ -1387,7 +1388,7 @@ CVTS_FUNC(u16, s16, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u16, s32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1421,7 +1422,7 @@ CVTS_FUNC(u16, s32, 8,
 #else
 CVTS_FUNC(u16, s32, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1435,15 +1436,15 @@ CVTS_FUNC(u16, s32, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         vst1q_s32(_dst + i + 0, vline1_s32);
         vst1q_s32(_dst + i + 4, vline2_s32);
     }
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(u16, f32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta);,
@@ -1495,7 +1496,7 @@ CVTS_FUNC(u16, f32, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s16, u8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1530,7 +1531,7 @@ CVTS_FUNC(s16, u8, 16,
 #else
 CVTS_FUNC(s16, u8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1544,8 +1545,8 @@ CVTS_FUNC(s16, u8, 16,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         uint8x8_t vRes = vqmovun_s16(vcombine_s16(vRes1, vRes2));
@@ -1554,7 +1555,7 @@ CVTS_FUNC(s16, u8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s16, s8, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1589,7 +1590,7 @@ CVTS_FUNC(s16, s8, 16,
 #else
 CVTS_FUNC(s16, s8, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1603,8 +1604,8 @@ CVTS_FUNC(s16, s8, 16,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         int8x8_t vRes = vqmovn_s16(vcombine_s16(vRes1, vRes2));
@@ -1613,7 +1614,7 @@ CVTS_FUNC(s16, s8, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s16, u16, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1647,7 +1648,7 @@ CVTS_FUNC(s16, u16, 8,
 #else
 CVTS_FUNC(s16, u16, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1661,8 +1662,8 @@ CVTS_FUNC(s16, u16, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         uint16x4_t vRes1 = vqmovun_s32(vline1_s32);
         uint16x4_t vRes2 = vqmovun_s32(vline2_s32);
         vst1q_u16(_dst + i, vcombine_u16(vRes1, vRes2));
@@ -1670,7 +1671,7 @@ CVTS_FUNC(s16, u16, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC1(s16, 16,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1704,7 +1705,7 @@ CVTS_FUNC1(s16, 16,
 #else
 CVTS_FUNC1(s16, 16,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1718,8 +1719,8 @@ CVTS_FUNC1(s16, 16,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         vst1q_s16(_dst + i, vcombine_s16(vRes1, vRes2));
@@ -1727,7 +1728,7 @@ CVTS_FUNC1(s16, 16,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s16, s32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1761,7 +1762,7 @@ CVTS_FUNC(s16, s32, 8,
 #else
 CVTS_FUNC(s16, s32, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1775,15 +1776,15 @@ CVTS_FUNC(s16, s32, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         vst1q_s32(_dst + i + 0, vline1_s32);
         vst1q_s32(_dst + i + 4, vline2_s32);
     }
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s16, f32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta);,
@@ -1835,7 +1836,7 @@ CVTS_FUNC(s16, f32, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s32, u8, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1870,7 +1871,7 @@ CVTS_FUNC(s32, u8, 8,
 #else
 CVTS_FUNC(s32, u8, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1883,8 +1884,8 @@ CVTS_FUNC(s32, u8, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         uint16x4_t vRes1 = vqmovun_s32(vline1_s32);
         uint16x4_t vRes2 = vqmovun_s32(vline2_s32);
         uint8x8_t vRes = vqmovn_u16(vcombine_u16(vRes1, vRes2));
@@ -1893,7 +1894,7 @@ CVTS_FUNC(s32, u8, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s32, s8, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1928,7 +1929,7 @@ CVTS_FUNC(s32, s8, 8,
 #else
 CVTS_FUNC(s32, s8, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1941,8 +1942,8 @@ CVTS_FUNC(s32, s8, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         int8x8_t vRes = vqmovn_s16(vcombine_s16(vRes1, vRes2));
@@ -1951,7 +1952,7 @@ CVTS_FUNC(s32, s8, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s32, u16, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -1985,7 +1986,7 @@ CVTS_FUNC(s32, u16, 8,
 #else
 CVTS_FUNC(s32, u16, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -1998,8 +1999,8 @@ CVTS_FUNC(s32, u16, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         uint16x4_t vRes1 = vqmovun_s32(vline1_s32);
         uint16x4_t vRes2 = vqmovun_s32(vline2_s32);
         vst1q_u16(_dst + i, vcombine_u16(vRes1, vRes2));
@@ -2007,7 +2008,7 @@ CVTS_FUNC(s32, u16, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s32, s16, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -2041,7 +2042,7 @@ CVTS_FUNC(s32, s16, 8,
 #else
 CVTS_FUNC(s32, s16, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -2054,8 +2055,8 @@ CVTS_FUNC(s32, s16, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         vst1q_s16(_dst + i, vcombine_s16(vRes1, vRes2));
@@ -2063,7 +2064,7 @@ CVTS_FUNC(s32, s16, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC1(s32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -2097,7 +2098,7 @@ CVTS_FUNC1(s32, 8,
 #else
 CVTS_FUNC1(s32, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -2110,15 +2111,15 @@ CVTS_FUNC1(s32, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         vst1q_s32(_dst + i + 0, vline1_s32);
         vst1q_s32(_dst + i + 4, vline2_s32);
     }
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(s32, f32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta);,
@@ -2169,7 +2170,7 @@ CVTS_FUNC(s32, f32, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(f32, u8, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)((1 << 16)*alpha));
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)((1 << 16)*beta));
@@ -2239,7 +2240,7 @@ CVTS_FUNC(f32, u8, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(f32, s8, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -2272,7 +2273,7 @@ CVTS_FUNC(f32, s8, 8,
 #else
 CVTS_FUNC(f32, s8, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -2283,8 +2284,8 @@ CVTS_FUNC(f32, s8, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         int8x8_t vRes = vqmovn_s16(vcombine_s16(vRes1, vRes2));
@@ -2293,7 +2294,7 @@ CVTS_FUNC(f32, s8, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(f32, u16, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -2325,7 +2326,7 @@ CVTS_FUNC(f32, u16, 8,
 #else
 CVTS_FUNC(f32, u16, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -2336,8 +2337,8 @@ CVTS_FUNC(f32, u16, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        uint32x4_t vline1_u32 = vcvtq_u32_f32(vline1_f32);
-        uint32x4_t vline2_u32 = vcvtq_u32_f32(vline2_f32);
+        uint32x4_t vline1_u32 = internal::vroundq_u32_f32(vline1_f32);
+        uint32x4_t vline2_u32 = internal::vroundq_u32_f32(vline2_f32);
         uint16x4_t vRes1 = vqmovn_u32(vline1_u32);
         uint16x4_t vRes2 = vqmovn_u32(vline2_u32);
         vst1q_u16(_dst + i, vcombine_u16(vRes1, vRes2));
@@ -2345,7 +2346,7 @@ CVTS_FUNC(f32, u16, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(f32, s16, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -2377,7 +2378,7 @@ CVTS_FUNC(f32, s16, 8,
 #else
 CVTS_FUNC(f32, s16, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -2388,8 +2389,8 @@ CVTS_FUNC(f32, s16, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         int16x4_t vRes1 = vqmovn_s32(vline1_s32);
         int16x4_t vRes2 = vqmovn_s32(vline2_s32);
         vst1q_s16(_dst + i, vcombine_s16(vRes1, vRes2));
@@ -2397,7 +2398,7 @@ CVTS_FUNC(f32, s16, 8,
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC(f32, s32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta + 0.5f);,
@@ -2429,7 +2430,7 @@ CVTS_FUNC(f32, s32, 8,
 #else
 CVTS_FUNC(f32, s32, 8,
     float32x4_t vscale = vdupq_n_f32((f32)alpha);
-    float32x4_t vshift = vdupq_n_f32((f32)beta + 0.5f);,
+    float32x4_t vshift = vdupq_n_f32((f32)beta);,
 {
     for (size_t i = 0; i < w; i += 8)
     {
@@ -2440,15 +2441,15 @@ CVTS_FUNC(f32, s32, 8,
         vline2_f32 = vmulq_f32(vline2_f32, vscale);
         vline1_f32 = vaddq_f32(vline1_f32, vshift);
         vline2_f32 = vaddq_f32(vline2_f32, vshift);
-        int32x4_t vline1_s32 = vcvtq_s32_f32(vline1_f32);
-        int32x4_t vline2_s32 = vcvtq_s32_f32(vline2_f32);
+        int32x4_t vline1_s32 = internal::vroundq_s32_f32(vline1_f32);
+        int32x4_t vline2_s32 = internal::vroundq_s32_f32(vline2_f32);
         vst1q_s32(_dst + i + 0, vline1_s32);
         vst1q_s32(_dst + i + 4, vline2_s32);
     }
 })
 #endif
 
-#if defined(__GNUC__) && __GNUC__ == 4 && __GNUC_MINOR__ < 7
+#if !defined(__aarch64__) && defined(__GNUC__) && __GNUC__ == 4 &&  __GNUC_MINOR__ < 7 && !defined(__clang__)
 CVTS_FUNC1(f32, 8,
     register float32x4_t vscale asm ("q0") = vdupq_n_f32((f32)alpha);
     register float32x4_t vshift asm ("q1") = vdupq_n_f32((f32)beta);,

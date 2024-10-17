@@ -52,9 +52,6 @@ namespace ocl {
 
 using namespace perf;
 
-using std::tr1::get;
-using std::tr1::tuple;
-
 #define OCL_PERF_STRATEGY PERF_STRATEGY_SIMPLE
 
 #define OCL_PERF_TEST(fixture, name) SIMPLE_PERF_TEST(fixture, name)
@@ -67,7 +64,7 @@ using std::tr1::tuple;
     public: \
         OCL##_##fixture##_##name() { } \
     protected: \
-        virtual void PerfTestBody(); \
+        virtual void PerfTestBody() CV_OVERRIDE; \
     }; \
     TEST_F(OCL##_##fixture##_##name, name) { CV_TRACE_REGION("PERF_TEST: " #fixture "_" #name); declare.strategy(OCL_PERF_STRATEGY); RunPerfTestBody(); } \
     void OCL##_##fixture##_##name::PerfTestBody()
@@ -79,7 +76,7 @@ using std::tr1::tuple;
     public: \
         OCL##_##fixture##_##name() { } \
     protected: \
-        virtual void PerfTestBody(); \
+        virtual void PerfTestBody() CV_OVERRIDE; \
     }; \
     TEST_P(OCL##_##fixture##_##name, name) { CV_TRACE_REGION("PERF_TEST_P: " #fixture "_" #name); declare.strategy(OCL_PERF_STRATEGY); RunPerfTestBody(); } \
     INSTANTIATE_TEST_CASE_P(/*none*/, OCL##_##fixture##_##name, params); \
@@ -122,11 +119,11 @@ using std::tr1::tuple;
 namespace perf {
 
 // Check for current device limitation
-CV_EXPORTS void checkDeviceMaxMemoryAllocSize(const Size& size, int type, int factor = 1);
+void checkDeviceMaxMemoryAllocSize(const Size& size, int type, int factor = 1);
 
 // Initialize Mat with random numbers. Range is depends on the data type.
 // TODO Parameter type is actually OutputArray
-CV_EXPORTS void randu(InputOutputArray dst);
+void randu(InputOutputArray dst);
 
 inline void safeFinish()
 {

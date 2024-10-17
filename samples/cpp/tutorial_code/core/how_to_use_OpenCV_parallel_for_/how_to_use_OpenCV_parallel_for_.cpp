@@ -2,6 +2,8 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#define PARALLEL_FOR_LAMBDA
+
 using namespace std;
 using namespace cv;
 
@@ -33,6 +35,8 @@ int mandelbrotFormula(const complex<float> &z0, const int maxIter=500) {
 }
 //! [mandelbrot-grayscale-value]
 
+#ifndef PARALLEL_FOR_LAMBDA
+
 //! [mandelbrot-parallel]
 class ParallelMandelbrot : public ParallelLoopBody
 {
@@ -42,7 +46,7 @@ public:
     {
     }
 
-    virtual void operator ()(const Range& range) const
+    virtual void operator ()(const Range& range) const CV_OVERRIDE
     {
         for (int r = range.start; r < range.end; r++)
         {
@@ -70,6 +74,8 @@ private:
     float m_scaleY;
 };
 //! [mandelbrot-parallel]
+
+#endif // !PARALLEL_FOR_LAMBDA
 
 //! [mandelbrot-sequential]
 void sequentialMandelbrot(Mat &img, const float x1, const float y1, const float scaleX, const float scaleY)
@@ -102,7 +108,7 @@ int main()
 
     double t1 = (double) getTickCount();
 
-    #ifdef CV_CXX11
+#ifdef PARALLEL_FOR_LAMBDA
 
     //! [mandelbrot-parallel-call-cxx11]
     parallel_for_(Range(0, mandelbrotImg.rows*mandelbrotImg.cols), [&](const Range& range){
@@ -121,14 +127,14 @@ int main()
     });
     //! [mandelbrot-parallel-call-cxx11]
 
-    #else
+#else // PARALLEL_FOR_LAMBDA
 
     //! [mandelbrot-parallel-call]
     ParallelMandelbrot parallelMandelbrot(mandelbrotImg, x1, y1, scaleX, scaleY);
     parallel_for_(Range(0, mandelbrotImg.rows*mandelbrotImg.cols), parallelMandelbrot);
     //! [mandelbrot-parallel-call]
 
-    #endif
+#endif // PARALLEL_FOR_LAMBDA
 
     t1 = ((double) getTickCount() - t1) / getTickFrequency();
     cout << "Parallel Mandelbrot: " << t1 << " s" << endl;

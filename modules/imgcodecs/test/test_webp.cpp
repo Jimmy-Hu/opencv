@@ -1,8 +1,9 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html
 #include "test_precomp.hpp"
 
-using namespace cv;
-using namespace std;
-using namespace std::tr1;
+namespace opencv_test { namespace {
 
 #ifdef HAVE_WEBP
 
@@ -44,11 +45,17 @@ TEST(Imgcodecs_WebP, encode_decode_lossless_webp)
         }
     }
 
-    remove(output.c_str());
+    EXPECT_EQ(0, remove(output.c_str()));
 
     cv::Mat decode = cv::imdecode(buf, IMREAD_COLOR);
     ASSERT_FALSE(decode.empty());
     EXPECT_TRUE(cvtest::norm(decode, img_webp, NORM_INF) == 0);
+
+    cv::Mat decode_rgb = cv::imdecode(buf, IMREAD_COLOR_RGB);
+    ASSERT_FALSE(decode_rgb.empty());
+
+    cvtColor(decode_rgb, decode_rgb, COLOR_RGB2BGR);
+    EXPECT_TRUE(cvtest::norm(decode_rgb, img_webp, NORM_INF) == 0);
 
     ASSERT_FALSE(img_webp.empty());
 
@@ -71,7 +78,7 @@ TEST(Imgcodecs_WebP, encode_decode_lossy_webp)
 
         EXPECT_NO_THROW(cv::imwrite(output, img, params));
         cv::Mat img_webp = cv::imread(output);
-        remove(output.c_str());
+        EXPECT_EQ(0, remove(output.c_str()));
         EXPECT_FALSE(img_webp.empty());
         EXPECT_EQ(3,   img_webp.channels());
         EXPECT_EQ(512, img_webp.cols);
@@ -95,12 +102,19 @@ TEST(Imgcodecs_WebP, encode_decode_with_alpha_webp)
     string output = cv::tempfile(".webp");
 
     EXPECT_NO_THROW(cv::imwrite(output, img));
-    cv::Mat img_webp = cv::imread(output);
-    remove(output.c_str());
+    cv::Mat img_webp = cv::imread(output, IMREAD_UNCHANGED);
+    cv::Mat img_webp_bgr = cv::imread(output); // IMREAD_COLOR by default
+    EXPECT_EQ(0, remove(output.c_str()));
     EXPECT_FALSE(img_webp.empty());
     EXPECT_EQ(4,   img_webp.channels());
     EXPECT_EQ(512, img_webp.cols);
     EXPECT_EQ(512, img_webp.rows);
+    EXPECT_FALSE(img_webp_bgr.empty());
+    EXPECT_EQ(3,   img_webp_bgr.channels());
+    EXPECT_EQ(512, img_webp_bgr.cols);
+    EXPECT_EQ(512, img_webp_bgr.rows);
 }
 
 #endif // HAVE_WEBP
+
+}} // namespace

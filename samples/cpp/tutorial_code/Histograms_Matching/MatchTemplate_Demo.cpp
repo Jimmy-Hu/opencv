@@ -26,32 +26,34 @@ int max_Trackbar = 5;
 /// Function Headers
 void MatchingMethod( int, void* );
 
+const char* keys =
+"{ help  h| | Print help message. }"
+"{ @input1 | Template_Matching_Original_Image.jpg | image_name }"
+"{ @input2 | Template_Matching_Template_Image.jpg | template_name }"
+"{ @input3 |  | mask_name }";
+
 /**
  * @function main
  */
 int main( int argc, char** argv )
 {
-  if (argc < 3)
-  {
-    cout << "Not enough parameters" << endl;
-    cout << "Usage:\n./MatchTemplate_Demo <image_name> <template_name> [<mask_name>]" << endl;
-    return -1;
-  }
+  CommandLineParser parser( argc, argv, keys );
+  samples::addSamplesDataSearchSubDirectory( "doc/tutorials/imgproc/histograms/template_matching/images" );
 
   //! [load_image]
   /// Load image and template
-  img = imread( argv[1], IMREAD_COLOR );
-  templ = imread( argv[2], IMREAD_COLOR );
+  img = imread( samples::findFile( parser.get<String>("@input1") ) );
+  templ = imread( samples::findFile( parser.get<String>("@input2") ), IMREAD_COLOR );
 
   if(argc > 3) {
     use_mask = true;
-    mask = imread( argv[3], IMREAD_COLOR );
+    mask = imread(samples::findFile( parser.get<String>("@input3") ), IMREAD_COLOR );
   }
 
   if(img.empty() || templ.empty() || (use_mask && mask.empty()))
   {
     cout << "Can't read one of the images" << endl;
-    return -1;
+    return EXIT_FAILURE;
   }
   //! [load_image]
 
@@ -71,7 +73,7 @@ int main( int argc, char** argv )
 
   //! [wait_key]
   waitKey(0);
-  return 0;
+  return EXIT_SUCCESS;
   //! [wait_key]
 }
 
@@ -89,7 +91,7 @@ void MatchingMethod( int, void* )
 
   //! [create_result_matrix]
   /// Create the result matrix
-  int result_cols =  img.cols - templ.cols + 1;
+  int result_cols = img.cols - templ.cols + 1;
   int result_rows = img.rows - templ.rows + 1;
 
   result.create( result_rows, result_cols, CV_32FC1 );
@@ -97,7 +99,7 @@ void MatchingMethod( int, void* )
 
   //! [match_template]
   /// Do the Matching and Normalize
-  bool method_accepts_mask = (CV_TM_SQDIFF == match_method || match_method == CV_TM_CCORR_NORMED);
+  bool method_accepts_mask = (TM_SQDIFF == match_method || match_method == TM_CCORR_NORMED);
   if (use_mask && method_accepts_mask)
     { matchTemplate( img, templ, result, match_method, mask); }
   else
