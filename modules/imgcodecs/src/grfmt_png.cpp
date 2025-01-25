@@ -274,7 +274,7 @@ bool  PngDecoder::readHeader()
     }
 
     // Read PNG header: 137 80 78 71 13 10 26 10
-    if (!read_from_io(&sig, 8))
+    if (!readFromStreamOrBuffer(&sig, 8))
         return false;
 
     id = read_chunk(m_chunkIHDR);
@@ -327,11 +327,10 @@ bool  PngDecoder::readHeader()
         if (id == id_bKGD)
         {
             // The spec is actually more complex: http://www.libpng.org/pub/png/spec/1.2/PNG-Chunks.html#C.bKGD
-            int bgcolor = png_get_uint_32(&chunk.p[8]);
-            m_animation.bgcolor[3] = (bgcolor >> 24) & 0xFF;
-            m_animation.bgcolor[2] = (bgcolor >> 16) & 0xFF;
-            m_animation.bgcolor[1] = (bgcolor >> 8) & 0xFF;
-            m_animation.bgcolor[0] = bgcolor & 0xFF;
+            m_animation.bgcolor[0] = png_get_uint_16(&chunk.p[8]);
+            m_animation.bgcolor[1] = png_get_uint_16(&chunk.p[10]);
+            m_animation.bgcolor[2] = png_get_uint_16(&chunk.p[12]);
+            m_animation.bgcolor[3] = 0;
         }
 
         if (id == id_PLTE || id == id_tRNS)
@@ -682,7 +681,7 @@ void PngDecoder::compose_frame(std::vector<png_bytep>& rows_dst, const std::vect
             });
 }
 
-bool PngDecoder::read_from_io(void* buffer, size_t num_bytes)
+bool PngDecoder::readFromStreamOrBuffer(void* buffer, size_t num_bytes)
 {
     if (m_f)
         return fread(buffer, 1, num_bytes, m_f) == num_bytes;
@@ -700,7 +699,7 @@ bool PngDecoder::read_from_io(void* buffer, size_t num_bytes)
 uint32_t PngDecoder::read_chunk(Chunk& chunk)
 {
     unsigned char size_id[8];
-    if (!read_from_io(&size_id, 8))
+    if (!readFromStreamOrBuffer(&size_id, 8))
         return 0;
     const size_t size = static_cast<size_t>(png_get_uint_32(size_id)) + 12;
 
@@ -721,11 +720,10 @@ uint32_t PngDecoder::read_chunk(Chunk& chunk)
         if (size != 8 + 26 + 4)
             return 0;
     } else if (id == id_bKGD) {
-        // 8=HDR+size, ??=size of bKGD chunk, 4=CRC
+        // 8=HDR+size, (1, 2 or 6)=size of bKGD chunk, 4=CRC
         // The spec is actually more complex:
         // http://www.libpng.org/pub/png/spec/1.2/PNG-Chunks.html#C.bKGD
-        // TODO: we only check that 4 bytes can be read from &chunk.p[8]. Fix.
-        if (size < 8 + 4)
+        if (size != 8 + 1 + 4 && size != 8 + 2 + 4 && size != 8 + 6 + 4)
             return 0;
     } else if (id != id_fdAT && id != id_IDAT && id != id_IEND && id != id_PLTE && id != id_tRNS) {
         if (size > PNG_USER_CHUNK_MALLOC_MAX)
@@ -737,7 +735,7 @@ uint32_t PngDecoder::read_chunk(Chunk& chunk)
 
     chunk.p.resize(size);
     memcpy(chunk.p.data(), size_id, 8);
-    if (read_from_io(&chunk.p[8], chunk.p.size() - 8))
+    if (readFromStreamOrBuffer(&chunk.p[8], chunk.p.size() - 8))
         return id;
     return 0;
 }
@@ -960,15 +958,24 @@ bool  PngEncoder::write( const Mat& img, const std::vector<int>& params )
     return result;
 }
 
-size_t PngEncoder::write_to_io(void const* _Buffer, size_t  _ElementSize, size_t _ElementCount, FILE * _Stream)
+size_t PngEncoder::writeToStreamOrBuffer(void const* buffer, size_t num_bytes, FILE* stream)
 {
-    if (_Stream)
-        return fwrite(_Buffer, _ElementSize, _ElementCount, _Stream);
+    if (!buffer || !num_bytes)
+        return 0; // Handle null buffer or empty writes
+
+    if (stream)
+    {
+        size_t written = fwrite(buffer, 1, num_bytes, stream);
+        return written; // fwrite handles the write count
+    }
 
     size_t cursz = m_buf->size();
-    m_buf->resize(cursz + _ElementCount);
-    memcpy( &(*m_buf)[cursz], _Buffer, _ElementCount );
-    return _ElementCount;
+    if (cursz + num_bytes > m_buf->max_size())
+        throw std::runtime_error("Buffer size exceeds maximum capacity");
+
+    m_buf->resize(cursz + num_bytes);
+    memcpy(&(*m_buf)[cursz], buffer, num_bytes);
+    return num_bytes;
 }
 
 void PngEncoder::writeChunk(FILE* f, const char* name, unsigned char* data, uint32_t length)
@@ -977,26 +984,26 @@ void PngEncoder::writeChunk(FILE* f, const char* name, unsigned char* data, uint
     uint32_t crc = crc32(0, Z_NULL, 0);
 
     png_save_uint_32(buf, length);
-    write_to_io(buf, 1, 4, f);
-    write_to_io(name, 1, 4, f);
+    writeToStreamOrBuffer(buf, 4, f);
+    writeToStreamOrBuffer(name, 4, f);
     crc = crc32(crc, (const Bytef*)name, 4);
 
     if (memcmp(name, "fdAT", 4) == 0)
     {
         png_save_uint_32(buf, next_seq_num++);
-        write_to_io(buf, 1, 4, f);
+        writeToStreamOrBuffer(buf, 4, f);
         crc = crc32(crc, buf, 4);
         length -= 4;
     }
 
     if (data != NULL && length > 0)
     {
-        write_to_io(data, 1, length, f);
+        writeToStreamOrBuffer(data, length, f);
         crc = crc32(crc, data, length);
     }
 
     png_save_uint_32(buf, crc);
-    write_to_io(buf, 1, 4, f);
+    writeToStreamOrBuffer(buf, 4, f);
 }
 
 void PngEncoder::writeIDATs(FILE* f, int frame, unsigned char* data, uint32_t length, uint32_t idat_size)
@@ -1521,7 +1528,7 @@ bool PngEncoder::writeanimation(const Animation& animation, const std::vector<in
         png_save_uint_32(buf_acTL, num_frames - first);
         png_save_uint_32(buf_acTL + 4, loops);
 
-        write_to_io(header, 1, 8, m_f);
+        writeToStreamOrBuffer(header, 8, m_f);
 
         writeChunk(m_f, "IHDR", buf_IHDR, 13);
 
@@ -1533,13 +1540,13 @@ bool PngEncoder::writeanimation(const Animation& animation, const std::vector<in
         if (palsize > 0)
             writeChunk(m_f, "PLTE", (unsigned char*)(&palette), palsize * 3);
 
-        if ((animation.bgcolor != Scalar()) && (animation.frames.size() > 1))
+        if ((animation.bgcolor != Scalar()) && coltype)
         {
-            uint64_t bgvalue = (static_cast<int>(animation.bgcolor[0]) & 0xFF) << 24 |
-                (static_cast<int>(animation.bgcolor[1]) & 0xFF) << 16 |
-                (static_cast<int>(animation.bgcolor[2]) & 0xFF) << 8 |
-                (static_cast<int>(animation.bgcolor[3]) & 0xFF);
-            writeChunk(m_f, "bKGD", (unsigned char*)(&bgvalue), 6); //the bKGD chunk must precede the first IDAT chunk, and must follow the PLTE chunk.
+            unsigned char bgvalue[6] = {};
+            bgvalue[1] = animation.bgcolor[0];
+            bgvalue[3] = animation.bgcolor[1];
+            bgvalue[5] = animation.bgcolor[2];
+            writeChunk(m_f, "bKGD", bgvalue, 6); //the bKGD chunk must precede the first IDAT chunk, and must follow the PLTE chunk.
         }
 
         if (trnssize > 0)
