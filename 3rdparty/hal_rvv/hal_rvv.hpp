@@ -5,6 +5,7 @@
 #ifndef OPENCV_HAL_RVV_HPP_INCLUDED
 #define OPENCV_HAL_RVV_HPP_INCLUDED
 
+#include "opencv2/core/base.hpp"
 #include "opencv2/core/hal/interface.h"
 #include "opencv2/imgproc/hal/interface.h"
 
@@ -49,6 +50,7 @@
 #include "hal_rvv_1p0/filter.hpp" // imgproc
 #include "hal_rvv_1p0/pyramids.hpp" // imgproc
 #include "hal_rvv_1p0/color.hpp" // imgproc
+#include "hal_rvv_1p0/warp.hpp" // imgproc
 #include "hal_rvv_1p0/thresh.hpp" // imgproc
 #include "hal_rvv_1p0/histogram.hpp" // imgproc
 #endif
