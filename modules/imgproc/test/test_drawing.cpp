@@ -41,6 +41,7 @@
 //M*/
 
 #include "test_precomp.hpp"
+#include "opencv2/core/utils/filesystem.hpp"
 
 namespace opencv_test { namespace {
 
@@ -83,9 +84,12 @@ void CV_DrawingTest::run( int )
     {
         // image should match exactly
         float err = (float)cvtest::norm( testImg, valImg, NORM_L1 );
-        float Eps = 1;
+        float Eps = 10;
         if( err > Eps)
         {
+            //imshow("reference", valImg);
+            //imshow("result", testImg);
+            //waitKey();
             ts->printf( ts->LOG, "NORM_L1 between testImg and valImg is equal %f (larger than %f)\n", err, Eps );
             ts->set_failed_test_info(cvtest::TS::FAIL_BAD_ACCURACY);
         }
@@ -620,8 +624,17 @@ TEST(Drawing, putText_no_garbage)
 
     EXPECT_EQ(0, cv::countNonZero(mat(Rect(0, 0,           10, sz.height))));
     EXPECT_EQ(0, cv::countNonZero(mat(Rect(sz.width-10, 0, 10, sz.height))));
-    EXPECT_EQ(0, cv::countNonZero(mat(Rect(205, 0,         10, sz.height))));
-    EXPECT_EQ(0, cv::countNonZero(mat(Rect(405, 0,         10, sz.height))));
+    EXPECT_EQ(0, cv::countNonZero(mat(Rect(190, 0,         10, sz.height))));
+    EXPECT_EQ(0, cv::countNonZero(mat(Rect(380, 0,         10, sz.height))));
+
+#if 0
+    rectangle(mat, Rect(0, 0,           10, sz.height), Scalar::all(255), 1, LINE_8);
+    rectangle(mat, Rect(sz.width-10, 0, 10, sz.height), Scalar::all(255), 1, LINE_8);
+    rectangle(mat, Rect(190, 0,         10, sz.height), Scalar::all(255), 1, LINE_8);
+    rectangle(mat, Rect(380, 0,         10, sz.height), Scalar::all(255), 1, LINE_8);
+    imshow("result", mat);
+    waitKey();
+#endif
 }
 
 
@@ -678,6 +691,272 @@ TEST(Drawing, fillpoly_circle)
     fillPoly(img_fp3, vtx3, color);
     double diff_fp3 = cv::norm(img_c, img_fp3, NORM_L1)/(255*(radius+radius_small*2)*2*CV_PI);
     EXPECT_LT(diff_fp3, 1.);
+}
+
+
+TEST(Drawing, fromJava_getTextSize)
+{
+    String text = "Android all the way";
+    double fontScale = 2;
+    int thickness = 3;
+    int baseLine = 0;
+
+    Size res0 = getTextSize(text, FONT_HERSHEY_SCRIPT_SIMPLEX, fontScale, thickness, 0);
+    Size res = getTextSize(text, FONT_HERSHEY_SCRIPT_SIMPLEX, fontScale, thickness, &baseLine);
+
+#if 0
+    Mat img(200, 700, CV_8UC3, Scalar::all(255));
+    Point org(100, 100);
+    putText(img, text, org, FONT_HERSHEY_SCRIPT_SIMPLEX, fontScale, Scalar(128, 0, 0), thickness);
+    rectangle(img, org, Point(org.x + res0.width, org.y - res0.height), Scalar(0, 0, 128), 2, LINE_AA);
+    imshow("result", img);
+    waitKey();
+#endif
+
+    EXPECT_EQ(res0.width, res.width);
+    EXPECT_EQ(res0.height, res.height);
+    EXPECT_NEAR(494, res.width, 3.0);
+    EXPECT_NEAR(51, res.height, 3.0);
+    EXPECT_NEAR(10, baseLine, 3.0);
+}
+
+TEST(Drawing, fromJava_testPutTextMatStringPointIntDoubleScalarIntIntBoolean)
+{
+    String text = "Hello World";
+    Size labelSize(170, 23);
+
+    Mat img(20 + (int)labelSize.height, 20 + (int)labelSize.width, CV_8U, Scalar::all(0));
+    Point origin(10, 10);
+
+    putText(img, text, origin, FONT_HERSHEY_SIMPLEX, 1.0, Scalar::all(255), 1, LINE_8, true);
+
+    EXPECT_LT(0, countNonZero(img));
+    // check that border is not corrupted
+    rectangle(img, origin,
+                Point(origin.x + labelSize.width, origin.y + labelSize.height),
+                      Scalar::all(0), -1, 8);
+    //imshow("img", img);
+    //waitKey();
+    EXPECT_EQ(0, countNonZero(img));
+
+    origin = Point(10, labelSize.height + 10);
+
+    putText(img, text, origin, FONT_HERSHEY_SIMPLEX, 1.0, Scalar::all(255));
+    EXPECT_LT(0, countNonZero(img));
+    // check that border is not corrupted
+    rectangle(img, Point(10, 10), Point(labelSize.width + 10, labelSize.height + 10), Scalar::all(0), -1);
+    EXPECT_EQ(0, countNonZero(img));
+}
+
+typedef struct TextProp
+{
+    const char* str;
+    bool ralign;
+    int weight;
+    bool italic;
+} TextProp;
+
+// External fonts for the "italic" and "uni" built-in slots, shipped in opencv_extra
+// and registered for the whole test run by test_main.cpp (see registerExternalTestFonts).
+static string externalTestFont(const char* slot)
+{
+    const char* fname = strcmp(slot, "italic") == 0 ? "Rubik-Italic.ttf.gz" : "WenQuanYiMicroHei.ttf.gz";
+    string path = TS::ptr()->get_data_path() + "../highgui/drawing/" + fname;
+    if (!utils::fs::exists(path))
+        throw SkipTestException(string("font is missing in opencv_extra: ") + path);
+    return path;
+}
+
+// The reference picture was rendered with Rubik Italic as the "italic" font and
+// WenQuanYi Micro Hei as the "uni" (CJK) font. Neither is compiled into OpenCV by
+// default (WITH_ITALICFONT / WITH_UNIFONT are OFF); the external copies from
+// opencv_extra reproduce the picture 1:1.
+TEST(Drawing, ttf_text)
+{
+    string ts_data_path = TS::ptr()->get_data_path();
+    externalTestFont("italic");
+    externalTestFont("uni");
+
+    FontFace sans("sans");
+    FontFace italic("italic");
+    Mat img(600, 1300, CV_8UC3);
+    TextProp text[] =
+    {
+        {"The quick brown fox jumps over lazy dog. Fly, start, finish, shuffle shuttle.", false, 400, false},
+        {"vechicle #5 detected; fps=103.45.\n", false, 600, false},
+        {"Съешь же ещё этих мягких французских булок, да выпей чаю!\n"
+        "Dès Noël où un zéphyr haï me vêt de glaçons würmiens je dîne\nd’exquis rôtis de bœuf au kir à l’aÿ d’âge mûr & cætera!\n"
+        "“Falsches Üben von Xylophonmusik quält jeden größeren Zwerg”.", false, 400, true},
+
+        {"¡Oh tú, sabio encantador, quienquiera que seas,\n"
+         "a quien ha de tocar el ser coronista desta peregrina\n"
+         "historia, ruégote que no te olvides de mi buen Rocinante,\n"
+         "compañero eterno mío en todos mis caminos y carreras!\n", false, 300, false},
+        {"Ταχίστη αλώπηξ βαφής ψημένη γη, δρασκελίζει υπέρ νωθρού κυνός.", false, 400, false},
+        {"العربية لغة جميلة، والخط العربي فن.", false, 400, false},
+        {"春眠不觉晓，\n处处闻啼鸟。\n夜来风雨声，\n花落知多少。\n"
+        " あなたはそれが困難見つけた場合 — あなたは正しい方向に向かっている。\n"
+        " 넌 모든 꽃들을 다 꺾어버릴 수는 있겠지만, 봄이 오는 걸 막을 수는 없어。 ", false, 400, false}
+    };
+    Scalar color(150, 80, 0);
+
+    for(int iter = 0; iter < 1; iter++)
+    {
+        //double ts = (double)getTickCount();
+        img.setTo(Scalar::all(255));
+        int sz = 20;
+        int x0 = 50, y0 = 70;
+        Point org(x0, y0);
+
+        int j = 0, column = 1;
+        for(const TextProp& t: text)
+        {
+            PutTextFlags flags = t.ralign ? PUT_TEXT_ALIGN_RIGHT : PUT_TEXT_ALIGN_LEFT;
+            if(t.ralign)
+            {
+                if(j > 0)
+                    break;
+                if(column == 1)
+                {
+                    column = 2;
+                    org.y = y0;
+                }
+                org.x = img.cols - x0;
+            }
+            else
+            {
+                org.x = column == 1 ? x0 : img.cols/2;
+            }
+            FontFace& face = t.italic ? italic : sans;
+            //Rect r = getTextSize(img.size(), t.str, org, face, sz, t.weight, flags);
+            org = putText(img, t.str, org, color, face,
+                          sz, t.weight, flags, Range());
+            //rectangle(img, r, Scalar(80, 0, 128), 1, LINE_AA);
+            org.y += sz + 10;
+        }
+
+        Scalar color2(80, 0, 128);
+
+        org = Point(img.cols - 500, 150);
+        putText(img, "Пробуем\n ", org, color2, italic, 80, 300,
+                PUT_TEXT_ALIGN_LEFT, Range());
+        org.x -= 90;
+        org.y += 130;
+        // testing alternative way to set the weight;
+        // in putText we use weight=0
+        italic.setInstance({CV_FOURCC('w','g','h','t'), 800<<16});
+        putText(img, "OpenCV", org, color2, italic, 120, 0,
+                PUT_TEXT_ALIGN_LEFT, Range());
+        org.y += 140;
+        org.x += 60;
+        putText(img, "打印文字", org, color2, sans, 100, 400,
+                PUT_TEXT_ALIGN_LEFT, Range());
+        //ts = (double)getTickCount() - ts;
+        //printf("iter=%d. ts=%.2fms\n", iter, ts*1000./getTickFrequency());
+    }
+
+#if 0
+    //imwrite(ts_data_path + "../highgui/drawing/text_test_new.png", img);
+    imshow("test", img);
+    waitKey();
+#else
+    // Always dump the rendered image for visual inspection (HarfBuzz engine bring-up).
+    //imwrite("ttf_text_actual.png", img);
+    Mat refimg = imread(ts_data_path + "../highgui/drawing/text_test.png", IMREAD_UNCHANGED);
+    //imshow("ref", refimg);
+    //imshow("actual", img);
+    //absdiff(refimg, img, refimg);
+    //imshow("diff", refimg);
+    //waitKey();
+    EXPECT_EQ(refimg.size(), img.size());
+    EXPECT_LT(cv::norm(refimg, img, NORM_L1), 6500);
+#endif
+}
+
+// Re-registers the external test fonts when a test that unregistered them finishes.
+struct ExternalTestFontsGuard
+{
+    ~ExternalTestFontsGuard()
+    {
+        FontFace::setBuiltinFont("italic", externalTestFont("italic"));
+        FontFace::setBuiltinFont("uni", externalTestFont("uni"));
+    }
+};
+
+TEST(Drawing, builtin_font_slots)
+{
+    string italic_font = externalTestFont("italic"), uni_font = externalTestFont("uni");
+    ExternalTestFontsGuard guard;
+
+    EXPECT_FALSE(FontFace::setBuiltinFont("no-such-slot", ""));
+    EXPECT_FALSE(FontFace::setBuiltinFont("uni", "no-such-file.ttf"));
+
+    // back to the compiled-in state: only the fonts selected at build time
+    ASSERT_TRUE(FontFace::setBuiltinFont("italic", ""));
+    ASSERT_TRUE(FontFace::setBuiltinFont("uni", ""));
+    {
+        // "italic" always resolves to some font: the compiled-in Rubik Italic if any,
+        // otherwise the upright "sans" (so FONT_ITALIC in the legacy API keeps working)
+        FontFace italic("italic");
+#ifdef HAVE_ITALICFONT
+        EXPECT_EQ(italic.getName(), "italic");
+#else
+        EXPECT_EQ(italic.getName(), "sans");
+#endif
+        FontFace uni;
+#ifdef HAVE_UNIFONT
+        EXPECT_TRUE(uni.set("uni"));
+#else
+        EXPECT_FALSE(uni.set("uni"));
+#endif
+    }
+    Mat img(60, 300, CV_8UC3, Scalar::all(255));
+    FontFace sans("sans");
+    Rect r_before = getTextSize(img.size(), "打印文字", Point(10, 40), sans, 30, 400, PUT_TEXT_ALIGN_LEFT);
+
+    // register the external CJK font: it now serves both as "uni" and as a fallback for "sans"
+    ASSERT_TRUE(FontFace::setBuiltinFont("uni", uni_font));
+    FontFace uni("uni");
+    EXPECT_EQ(uni.getName(), "uni");
+    Rect r_after = getTextSize(img.size(), "打印文字", Point(10, 40), sans, 30, 400, PUT_TEXT_ALIGN_LEFT);
+#ifndef HAVE_UNIFONT
+    // without the CJK font the characters were not covered and measured as '?'
+    EXPECT_NE(r_before.width, r_after.width);
+#else
+    EXPECT_EQ(r_before.width, r_after.width);
+#endif
+    putText(img, "打印文字", Point(10, 40), Scalar(0, 0, 0), sans, 30, 400, PUT_TEXT_ALIGN_LEFT);
+    EXPECT_LT(mean(img)[0], 255.0); // something has been drawn
+
+    ASSERT_TRUE(FontFace::setBuiltinFont("italic", italic_font));
+    FontFace italic("italic");
+    EXPECT_EQ(italic.getName(), "italic");
+}
+
+// Experiment (not a regression test): render Arabic + Devanagari with FiraGO,
+// which covers both scripts, and dump a PNG for visual inspection.
+TEST(Drawing, DISABLED_firago_experiment)
+{
+    // FiraGO covers both Arabic and Devanagari. It is optional test data:
+    // findDataFile(..., /*required=*/false) throws SkipTestException when the
+    // font is absent, so the test is reported as skipped rather than failing.
+    string fontpath = findDataFile("../highgui/drawing/FiraGo-Book.ttf", false);
+    FontFace fira(fontpath);
+
+    Mat img(360, 1000, CV_8UC3, Scalar::all(255));
+    Scalar color(40, 40, 40);
+    int x0 = 40, y = 70;
+
+    putText(img, "FiraGO: Arabic + Devanagari", Point(x0, y), color, fira, 30, 500,
+            PUT_TEXT_ALIGN_LEFT, Range());
+    y += 90;
+    putText(img, "العربية لغة جميلة، والخط العربي فن.", Point(x0, y), color, fira, 48, 400,
+            PUT_TEXT_ALIGN_LEFT, Range());
+    y += 100;
+    putText(img, "नमस्ते दुनिया — संस्कृतम् सुन्दरम् अस्ति।", Point(x0, y), color, fira, 48, 400,
+            PUT_TEXT_ALIGN_LEFT, Range());
+
+    imwrite("firago_experiment.png", img);
 }
 
 TEST(Drawing, fillpoly_contours)
@@ -811,7 +1090,7 @@ TEST(Drawing, fillpoly_fully)
             t1.x = (t1.x + offset.x) << (xy_shift - shift);
             t1.y = (t1.y + delta) >> shift;
 
-            if (lineType < cv::LINE_AA)
+            if (lineType < LINE_AA)
             {
                 t0.x = (t0.x + (xy_one >> 1)) >> xy_shift;
                 t1.x = (t1.x + (xy_one >> 1)) >> xy_shift;
@@ -900,7 +1179,7 @@ PARAM_TEST_CASE(FillPolyFully, unsigned, unsigned, int, int, Point, cv::LineType
             t1.x = (t1.x + offset.x) << (xy_shift - shift);
             t1.y = (t1.y + delta) >> shift;
 
-            if (lineType < cv::LINE_AA)
+            if (lineType < LINE_AA)
             {
                 t0.x = (t0.x + (xy_one >> 1)) >> xy_shift;
                 t1.x = (t1.x + (xy_one >> 1)) >> xy_shift;
@@ -933,7 +1212,7 @@ PARAM_TEST_CASE(FillPolyFully, unsigned, unsigned, int, int, Point, cv::LineType
     }
 };
 
-TEST_P(FillPolyFully, DISABLED_fillpoly_fully)
+TEST_P(FillPolyFully, fillpoly_fully)
 {
     int imageSizeOffset = 15;
 

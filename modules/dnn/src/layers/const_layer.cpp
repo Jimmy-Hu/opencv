@@ -57,6 +57,20 @@ public:
         return false;
     }
 
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        if (preferableTarget == DNN_TARGET_OPENCL_FP16
+            && blobs[0].type() == CV_32F)
+            outputs.assign(1, CV_16F);
+        else
+            outputs.assign(1, blobs[0].depth());
+    }
+
+
 #ifdef HAVE_OPENCL
     bool forward_ocl(InputArrayOfArrays inps, OutputArrayOfArrays outs, OutputArrayOfArrays internals)
     {
@@ -128,23 +142,10 @@ public:
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> >& inputs,
                                         const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
-        ov::element::Type dType;
-        if (blobs[0].depth() == CV_32F) {
-            dType = ov::element::f32;
-        } else if (blobs[0].depth() == CV_32S) {
-            dType = ov::element::i32;
-        } else if (blobs[0].depth() == CV_8S) {
-            dType = ov::element::i8;
-        } else {
-            CV_Error(Error::StsNotImplemented, format("Unexpected Const data depth: %d", blobs[0].depth()));
-        }
         std::shared_ptr<ov::Node> node =
-                    std::make_shared<ov::op::v0::Constant>(dType,
+                    std::make_shared<ov::op::v0::Constant>(cvTypeToOvType(blobs[0]),
                                                            getShape<size_t>(blobs[0]),
                                                            blobs[0].data);
-        if (node->get_element_type() != ov::element::f32) {
-            node = std::make_shared<ov::op::v0::Convert>(node, ov::element::f32);
-        }
         return Ptr<BackendNode>(new InfEngineNgraphNode(node));
     }
 #endif  // HAVE_DNN_NGRAPH
@@ -171,22 +172,12 @@ public:
 
         CV_Assert(blobs.size() == 1);
         Mat blob = blobs[0];
-        if (blob.type() != CV_32F) {
-            blob.convertTo(blob, CV_32F);
-        }
-        return make_cuda_node<cuda4dnn::ConstOp>(preferableTarget, std::move(context->stream), blob);
+        if (blob.type() == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::ConstOp>(std::move(context->stream), blob);
+        else
+            return make_cuda_node_with_type<cuda4dnn::ConstOp>(preferableTarget, blob.type(), std::move(context->stream), blob);
     }
 #endif
-
-    virtual bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                             const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        Mat quantizedBlob;
-        blobs[0].convertTo(quantizedBlob, CV_8S, 1.f/scales[1][0], zeropoints[1][0]);
-        params.blobs.clear();
-        params.blobs.push_back(quantizedBlob);
-        return true;
-    }
 };
 
 Ptr<Layer> ConstLayer::create(const LayerParams& params)

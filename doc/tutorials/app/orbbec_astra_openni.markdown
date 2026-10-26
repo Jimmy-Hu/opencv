@@ -200,5 +200,5 @@ but the depth data makes it easy.
 ![Depth frame](images/astra_depth.png)
 
 The complete implementation can be found in
-[openni_orbbec_astra.cpp](https://github.com/opencv/opencv/tree/4.x/samples/cpp/tutorial_code/videoio/openni_orbbec_astra/openni_orbbec_astra.cpp)
+[openni_orbbec_astra.cpp](https://github.com/opencv/opencv/tree/5.x/samples/cpp/tutorial_code/videoio/openni_orbbec_astra/openni_orbbec_astra.cpp)
 in `samples/cpp/tutorial_code/videoio` directory.

@@ -7,6 +7,7 @@
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 
+
 #include <opencv2/dnn/shape_utils.hpp>
 
 namespace cv { namespace dnn {
@@ -37,23 +38,41 @@ public:
                backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
     }
 
+    bool isDataShuffling() const CV_OVERRIDE { return true; }
+
     virtual bool getMemoryShapes(const std::vector<MatShape> &inputs,
                                  const int requiredOutputs,
                                  std::vector<MatShape> &outputs,
                                  std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_CheckEQ(inputs.size(), 1ull, "Tile: one input is expected");
+        int nrepeats = (int)repeats.size();
 
         // repeats must have the same length as input's dimension number
-        // FIXIT: it breaks when the input is 1d tensor (represented as 2d mat with size=2 in opencv dnn)
-        CV_CheckEQ(inputs[0].size(), repeats.size(), "Tile: repeats must be a 1D tensor of the same length as input's dimension number");
-
-        outputs.assign(1, inputs[0]);
-        for (int i = 0; i < repeats.size(); i++)
-        {
-            outputs[0][i] *= repeats[i];
+        if (inputs[0].size() > 1) {
+            CV_CheckEQ(inputs[0].size(), repeats.size(), "Tile: repeats must be a 1D tensor of the same length as input's dimension number");
+            outputs.assign(1, inputs[0]);
+            for (int i = 0; i < nrepeats; i++)
+            {
+                outputs[0][i] *= repeats[i];
+            }
+        } else {
+            CV_CheckGE(nrepeats, 1, "Tile: Provide at least one repeat along any dimension");
+            outputs.assign(1, MatShape(repeats));
+            if (inputs[0].size() == 1)
+                outputs[0][nrepeats - 1] *= inputs[0][0];
         }
+
         return false;
+    }
+
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        outputs.assign(requiredOutputs, inputs[0]);
     }
 
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
@@ -69,22 +88,29 @@ public:
         Mat& out = outputs[0];
 
         Mat tmp = data.clone();
-        MatShape tmp_shape = shape(tmp);
         MatShape out_shape = shape(out);
         int rep_i, ndims = data.dims;
         int dims = 1;
-        for (int i = 0; i < ndims; i++)
-        {
-            rep_i = repeats[i];
-            if (rep_i != 1)
+        if (ndims > 1){
+            for (int i = 0; i < ndims; i++)
             {
-                tmp = tmp.reshape(0, dims);
-                tmp = cv::repeat(tmp, 1, rep_i);
+                rep_i = repeats[i];
+                if (rep_i != 1)
+                {
+                    tmp = tmp.reshape(0, dims);
+                    tmp = cv::repeat(tmp, 1, rep_i);
+                }
                 dims *= out_shape[i];
             }
+            tmp = tmp.reshape(0, out_shape);
+        } else {
+            for (int i = 0; i < repeats.size(); i++){
+                tmp = tmp.reshape(0, dims);
+                tmp = cv::repeat(tmp, repeats[i], 1);
+                dims *= out_shape[i];
+            }
+            tmp = tmp.reshape(0, out_shape);
         }
-        tmp = tmp.reshape(0, out_shape);
-
         tmp.copyTo(out);
     }
 
@@ -97,6 +123,7 @@ public:
         return Ptr<BackendNode>(new InfEngineNgraphNode(tile));
     }
 #endif  // HAVE_DNN_NGRAPH
+
 
 private:
     std::vector<int> repeats;

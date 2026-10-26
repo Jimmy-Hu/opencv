@@ -8,9 +8,12 @@
 #include <cmath>
 #include <ctime>
 
-#include <opencv2/calib3d.hpp>
+#include <opencv2/geometry.hpp>
+#include <opencv2/calib.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
+
+using namespace cv;
 
 double calib::calibController::estimateCoverageQuality()
 {

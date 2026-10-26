@@ -41,7 +41,7 @@
 //M*/
 
 #include "precomp.hpp"
-#include "opencv2/calib3d/private.hpp"
+#include "opencv2/core/cvdef.h"
 
 using namespace cv;
 using namespace cv::detail;
@@ -252,42 +252,35 @@ bool BundleAdjusterBase::estimate(const std::vector<ImageFeatures> &features,
         total_num_matches_ += static_cast<int>(pairwise_matches[edges_[i].first * num_images_ +
                                                                 edges_[i].second].num_inliers);
 
-    LevMarq solver(num_images_ * num_params_per_cam_,
-                   total_num_matches_ * num_errs_per_measurement_, term_criteria_);
+    int nerrs = total_num_matches_ * num_errs_per_measurement_;
 
-    Mat err, jac;
-    cam_params_.copyTo(solver.param);
-
-#if ENABLE_LOG
-    int iter = 0;
-#endif
-    for(;;)
+    auto callb = [&](InputOutputArray param, OutputArray err, OutputArray jac) -> bool
     {
-        Mat1d _param, _jac, _err;
-
-        bool proceed = solver.update(_param, _jac, _err);
-
-        _param.copyTo(cam_params_);
-
-        if (!proceed || _err.empty())
-            break;
-
-        if (!_jac.empty())
+        // workaround against losing value
+        Mat backup = cam_params_.clone();
+        param.copyTo(cam_params_);
+        if (jac.needed())
         {
-            calcJacobian(jac);
-            jac.copyTo(_jac);
+            Mat m = jac.getMat();
+            calcJacobian(m);
         }
-
-        if (!_err.empty())
+        if (err.needed())
         {
-            calcError(err);
-            LOG_CHAT(".");
-#if ENABLE_LOG
-            iter++;
-#endif
-            err.copyTo(_err);
+            Mat m = err.getMat();
+            calcError(m);
         }
-    }
+        backup.copyTo(cam_params_);
+        return true;
+    };
+
+    LevMarq solver(cam_params_, callb,
+                   LevMarq::Settings()
+                   .setMaxIterations((unsigned int)term_criteria_.maxCount)
+                   .setStepNormTolerance(term_criteria_.epsilon)
+                   .setSmallEnergyTolerance(term_criteria_.epsilon * term_criteria_.epsilon)
+                   .setGeodesic(true),
+                   noArray(), MatrixType::AUTO, VariableType::LINEAR, nerrs);
+    solver.optimize();
 
     LOGLN_CHAT("");
     LOGLN_CHAT("Bundle adjustment, final RMS error: " << std::sqrt(err.dot(err) / total_num_matches_));

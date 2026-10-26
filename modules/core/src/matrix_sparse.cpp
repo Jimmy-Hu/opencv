@@ -273,7 +273,7 @@ size_t SparseMat::hash(const int* idx) const
 SparseMat::SparseMat(const Mat& m)
 : flags(MAGIC_VAL), hdr(0)
 {
-    create( m.dims, m.size, m.type() );
+    create( m.dims, m.size.p, m.type() );
 
     int i, idx[CV_MAX_DIM] = {0}, d = m.dims, lastSize = m.size[d - 1];
     size_t esz = m.elemSize();
@@ -845,7 +845,7 @@ void normalize( const SparseMat& src, SparseMat& dst, double a, int norm_type )
     CV_INSTRUMENT_REGION();
 
     double scale = 1;
-    if( norm_type == CV_L2 || norm_type == CV_L1 || norm_type == CV_C )
+    if( norm_type == NORM_L2 || norm_type == NORM_L1 || norm_type == NORM_INF )
     {
         scale = norm( src, norm_type );
         scale = scale > DBL_EPSILON ? a/scale : 0.;
@@ -857,41 +857,3 @@ void normalize( const SparseMat& src, SparseMat& dst, double a, int norm_type )
 }
 
 } // cv::
-
-//
-// C-API glue
-//
-CvSparseMat* cvCreateSparseMat(const cv::SparseMat& sm)
-{
-    if( !sm.hdr || sm.hdr->dims > (int)cv::SparseMat::MAX_DIM)
-        return 0;
-
-    CvSparseMat* m = cvCreateSparseMat(sm.hdr->dims, sm.hdr->size, sm.type());
-
-    cv::SparseMatConstIterator from = sm.begin();
-    size_t i, N = sm.nzcount(), esz = sm.elemSize();
-
-    for( i = 0; i < N; i++, ++from )
-    {
-        const cv::SparseMat::Node* n = from.node();
-        uchar* to = cvPtrND(m, n->idx, 0, -2, 0);
-        cv::copyElem(from.ptr, to, esz);
-    }
-    return m;
-}
-
-void CvSparseMat::copyToSparseMat(cv::SparseMat& m) const
-{
-    m.create( dims, &size[0], type );
-
-    CvSparseMatIterator it;
-    CvSparseNode* n = cvInitSparseMatIterator(this, &it);
-    size_t esz = m.elemSize();
-
-    for( ; n != 0; n = cvGetNextSparseNode(&it) )
-    {
-        const int* idx = CV_NODE_IDX(this, n);
-        uchar* to = m.newNode(idx, m.hash(idx));
-        cv::copyElem((const uchar*)CV_NODE_VAL(this, n), to, esz);
-    }
-}

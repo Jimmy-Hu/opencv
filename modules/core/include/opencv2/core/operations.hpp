@@ -50,6 +50,7 @@
 #endif
 
 #include <cstdio>
+#include <ostream>
 
 #if defined(__GNUC__) || defined(__clang__) // at least GCC 3.1+, clang 3.5+
 #  if defined(__MINGW_PRINTF_FORMAT)  // https://sourceforge.net/p/mingw-w64/wiki2/gnu%20printf/.
@@ -263,12 +264,22 @@ Matx<_Tp, n, l> Matx<_Tp, m, n>::solve(const Matx<_Tp, m, l>& rhs, int method) c
     return ok ? x : Matx<_Tp, n, l>::zeros();
 }
 
+template<typename _Tp, int m, int n> inline
+void Matx<_Tp, m, n>::copyTo(OutputArray dst) const
+{
+    Mat(*this, false).copyTo(dst);
+}
 
+template<typename _Tp, int m, int n> inline
+void Matx<_Tp, m, n>::convertTo(OutputArray dst, int type, double scale, double shift) const
+{
+    Mat(*this, false).convertTo(dst, type, scale, shift);
+}
 
 ////////////////////////// Augmenting algebraic & logical operations //////////////////////////
 
 #define CV_MAT_AUG_OPERATOR1(op, cvop, A, B) \
-    static inline A& operator op (A& a, const B& b) { cvop; return a; }
+    inline A& operator op (A& a, const B& b) { cvop; return a; }
 
 #define CV_MAT_AUG_OPERATOR(op, cvop, A, B)   \
     CV_MAT_AUG_OPERATOR1(op, cvop, A, B)      \
@@ -279,8 +290,8 @@ Matx<_Tp, n, l> Matx<_Tp, m, n>::solve(const Matx<_Tp, m, l>& rhs, int method) c
     template<typename _Tp> CV_MAT_AUG_OPERATOR1(op, cvop, const A, B)
 
 #define CV_MAT_AUG_OPERATOR_TN(op, cvop, A)                                \
-    template<typename _Tp, int m, int n> static inline A& operator op (A& a, const Matx<_Tp,m,n>& b) { cvop; return a; } \
-    template<typename _Tp, int m, int n> static inline const A& operator op (const A& a, const Matx<_Tp,m,n>& b) { cvop; return a; }
+    template<typename _Tp, int m, int n> inline A& operator op (A& a, const Matx<_Tp,m,n>& b) { cvop; return a; } \
+    template<typename _Tp, int m, int n> inline const A& operator op (const A& a, const Matx<_Tp,m,n>& b) { cvop; return a; }
 
 CV_MAT_AUG_OPERATOR  (+=, cv::add(a, b, (const Mat&)a), Mat, Mat)
 CV_MAT_AUG_OPERATOR  (+=, cv::add(a, b, (const Mat&)a), Mat, Scalar)
@@ -419,7 +430,7 @@ inline unsigned RNG::next()
 }
 
 //! returns the next uniformly-distributed random number of the specified type
-template<typename _Tp> static inline _Tp randu()
+template<typename _Tp> inline _Tp randu()
 {
   return (_Tp)theRNG();
 }
@@ -427,13 +438,13 @@ template<typename _Tp> static inline _Tp randu()
 
 ///////////////////////////////// Formatted output of cv::Mat /////////////////////////////////
 
-static inline
+inline
 Ptr<Formatted> format(InputArray mtx, Formatter::FormatType fmt)
 {
     return Formatter::get(fmt)->format(mtx.getMat());
 }
 
-static inline
+inline
 int print(Ptr<Formatted> fmtd, FILE* stream = stdout)
 {
     int written = 0;
@@ -444,35 +455,40 @@ int print(Ptr<Formatted> fmtd, FILE* stream = stdout)
     return written;
 }
 
-static inline
+inline
 int print(const Mat& mtx, FILE* stream = stdout)
 {
     return print(Formatter::get()->format(mtx), stream);
 }
 
-static inline
+inline
 int print(const UMat& mtx, FILE* stream = stdout)
 {
     return print(Formatter::get()->format(mtx.getMat(ACCESS_READ)), stream);
 }
 
-template<typename _Tp> static inline
+template<typename _Tp> inline
 int print(const std::vector<Point_<_Tp> >& vec, FILE* stream = stdout)
 {
     return print(Formatter::get()->format(Mat(vec)), stream);
 }
 
-template<typename _Tp> static inline
+template<typename _Tp> inline
 int print(const std::vector<Point3_<_Tp> >& vec, FILE* stream = stdout)
 {
     return print(Formatter::get()->format(Mat(vec)), stream);
 }
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 int print(const Matx<_Tp, m, n>& matx, FILE* stream = stdout)
 {
     return print(Formatter::get()->format(cv::Mat(matx)), stream);
 }
+
+// numpy/ONNXRuntime-style matrix pretty-printer
+CV_EXPORTS std::ostream& pprint(std::ostream& strm, InputArray tensor, int indent=0,
+                                int edge=3, int wholeTensorThreshold=100,
+                                char parens='\0');
 
 //! @endcond
 

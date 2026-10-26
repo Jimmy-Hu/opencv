@@ -501,7 +501,7 @@ double CvCaptureCAM_Aravis::getProperty( int property_id ) const
         }
         break;
     }
-    return -1.0;
+    return CAP_PROP_UNKNOWN;
 }
 
 double CvCaptureCAM_Aravis::getExpectedMidGrey(ArvPixelFormat fmt) const
@@ -643,5 +643,45 @@ cv::Ptr<cv::IVideoCapture> cv::create_Aravis_capture( int index )
         return capture;
     }
     return NULL;
+}
+
+// Build a human readable name for the device with the given index in the
+// cached Aravis device list. arv_update_device_list() shall be called before.
+static std::string aravisDeviceName(unsigned int index)
+{
+    const char *vendor = arv_get_device_vendor(index);
+    const char *model = arv_get_device_model(index);
+    const char *id = arv_get_device_id(index);
+
+    std::string name;
+    if(vendor && vendor[0])
+        name = vendor;
+    if(model && model[0]) {
+        if(!name.empty())
+            name += " ";
+        name += model;
+    }
+    if(id && id[0]) {
+        if(name.empty())
+            name = id;
+        else
+            name += cv::format(" (%s)", id);
+    }
+
+    return name;
+}
+
+std::vector<cv::VideoDeviceInfo> cv::enumerate_Aravis_devices()
+{
+    std::vector<VideoDeviceInfo> result;
+
+    arv_update_device_list();
+
+    const unsigned int count = arv_get_n_devices();
+    for(unsigned int i = 0; i < count; i++) {
+        result.push_back(makeVideoDeviceInfo((int)i, CAP_ARAVIS, aravisDeviceName(i)));
+    }
+
+    return result;
 }
 #endif

@@ -43,7 +43,6 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_webnn.hpp"
@@ -78,6 +77,8 @@ public:
     {
         axisRaw = params.get<int>("axis", -1);
         logSoftMax = params.get<bool>("log_softmax", false);
+        scale = params.get<float>("scale", 1.f);
+        coerced2d = params.get<bool>("coerced_2d", false);
         setParamsFrom(params);
     }
 
@@ -92,14 +93,20 @@ public:
     {
         bool inplace = Layer::getMemoryShapes(inputs, requiredOutputs, outputs, internals);
         MatShape shape = inputs[0];
-        int cAxis = normalize_axis(axisRaw, shape.size());
-        shape[cAxis] = 1;
+        if (shape.dims > 0) {
+            int cAxis = normalize_axis(axisRaw, shape.dims);
+            shape[cAxis] = 1;
+        }
         internals.assign(1, shape);
         return inplace;
     }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
+#if defined(HAVE_CUDNNJIT) && !defined(HAVE_CUDNN)
+        if (backendId == DNN_BACKEND_CUDA)
+            return false;  // SoftmaxOp uses cudnnSoftmaxForward, absent in a JIT-only build
+#endif
 #ifdef HAVE_INF_ENGINE
         if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
             return true;
@@ -116,7 +123,6 @@ public:
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               (backendId == DNN_BACKEND_HALIDE && haveHalide() && axisRaw == 1) ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -140,6 +146,11 @@ public:
         UMat& src = inputs[0];
         UMat& dstMat = outputs[0];
         int axis = normalize_axis(axisRaw, src.dims);
+
+        // The kernels below reduce over a single axis; the pre-opset-13 semantics reduce
+        // over the flattened dims [axis, rank) and are handled by the CPU path.
+        if (coerced2d && axis != src.dims - 1)
+            return false;
 
         if (softmaxOp.empty())
         {
@@ -231,51 +242,56 @@ public:
         Mat &dst = outputs[0];
         int axis = normalize_axis(axisRaw, src.dims);
 
-        if(logSoftMax)
+        // Softmax/LogSoftmax before opset 13 coerce the input to the 2D tensor
+        // [a_0 * ... * a_{axis-1}, a_axis * ... * a_{n-1}] and normalise over its second
+        // dimension, so the reduced range is the whole flattened tail and not just the
+        // one axis.  The tail is contiguous, so a 2D view of the blob expresses that.
+        if (coerced2d && axis != src.dims - 1)
+        {
+            MatShape s = shape(src);
+            std::vector<int> twoDims{static_cast<int>(total(s, 0, axis)),
+                                     static_cast<int>(total(s, axis))};
+            Mat src2d = src.reshape(1, twoDims);
+            Mat dst2d = dst.reshape(1, twoDims);
+
+            if (logSoftMax) {
+                CV_Assert(scale == 1.f);
+                logSoftmax(dst2d, src2d, 1);
+            } else if (scale != 1.f) {
+                softmax(dst2d, src2d, 1, scale);
+            } else {
+                softmax(dst2d, src2d, 1);
+            }
+            return;
+        }
+
+        if (logSoftMax) {
+            CV_Assert(scale == 1.f);
             logSoftmax(dst, src, axis);
-        else
+        } else if (scale != 1.f) {
+            softmax(dst, src, axis, scale);
+        } else {
             softmax(dst, src, axis);
+        }
     }
 
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays inputs_,
+        InputArrayOfArrays
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
 
-        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
-        auto channel_axis = normalize_axis(axisRaw, input_wrapper->getRank());
+        std::vector<UMat> inputs;
+        inputs_.getUMatVector(inputs);
+        CV_Assert(!inputs.empty());
+
+        auto channel_axis = normalize_axis(axisRaw, cv::dnn::shape(inputs[0]).dims);
         return make_cuda_node<cuda4dnn::SoftmaxOp>(preferableTarget, std::move(context->cudnn_handle), channel_axis, logSoftMax);
     }
 #endif
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
-        int inW, inH, inC, inN;
-        getCanonicalSize(inputBuffer, &inW, &inH, &inC, &inN);
-
-        if (inW != 1 || inH != 1)
-            CV_Error(cv::Error::StsNotImplemented,
-                     "Halide backend for SoftMax with spatial size "
-                     "more than 1x1 is not implemented");
-
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-
-        Halide::Func expInput("expInput");
-        Halide::RDom r(0, inW, 0, inH, 0, inC);
-        expInput(x, y, c, n) = exp(inputBuffer(x, y, c, n));
-        Halide::Expr globalSum = sum(expInput(r.x, r.y, r.z, n));
-        top(x, y, c, n) = expInput(x, y, c, n) / globalSum;
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
 
 #ifdef HAVE_CANN
     virtual Ptr<BackendNode> initCann(const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -321,24 +337,6 @@ public:
     }
 #endif  // HAVE_DNN_NGRAPH
 
-    virtual bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                             const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        float inpScale = scales[0][0];
-        Mat lookUpTable(1, 256, CV_32F);
-        float* table = lookUpTable.ptr<float>();
-        for (int i = -128; i < 128; i++)
-        {
-            float x = inpScale*(i - 127); // ensures exp(x) is always between (0, 1)
-            table[i+128] = std::exp(x);
-        }
-        params.blobs.clear();
-        params.blobs.push_back(lookUpTable);
-        params.set("input_scale", inpScale);
-        params.set("input_zeropoint", zeropoints[0][0]);
-        return true;
-    }
-
 #ifdef HAVE_WEBNN
     virtual Ptr<BackendNode> initWebnn(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
@@ -366,6 +364,7 @@ public:
     }
 
     int axisRaw;
+    bool coerced2d;  // ONNX Softmax/LogSoftmax before opset 13 reduce the flattened tail
 };
 
 Ptr<SoftmaxLayer> SoftmaxLayer::create(const LayerParams& params)

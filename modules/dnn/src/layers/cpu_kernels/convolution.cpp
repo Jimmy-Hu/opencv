@@ -164,18 +164,22 @@ Ptr<FastConv> initFastConv(
     }
 
     conv->conv_type = ifRunDepthWise && conv_dim != CONV_3D ? CONV_TYPE_DEPTHWISE :
-            useWinograd && (conv_dim == CONV_2D && (conv->useSIMD128 || conv->useAVX || conv->useAVX2 || conv->useNEON) &&
+            useWinograd && (conv_dim == CONV_2D && (conv->useSIMD128 || conv->useAVX || conv->useAVX2 || conv->useNEON || conv->useRVV) &&
             Hk == 3 && Wk == 3 && dilation_h == 1 && dilation_w == 1 && stride_h == 1 && stride_w == 1) ?
             CONV_TYPE_WINOGRAD3X3 :
             (ifRunDepthWiseRemain ? CONV_TYPE_DEPTHWISE_REMAIN : CONV_TYPE_GENERIC);
 
-#if !(CV_NEON || CV_SIMD128 || CV_TRY_AVX || CV_TRY_AVX2)
-    if (conv->conv_type == CONV_TYPE_WINOGRAD3X3) // Disabel Winograd when CV_NEON, CV_SIMD128 ,CV_TRY_AVX and CV_TRY_AVX2 are not available.
+#if !(CV_NEON || CV_SIMD128 || CV_TRY_AVX || CV_TRY_AVX2 || CV_RVV)
+    if (conv->conv_type == CONV_TYPE_WINOGRAD3X3) // Disabel Winograd when CV_NEON, CV_SIMD128, CV_TRY_AVX, CV_TRY_AVX2 and CV_RVV are not available.
+        conv->conv_type = CONV_TYPE_GENERIC;
+#endif
+#if CV_RVV
+    // Winograd RVV requires vsetvlmax_e32m1() >= 8 (i.e. VLEN >= 256). Fall back to generic on narrower implementations.
+    if (conv->conv_type == CONV_TYPE_WINOGRAD3X3 && conv->useRVV && (int)__riscv_vsetvlmax_e32m1() < 8)
         conv->conv_type = CONV_TYPE_GENERIC;
 #endif
 
     Mat weightsMat = _weightsMat.getMat();
-    auto wShape = shape(weightsMat);
     const size_t wstep = weightsMat.step1();
 
     conv->useFP16 = false;
@@ -245,6 +249,8 @@ Ptr<FastConv> initFastConv(
 
 #if CV_TRY_AVX || CV_TRY_AVX2
         const int CONV_WINO_ATOM_F32 = (conv->useAVX || conv->useAVX2) ? 8 : 4;
+#elif CV_RVV
+        const int CONV_WINO_ATOM_F32 = (conv->useRVV && (int)__riscv_vsetvlmax_e32m1() >= 8) ? 8 : 4;
 #else
         const int CONV_WINO_ATOM_F32 = 4;
 #endif
@@ -1859,6 +1865,58 @@ void convBlockMR1_F32(int np, const float* a, const float* b, float *c, const fl
     }
      else
         convBlockMR1NoSIMD(np, a, b, c, bias, init_c, minval, maxval, ifMinMaxAct, outLen, convNR);
+#elif CV_RVV
+{
+    // LMUL=1 kernel: vlanes = VLEN/32 (8 at VLEN=256), so the convNR==24 tile is 3 vectors.
+    // OpenCV's scalable v_float32 is LMUL=2 (16 lanes at VLEN=256) and does not divide 24,
+    // hence native LMUL=1 intrinsics here; vfmacc.vf broadcasts a[p] without an extra register.
+    // Like the NEON MR1 kernel, all convNR outputs are stored even for partial outLen:
+    // the caller redirects partial stripes into a CONV_NR-sized buffer and copies outLen back.
+    const int vl = (int)__riscv_vsetvlmax_e32m1();
+    if (convNR == 3 * vl)
+    {
+        vfloat32m1_t c0 = __riscv_vfmv_v_f_f32m1(bias, vl), c1 = c0, c2 = c0;
+        if (outLen > 2 * vl)
+        {
+            for (int p = 0; p < np; p++, a++, b += convNR)
+            {
+                c0 = __riscv_vfmacc_vf_f32m1(c0, a[0], __riscv_vle32_v_f32m1(b,          vl), vl);
+                c1 = __riscv_vfmacc_vf_f32m1(c1, a[0], __riscv_vle32_v_f32m1(b + vl,     vl), vl);
+                c2 = __riscv_vfmacc_vf_f32m1(c2, a[0], __riscv_vle32_v_f32m1(b + 2 * vl, vl), vl);
+            }
+        }
+        else if (outLen > vl)
+        {
+            for (int p = 0; p < np; p++, a++, b += convNR)
+            {
+                c0 = __riscv_vfmacc_vf_f32m1(c0, a[0], __riscv_vle32_v_f32m1(b,      vl), vl);
+                c1 = __riscv_vfmacc_vf_f32m1(c1, a[0], __riscv_vle32_v_f32m1(b + vl, vl), vl);
+            }
+        }
+        else
+        {
+            for (int p = 0; p < np; p++, a++, b += convNR)
+                c0 = __riscv_vfmacc_vf_f32m1(c0, a[0], __riscv_vle32_v_f32m1(b, vl), vl);
+        }
+        if (init_c)
+        {
+            c0 = __riscv_vfadd_vv_f32m1(c0, __riscv_vle32_v_f32m1(c,          vl), vl);
+            c1 = __riscv_vfadd_vv_f32m1(c1, __riscv_vle32_v_f32m1(c + vl,     vl), vl);
+            c2 = __riscv_vfadd_vv_f32m1(c2, __riscv_vle32_v_f32m1(c + 2 * vl, vl), vl);
+        }
+        if (ifMinMaxAct)
+        {
+            c0 = __riscv_vfmin_vf_f32m1(__riscv_vfmax_vf_f32m1(c0, minval, vl), maxval, vl);
+            c1 = __riscv_vfmin_vf_f32m1(__riscv_vfmax_vf_f32m1(c1, minval, vl), maxval, vl);
+            c2 = __riscv_vfmin_vf_f32m1(__riscv_vfmax_vf_f32m1(c2, minval, vl), maxval, vl);
+        }
+        __riscv_vse32_v_f32m1(c,          c0, vl);
+        __riscv_vse32_v_f32m1(c + vl,     c1, vl);
+        __riscv_vse32_v_f32m1(c + 2 * vl, c2, vl);
+        return;
+    }
+    convBlockMR1NoSIMD(np, a, b, c, bias, init_c, minval, maxval, ifMinMaxAct, outLen, convNR);
+}
 #else
     convBlockMR1NoSIMD(np, a, b, c, bias, init_c, minval, maxval, ifMinMaxAct, outLen, convNR);
 #endif
@@ -2172,6 +2230,85 @@ static inline void convBlockNoSIMD(int np, const float* a, const float* b, float
     }
 }
 
+#if CV_RVV
+// One LMUL=1 row segment of the convBlock_F32 RVV kernel: 4 rows x NC column chunks of vl lanes
+// each. NC is a template argument so unused chunks cost nothing; at VLEN=256 a 24-wide tile is
+// NC=3 chunks of 8 (12 accumulators), at VLEN=1024 one chunk of 24.
+template<int NC>
+static inline void convBlockRVV4xN_m1(int np, const float* a, const float* b, float* c, int ldc,
+                                      bool init_c, int convNR, size_t vl)
+{
+    const size_t o1 = vl, o2 = 2 * vl;  // column offsets of chunks 1 and 2
+    vfloat32m1_t c00 = __riscv_vfmv_v_f_f32m1(0.f, vl), c10 = c00, c20 = c00, c30 = c00;
+    vfloat32m1_t c01 = c00, c11 = c00, c21 = c00, c31 = c00;
+    vfloat32m1_t c02 = c00, c12 = c00, c22 = c00, c32 = c00;
+    for (int p = 0; p < np; p++, a += 4, b += convNR)
+    {
+        vfloat32m1_t b0 = __riscv_vle32_v_f32m1(b, vl);
+        c00 = __riscv_vfmacc_vf_f32m1(c00, a[0], b0, vl);
+        c10 = __riscv_vfmacc_vf_f32m1(c10, a[1], b0, vl);
+        c20 = __riscv_vfmacc_vf_f32m1(c20, a[2], b0, vl);
+        c30 = __riscv_vfmacc_vf_f32m1(c30, a[3], b0, vl);
+        if (NC > 1)
+        {
+            vfloat32m1_t b1 = __riscv_vle32_v_f32m1(b + o1, vl);
+            c01 = __riscv_vfmacc_vf_f32m1(c01, a[0], b1, vl);
+            c11 = __riscv_vfmacc_vf_f32m1(c11, a[1], b1, vl);
+            c21 = __riscv_vfmacc_vf_f32m1(c21, a[2], b1, vl);
+            c31 = __riscv_vfmacc_vf_f32m1(c31, a[3], b1, vl);
+        }
+        if (NC > 2)
+        {
+            vfloat32m1_t b2 = __riscv_vle32_v_f32m1(b + o2, vl);
+            c02 = __riscv_vfmacc_vf_f32m1(c02, a[0], b2, vl);
+            c12 = __riscv_vfmacc_vf_f32m1(c12, a[1], b2, vl);
+            c22 = __riscv_vfmacc_vf_f32m1(c22, a[2], b2, vl);
+            c32 = __riscv_vfmacc_vf_f32m1(c32, a[3], b2, vl);
+        }
+    }
+    // Same accumulation order as convBlockNoSIMD: FMA from zero over p, then add the existing C.
+    if (!init_c)
+    {
+        c00 = __riscv_vfadd_vv_f32m1(c00, __riscv_vle32_v_f32m1(c,           vl), vl);
+        c10 = __riscv_vfadd_vv_f32m1(c10, __riscv_vle32_v_f32m1(c + ldc,     vl), vl);
+        c20 = __riscv_vfadd_vv_f32m1(c20, __riscv_vle32_v_f32m1(c + ldc * 2, vl), vl);
+        c30 = __riscv_vfadd_vv_f32m1(c30, __riscv_vle32_v_f32m1(c + ldc * 3, vl), vl);
+        if (NC > 1)
+        {
+            c01 = __riscv_vfadd_vv_f32m1(c01, __riscv_vle32_v_f32m1(c + o1,           vl), vl);
+            c11 = __riscv_vfadd_vv_f32m1(c11, __riscv_vle32_v_f32m1(c + ldc + o1,     vl), vl);
+            c21 = __riscv_vfadd_vv_f32m1(c21, __riscv_vle32_v_f32m1(c + ldc * 2 + o1, vl), vl);
+            c31 = __riscv_vfadd_vv_f32m1(c31, __riscv_vle32_v_f32m1(c + ldc * 3 + o1, vl), vl);
+        }
+        if (NC > 2)
+        {
+            c02 = __riscv_vfadd_vv_f32m1(c02, __riscv_vle32_v_f32m1(c + o2,           vl), vl);
+            c12 = __riscv_vfadd_vv_f32m1(c12, __riscv_vle32_v_f32m1(c + ldc + o2,     vl), vl);
+            c22 = __riscv_vfadd_vv_f32m1(c22, __riscv_vle32_v_f32m1(c + ldc * 2 + o2, vl), vl);
+            c32 = __riscv_vfadd_vv_f32m1(c32, __riscv_vle32_v_f32m1(c + ldc * 3 + o2, vl), vl);
+        }
+    }
+    __riscv_vse32_v_f32m1(c,           c00, vl);
+    __riscv_vse32_v_f32m1(c + ldc,     c10, vl);
+    __riscv_vse32_v_f32m1(c + ldc * 2, c20, vl);
+    __riscv_vse32_v_f32m1(c + ldc * 3, c30, vl);
+    if (NC > 1)
+    {
+        __riscv_vse32_v_f32m1(c + o1,           c01, vl);
+        __riscv_vse32_v_f32m1(c + ldc + o1,     c11, vl);
+        __riscv_vse32_v_f32m1(c + ldc * 2 + o1, c21, vl);
+        __riscv_vse32_v_f32m1(c + ldc * 3 + o1, c31, vl);
+    }
+    if (NC > 2)
+    {
+        __riscv_vse32_v_f32m1(c + o2,           c02, vl);
+        __riscv_vse32_v_f32m1(c + ldc + o2,     c12, vl);
+        __riscv_vse32_v_f32m1(c + ldc * 2 + o2, c22, vl);
+        __riscv_vse32_v_f32m1(c + ldc * 3 + o2, c32, vl);
+    }
+}
+#endif
+
 void convBlock_F32(int np, const float* a, const float* b, float* c, int ldc, bool init_c, const int outLen,
                const int convMR, const int convNR)
 {
@@ -2206,6 +2343,38 @@ void convBlock_F32(int np, const float* a, const float* b, float* c, int ldc, bo
         return;
     }
     convBlockNoSIMD(np, a, b, c, ldc, init_c, outLen, convMR, convNR);
+#elif CV_RVV
+{
+    // VLEN-agnostic LMUL=1 kernel. Columns are processed in chunks of one length vl that divides
+    // convNR (24: vl = 8 at VLEN=256, 24 at VLEN>=1024, 4 at VLEN=128), like the x86 kernels'
+    // whole 8-lane vectors: a chunk never crosses the convNR-wide stripe the caller allocates for
+    // both the packed input and the output, and columns past outLen are computed on padding and
+    // never copied out. A single vl keeps vsetvli out of the inner loop; VLMAX is a power of two,
+    // so vl and the chunk count need no division (this runs once per call).
+    if (convMR == 4)
+    {
+        const int vm = (int)__riscv_vsetvlmax_e32m1();
+        int vl = convNR;
+        if (vm < convNR)
+        {
+            vl = vm;
+            while (convNR & (vl - 1))  // largest power of two <= VLMAX that divides convNR
+                vl >>= 1;
+        }
+        for (int j0 = 0; j0 < outLen; j0 += 3 * vl)
+        {
+            const int rem = outLen - j0;
+            if (rem > 2 * vl)
+                convBlockRVV4xN_m1<3>(np, a, b + j0, c + j0, ldc, init_c, convNR, vl);
+            else if (rem > vl)
+                convBlockRVV4xN_m1<2>(np, a, b + j0, c + j0, ldc, init_c, convNR, vl);
+            else
+                convBlockRVV4xN_m1<1>(np, a, b + j0, c + j0, ldc, init_c, convNR, vl);
+        }
+        return;
+    }
+    convBlockNoSIMD(np, a, b, c, ldc, init_c, outLen, convMR, convNR);
+}
 #else
     convBlockNoSIMD(np, a, b, c, ldc, init_c, outLen, convMR, convNR);
     return;

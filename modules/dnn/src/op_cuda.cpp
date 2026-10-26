@@ -8,12 +8,77 @@
 #include "op_cuda.hpp"
 #include "cuda4dnn/init.hpp"
 #include "net_impl.hpp"
+#include <opencv2/dnn/layer.details.hpp>
 
 namespace cv { namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
 
+class CUDALegacyExec : public Layer
+{
+public:
+    CUDALegacyExec(const Ptr<Layer>& impl_, void* ctx_) : impl(impl_), ctx(ctx_) {}
 
-void Net::Impl::initCUDABackend(const std::vector<LayerPin>& blobsToKeep_)
+    static Ptr<Layer> create(const Ptr<LayerInfo>& data, void* backendCtx)
+    {
+        Ptr<Layer> impl = data.dynamicCast<Layer>();
+        if (!impl || !backendCtx || !impl->supportBackend(DNN_BACKEND_CUDA))
+            return Ptr<Layer>();  // unsupported -> CPU fallback
+        Ptr<CUDALegacyExec> e(new CUDALegacyExec(impl, backendCtx));
+        e->name = impl->name;
+        e->type = impl->type;
+        e->inputs = impl->inputs;
+        e->outputs = impl->outputs;
+        return e;
+    }
+
+    void finalize(InputArrayOfArrays inputs, OutputArrayOfArrays outputs) CV_OVERRIDE
+    {
+        impl->finalize(inputs, outputs);
+    }
+
+    void forwardCUDA(InputArrayOfArrays inputs_,
+                     OutputArrayOfArrays outputs_,
+                     void* workspace) CV_OVERRIDE
+    {
+        std::vector<UMat> inputs, outputs;
+        inputs_.getUMatVector(inputs);
+        outputs_.getUMatVector(outputs);
+
+        cuda4dnn::csl::Workspace& ws = *reinterpret_cast<cuda4dnn::csl::Workspace*>(workspace);
+        if (!node) {
+            impl->preferableTarget = preferableTarget;  // initCUDA may pick FP16/FP32 by target
+            cuda4dnn::csl::CSLContext context = *reinterpret_cast<cuda4dnn::csl::CSLContext*>(ctx);
+            node = impl->initCUDA(&context, inputs_, outputs_);
+            CV_Assert(node);
+            cudaNode = node.dynamicCast<CUDABackendNode>();
+            CV_Assert(cudaNode);
+            ws.require(cudaNode->get_workspace_memory_in_bytes());
+        }
+        cudaNode->forward(inputs, outputs, ws);
+    }
+
+    Ptr<Layer> impl;
+    void* ctx;
+    Ptr<BackendNode> node;
+    Ptr<CUDABackendNode> cudaNode;
+};
+
+void registerCudaCommonExecs()
+{
+    CV_DNN_REGISTER_EXEC_CLASS(ReLU,        DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(ReLU6,       DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(NaryEltwise, DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(Flatten,     DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(Reshape2,    DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(BatchNorm2,  DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(MaxPool,     DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(Gemm,        DNN_BACKEND_CUDA, CUDALegacyExec);
+    CV_DNN_REGISTER_EXEC_CLASS(Pooling,     DNN_BACKEND_CUDA, CUDALegacyExec);  // GlobalAveragePool/GlobalMaxPool
+    CV_DNN_REGISTER_EXEC_CLASS(AveragePool, DNN_BACKEND_CUDA, CUDALegacyExec);
+}
+
+
+void Net::Impl::initCUDABackend()
 {
     CV_Assert(preferableBackend == DNN_BACKEND_CUDA);
 
@@ -42,8 +107,7 @@ void Net::Impl::initCUDABackend(const std::vector<LayerPin>& blobsToKeep_)
         context.cublas_handle = cuda4dnn::csl::cublas::Handle(context.stream);
         context.cudnn_handle = cuda4dnn::csl::cudnn::Handle(context.stream);
 
-        auto d2h_stream = cuda4dnn::csl::Stream(true);  // stream for background D2H data transfers
-        cudaInfo = std::unique_ptr<CudaInfo_t>(new CudaInfo_t(std::move(context), std::move(d2h_stream)));
+        cudaInfo = std::make_unique<CudaInfo_t>(std::move(context));
     }
 
     cudaInfo->workspace = cuda4dnn::csl::Workspace();  // release workspace memory if any
@@ -51,19 +115,20 @@ void Net::Impl::initCUDABackend(const std::vector<LayerPin>& blobsToKeep_)
     for (auto& layer : layers)
     {
         auto& ld = layer.second;
-        if (ld.id == 0)
+
+        if (ld.id == 0 && netInputLayer->supportBackend(preferableBackend))
         {
             for (auto& wrapper : ld.inputBlobsWrappers)
             {
                 auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
-                cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
+                cudaWrapper->setStream(cudaInfo->context.stream);
             }
         }
 
         for (auto& wrapper : ld.outputBlobsWrappers)
         {
             auto cudaWrapper = wrapper.dynamicCast<CUDABackendWrapper>();
-            cudaWrapper->setStream(cudaInfo->context.stream, cudaInfo->d2h_stream);
+            cudaWrapper->setStream(cudaInfo->context.stream);
         }
     }
 
@@ -90,15 +155,6 @@ void Net::Impl::initCUDABackend(const std::vector<LayerPin>& blobsToKeep_)
         {
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             cudaInfo->workspace.require(cudaNode->get_workspace_memory_in_bytes());
-        }
-    }
-
-    if (blobsToKeep_.size() > 1)
-    {
-        for (const auto& pin : blobsToKeep_)
-        {
-            LayerData& ld = layers[pin.lid];
-            ld.cudaD2HBackgroundTransfers.push_back(pin.oid);
         }
     }
 }

@@ -37,7 +37,7 @@ static bool ocl_convertScaleAbs( InputArray _src, OutputArray _dst, double alpha
     if (!doubleSupport && depth == CV_64F)
         return false;
 
-    _dst.create(_src.size(), CV_8UC(cn));
+    _dst.createSameSize(_src, CV_8UC(cn));
     int kercn = 1;
     if (d.isIntel())
     {
@@ -94,7 +94,7 @@ void convertScaleAbs(InputArray _src, OutputArray _dst, double alpha, double bet
     Mat src = _src.getMat();
     int cn = src.channels();
     double scale[] = {alpha, beta};
-    _dst.create( src.dims, src.size, CV_8UC(cn) );
+    _dst.create( src.size, CV_8UC(cn) );
     Mat dst = _dst.getMat();
     BinaryFunc func = getCvtScaleAbsFunc(src.depth());
     CV_Assert( func != 0 );

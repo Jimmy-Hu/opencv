@@ -1361,7 +1361,7 @@ int videoInput::listDevices(bool silent){
             if(!silent) DebugPrintOut("SETUP: Looking For Capture Devices\n");
             IMoniker *pMoniker = NULL;
 
-            while (pEnum->Next(1, &pMoniker, NULL) == S_OK){
+            while (deviceCounter < VI_MAX_CAMERAS && pEnum->Next(1, &pMoniker, NULL) == S_OK){
 
                 IPropertyBag *pPropBag;
                 hr = pMoniker->BindToStorage(0, 0, IID_IPropertyBag,
@@ -1381,13 +1381,11 @@ int videoInput::listDevices(bool silent){
                 if (FAILED(hr)) hr = pPropBag->Read(L"Description", &varName, 0);
 
                 if (SUCCEEDED(hr)){
-                    int count = 0;
-                    int maxLen = sizeof(deviceNames[0])/sizeof(deviceNames[0][0]) - 2;
-                    while( varName.bstrVal[count] != 0x00 && count < maxLen) {
-                        deviceNames[deviceCounter][count] = (char)varName.bstrVal[count];
-                        count++;
-                    }
-                    deviceNames[deviceCounter][count] = 0;
+                    if (::WideCharToMultiByte(CP_UTF8, 0, varName.bstrVal, -1,
+                                              deviceNames[deviceCounter],
+                                              sizeof(deviceNames[0])/sizeof(deviceNames[0][0]),
+                                              NULL, NULL) == 0)
+                        deviceNames[deviceCounter][0] = 0;
 
                     if(!silent) DebugPrintOut("SETUP: %i) %s\n",deviceCounter, deviceNames[deviceCounter]);
                 }
@@ -1431,7 +1429,7 @@ int videoInput::getWidth(int id) const
         return VDList[id] ->width;
     }
 
-    return 0;
+    return CAP_PROP_UNKNOWN;
 
 }
 
@@ -1448,7 +1446,7 @@ int videoInput::getHeight(int id) const
         return VDList[id] ->height;
     }
 
-    return 0;
+    return CAP_PROP_UNKNOWN;
 
 }
 
@@ -1463,7 +1461,7 @@ int videoInput::getFourcc(int id) const
         return getFourccFromMediaSubtype(VDList[id]->videoType);
     }
 
-    return 0;
+    return CAP_PROP_UNKNOWN;
 
 }
 
@@ -1477,14 +1475,14 @@ double videoInput::getFPS(int id) const
         }
     }
 
-    return 0;
+    return CAP_PROP_UNKNOWN;
 
 }
 
 int videoInput::getChannel(int deviceID) const
 {
     if (!isDeviceSetup(deviceID))
-        return 0;
+        return CAP_PROP_UNKNOWN;
     return VDList[deviceID]->storeConn;
 }
 
@@ -1500,7 +1498,7 @@ int videoInput::getSize(int id) const
         return VDList[id] ->videoSize;
     }
 
-    return 0;
+    return CAP_PROP_UNKNOWN;
 
 }
 
@@ -2406,7 +2404,7 @@ int videoInput::getVideoPropertyFromCV(int cv_property){
         case CAP_PROP_GAIN:
             return VideoProcAmp_Gain;
     }
-    return -1;
+    return CAP_PROP_UNKNOWN;
 }
 
 int videoInput::getCameraPropertyFromCV(int cv_property){
@@ -2437,7 +2435,7 @@ int videoInput::getCameraPropertyFromCV(int cv_property){
         default:
             break;
     }
-    return -1;
+    return CAP_PROP_UNKNOWN;
 }
 
 bool videoInput::isDeviceDisconnected(int deviceNumber)
@@ -3359,7 +3357,7 @@ int videoInput::property_window_count(int idx)
     if (isDeviceSetup(idx))
         return (int)InterlockedCompareExchange(&VDList[idx]->property_window_count, 0L, 0L);
 
-    return 0;
+    return CAP_PROP_UNKNOWN;
 }
 
 namespace cv
@@ -3457,7 +3455,7 @@ double VideoCapture_DShow::getProperty(int propIdx) const
         break;
     }
     // unknown parameter or value not available
-    return -1;
+    return CAP_PROP_UNKNOWN;
 }
 bool VideoCapture_DShow::setProperty(int propIdx, double propVal)
 {
@@ -3694,6 +3692,19 @@ void VideoCapture_DShow::close()
 Ptr<IVideoCapture> create_DShow_capture(int index, const VideoCaptureParameters& params)
 {
     return makePtr<VideoCapture_DShow>(index, params);
+}
+
+std::vector<VideoDeviceInfo> enumerate_DShow_devices()
+{
+    std::vector<VideoDeviceInfo> result;
+    const int count = videoInput::listDevices(true);
+
+    for (int i = 0; i < count; i++)
+    {
+        const char* name = videoInput::getDeviceName(i);
+        result.push_back(makeVideoDeviceInfo(i, CAP_DSHOW, name ? name : ""));
+    }
+    return result;
 }
 
 

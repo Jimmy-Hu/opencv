@@ -59,6 +59,46 @@ namespace cv
 {
 namespace dnn
 {
+void getConvolutionKernelParams(const LayerParams &params, std::vector<size_t>& kernel, std::vector<size_t>& pads_begin,
+                                std::vector<size_t>& pads_end, std::vector<size_t>& strides, std::vector<size_t>& dilations,
+                                cv::String &padMode, std::vector<size_t>& adjust_pads, bool& useWinograd);
+
+void getPoolingKernelParams(const LayerParams &params, std::vector<size_t>& kernel, std::vector<bool>& globalPooling,
+                            std::vector<size_t>& pads_begin, std::vector<size_t>& pads_end, std::vector<size_t>& strides, cv::String &padMode);
+
+void getConvPoolOutParams(const std::vector<int>& inp, const std::vector<size_t>& kernel,
+                          const std::vector<size_t>& stride, const String &padMode,
+                          const std::vector<size_t>& dilation, std::vector<int>& out);
+
+void getConvPoolPaddings(const std::vector<int>& inp, const std::vector<size_t>& kernel,
+                          const std::vector<size_t>& strides, const String &padMode,
+                          std::vector<size_t>& pads_begin, std::vector<size_t>& pads_end);
+
+// Global pooling spans every spatial dimension, but pads and strides are
+// trailing-aligned to the spatial dims and only guaranteed to be two long.
+// Front-insert neutral values so that they cover nspatial dims.
+void expandGlobalPoolingParams(std::vector<size_t>& pads_begin, std::vector<size_t>& pads_end,
+                               std::vector<size_t>& strides, size_t nspatial);
+
+// Used in quantized model. It will return the (Max_element - Min_element)/127.
+double getWeightScale(const Mat& weightsMat);
+
+// Several ONNX operations take list of integer's or float's,
+// e.g. to specify list of axes (Squeeze, Unsqueeze, Transpose, Reduce*, ...),
+// coordinates, repetitions etc. (Slice, Tile, ...), scale factors (Resize, ...).
+// Here are helper functions to extract this data
+void tensorToIntVec(const Mat& tensor, std::vector<int>& vec);
+void tensorToFloatVec(const Mat& tensor, std::vector<float>& vec);
+void tensorToScalar(const Mat& tensor, int type, void* value);
+template<typename _Tp> _Tp tensorToScalar(const Mat& tensor)
+{
+    _Tp value = _Tp(0);
+    tensorToScalar(tensor, DataType<_Tp>::type, &value);
+    return value;
+}
+
+// tensor to mat shape
+MatShape tensorToShape(const Mat& shapeTensor);
 
 enum OnnxDataType
 {
@@ -87,63 +127,34 @@ inline int onnxDataTypeToCV(OnnxDataType dt)
     case ONNX_INT8:       return CV_8S;
     case ONNX_UINT16:     return CV_16U;
     case ONNX_INT16:      return CV_16S;
-    case ONNX_UINT32:
-#ifdef CV_32U
-        return CV_32U;
-#else
-        return CV_32S;
-#endif
+    case ONNX_UINT32:     return CV_32U;
     case ONNX_INT32:      return CV_32S;
-    case ONNX_UINT64:
-#ifdef CV_64U
-        return CV_64U;
-#else
-        return CV_32S;
-#endif
-    case ONNX_INT64:
-#ifdef CV_64S
-        return CV_64S;
-#else
-        return CV_32S;
-#endif
+    case ONNX_UINT64:     return CV_64U;
+    case ONNX_INT64:      return CV_64S;
     case ONNX_FLOAT:      return CV_32F;
     case ONNX_DOUBLE:     return CV_64F;
     case ONNX_FLOAT16:    return CV_16F;
-    case ONNX_BFLOAT16:
-#ifdef CV_16BF
-        return CV_16BF;
-#else
-        return CV_16F;
-#endif
-    case ONNX_BOOL:
-#ifdef CV_Bool
-        return CV_Bool;
-#else
-        return CV_8U;
-#endif
+    case ONNX_BFLOAT16:   return CV_16BF;
+    case ONNX_BOOL:       return CV_Bool;
     default:
         // Fallback to default ONNX FLOAT if value is unknown.
         return CV_32F;
     }
 }
 
-void getConvolutionKernelParams(const LayerParams &params, std::vector<size_t>& kernel, std::vector<size_t>& pads_begin,
-                                std::vector<size_t>& pads_end, std::vector<size_t>& strides, std::vector<size_t>& dilations,
-                                cv::String &padMode, std::vector<size_t>& adjust_pads, bool& useWinograd);
-
-void getPoolingKernelParams(const LayerParams &params, std::vector<size_t>& kernel, std::vector<bool>& globalPooling,
-                            std::vector<size_t>& pads_begin, std::vector<size_t>& pads_end, std::vector<size_t>& strides, cv::String &padMode);
-
-void getConvPoolOutParams(const std::vector<int>& inp, const std::vector<size_t>& kernel,
-                          const std::vector<size_t>& stride, const String &padMode,
-                          const std::vector<size_t>& dilation, std::vector<int>& out);
-
-void getConvPoolPaddings(const std::vector<int>& inp, const std::vector<size_t>& kernel,
-                          const std::vector<size_t>& strides, const String &padMode,
-                          std::vector<size_t>& pads_begin, std::vector<size_t>& pads_end);
-
-// Used in quantized model. It will return the (Max_element - Min_element)/127.
-double getWeightScale(const Mat& weightsMat);
+// inputs and outputs are both vector<Mat>'s or both are vector<UMat>'s.
+// the function does the following:
+//
+// 1. resizes output vector to 1-element vector
+// 2. outputs[0].fit(shape, inputs[0].type())
+// 3. temp = inputs[0].reshape(shape);
+// 4. temp.copyTo(outputs[0]) // detect in-place case and do nothing in this case
+//
+// the function helps to implement DL operations
+// 'Reshape', 'Flatten', 'Squeeze', 'Unsqueeze', 'Identity'.
+void reshapeAndCopyFirst(InputArrayOfArrays inputs,
+                         OutputArrayOfArrays outputs,
+                         const MatShape& shape);
 }
 }
 

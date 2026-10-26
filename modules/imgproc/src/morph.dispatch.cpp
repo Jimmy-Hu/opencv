@@ -113,15 +113,16 @@ Ptr<FilterEngine> createMorphologyFilter(
             borderValue == morphologyDefaultBorderValue() )
     {
         int depth = CV_MAT_DEPTH(type);
-        CV_Assert( depth == CV_8U || depth == CV_16U || depth == CV_16S ||
+        CV_Assert( depth == CV_8U || depth == CV_Bool || depth == CV_16U || depth == CV_16S ||
                    depth == CV_32F || depth == CV_64F );
         if( op == MORPH_ERODE )
             borderValue = Scalar::all( depth == CV_8U ? (double)UCHAR_MAX :
+                                       depth == CV_Bool ? 1. :
                                        depth == CV_16U ? (double)USHRT_MAX :
                                        depth == CV_16S ? (double)SHRT_MAX :
                                        depth == CV_32F ? (double)FLT_MAX : DBL_MAX);
         else
-            borderValue = Scalar::all( depth == CV_8U || depth == CV_16U ?
+            borderValue = Scalar::all( depth == CV_8U || depth == CV_Bool || depth == CV_16U ?
                                            0. :
                                        depth == CV_16S ? (double)SHRT_MIN :
                                        depth == CV_32F ? (double)-FLT_MAX : -DBL_MAX);
@@ -797,7 +798,8 @@ static bool ocl_morphOp(InputArray _src, OutputArray _dst, InputArray _kernel,
     Size ksize = !kernel.empty() ? kernel.size() : Size(3, 3), ssize = _src.size();
 
     bool doubleSupport = dev.doubleFPConfig() > 0;
-    if ((depth == CV_64F && !doubleSupport) || borderType != BORDER_CONSTANT)
+    // ocl::typeToStr() has no mapping for CV_Bool, so fall back to the CPU path
+    if ((depth == CV_64F && !doubleSupport) || borderType != BORDER_CONSTANT || depth == CV_Bool)
         return false;
 
     bool haveExtraMat = !_extraMat.empty();
@@ -1298,112 +1300,3 @@ void morphologyEx( InputArray _src, OutputArray _dst, int op,
 }
 
 } // namespace cv
-
-CV_IMPL IplConvKernel *
-cvCreateStructuringElementEx( int cols, int rows,
-                              int anchorX, int anchorY,
-                              int shape, int *values )
-{
-    cv::Size ksize = cv::Size(cols, rows);
-    cv::Point anchor = cv::Point(anchorX, anchorY);
-    CV_Assert( cols > 0 && rows > 0 && anchor.inside(cv::Rect(0,0,cols,rows)) &&
-               (shape != CV_SHAPE_CUSTOM || values != 0));
-
-    int i, size = rows * cols;
-    int element_size = sizeof(IplConvKernel) + size*sizeof(int);
-    IplConvKernel *element = (IplConvKernel*)cvAlloc(element_size + 32);
-
-    element->nCols = cols;
-    element->nRows = rows;
-    element->anchorX = anchorX;
-    element->anchorY = anchorY;
-    element->nShiftR = shape < CV_SHAPE_ELLIPSE ? shape : CV_SHAPE_CUSTOM;
-    element->values = (int*)(element + 1);
-
-    if( shape == CV_SHAPE_CUSTOM )
-    {
-        for( i = 0; i < size; i++ )
-            element->values[i] = values[i];
-    }
-    else
-    {
-        cv::Mat elem = cv::getStructuringElement(shape, ksize, anchor);
-        for( i = 0; i < size; i++ )
-            element->values[i] = elem.ptr()[i];
-    }
-
-    return element;
-}
-
-
-CV_IMPL void
-cvReleaseStructuringElement( IplConvKernel ** element )
-{
-    if( !element )
-        CV_Error( cv::Error::StsNullPtr, "" );
-    cvFree( element );
-}
-
-
-static void convertConvKernel( const IplConvKernel* src, cv::Mat& dst, cv::Point& anchor )
-{
-    if(!src)
-    {
-        anchor = cv::Point(1,1);
-        dst.release();
-        return;
-    }
-    anchor = cv::Point(src->anchorX, src->anchorY);
-    dst.create(src->nRows, src->nCols, CV_8U);
-
-    int i, size = src->nRows*src->nCols;
-    for( i = 0; i < size; i++ )
-        dst.ptr()[i] = (uchar)(src->values[i] != 0);
-}
-
-
-CV_IMPL void
-cvErode( const CvArr* srcarr, CvArr* dstarr, IplConvKernel* element, int iterations )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst = cv::cvarrToMat(dstarr), kernel;
-    CV_Assert( src.size() == dst.size() && src.type() == dst.type() );
-    cv::Point anchor;
-    convertConvKernel( element, kernel, anchor );
-    cv::erode( src, dst, kernel, anchor, iterations, cv::BORDER_REPLICATE );
-}
-
-
-CV_IMPL void
-cvDilate( const CvArr* srcarr, CvArr* dstarr, IplConvKernel* element, int iterations )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst = cv::cvarrToMat(dstarr), kernel;
-    CV_Assert( src.size() == dst.size() && src.type() == dst.type() );
-    cv::Point anchor;
-    convertConvKernel( element, kernel, anchor );
-    cv::dilate( src, dst, kernel, anchor, iterations, cv::BORDER_REPLICATE );
-}
-
-
-CV_IMPL void
-cvMorphologyEx( const void* srcarr, void* dstarr, void*,
-                IplConvKernel* element, int op, int iterations )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst = cv::cvarrToMat(dstarr), kernel;
-    CV_Assert( src.size() == dst.size() && src.type() == dst.type() );
-    cv::Point anchor;
-    IplConvKernel* temp_element = NULL;
-    if (!element)
-    {
-        temp_element = cvCreateStructuringElementEx(3, 3, 1, 1, CV_SHAPE_RECT);
-    } else {
-        temp_element = element;
-    }
-    convertConvKernel( temp_element, kernel, anchor );
-    if (!element)
-    {
-        cvReleaseStructuringElement(&temp_element);
-    }
-    cv::morphologyEx( src, dst, op, kernel, anchor, iterations, cv::BORDER_REPLICATE );
-}
-
-/* End of file. */

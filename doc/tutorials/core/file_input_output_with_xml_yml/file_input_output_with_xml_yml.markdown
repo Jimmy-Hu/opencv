@@ -27,7 +27,7 @@ Source code
 -----------
 @add_toggle_cpp
 You can [download this from here
-](https://github.com/opencv/opencv/tree/4.x/samples/cpp/tutorial_code/core/file_input_output/file_input_output.cpp) or find it in the
+](https://github.com/opencv/opencv/tree/5.x/samples/cpp/tutorial_code/core/file_input_output/file_input_output.cpp) or find it in the
 `samples/cpp/tutorial_code/core/file_input_output/file_input_output.cpp` of the OpenCV source code
 library.
 
@@ -38,7 +38,7 @@ Here's a sample code of how to achieve all the stuff enumerated at the goal list
 
 @add_toggle_python
 You can [download this from here
-](https://github.com/opencv/opencv/tree/4.x/samples/python/tutorial_code/core/file_input_output/file_input_output.py) or find it in the
+](https://github.com/opencv/opencv/tree/5.x/samples/python/tutorial_code/core/file_input_output/file_input_output.py) or find it in the
 `samples/python/tutorial_code/core/file_input_output/file_input_output.py` of the OpenCV source code
 library.
 
@@ -96,7 +96,7 @@ you may access it. For sequences you need to go through them to query a specific
     @snippet cpp/tutorial_code/core/file_input_output/file_input_output.cpp readNum
     @end_toggle
     @add_toggle_python
-    @snippet cpp/tutorial_code/core/file_input_output/file_input_output.cpp readNum
+    @snippet python/tutorial_code/core/file_input_output/file_input_output.py readNum
     @end_toggle
 -#  **Input/Output of OpenCV Data structures.** Well these behave exactly just as the basic C++
     and Python types:

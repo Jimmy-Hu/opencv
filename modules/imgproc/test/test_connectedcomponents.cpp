@@ -743,6 +743,73 @@ TEST(Imgproc_ConnectedComponents, single_column)
 
 }
 
+// See https://github.com/opencv/opencv/issues/29593
+// cv::Mat_<bool>::depth() returns CV_Bool in 5.0, where it was CV_8U in 4.x, so
+// connected components should keep accepting boolean masks as binary input.
+TEST(Imgproc_ConnectedComponents, bool_mask_29593)
+{
+    Mat_<bool> input_bool(5, 6, false);
+    input_bool(0, 0) = true;
+    input_bool(0, 1) = true;
+    input_bool(1, 1) = true;
+    input_bool(2, 4) = true;
+    input_bool(3, 4) = true;
+    input_bool(3, 5) = true;
+    input_bool(4, 2) = true;
+
+    Mat1b input_uchar(input_bool.size(), uchar(0));
+    for (int r = 0; r < input_bool.rows; ++r)
+    {
+        for (int c = 0; c < input_bool.cols; ++c)
+        {
+            input_uchar(r, c) = input_bool(r, c) ? uchar(255) : uchar(0);
+        }
+    }
+
+    ASSERT_EQ(input_bool.depth(), CV_Bool);
+
+    const int ccltype[] = { cv::CCL_DEFAULT, cv::CCL_WU, cv::CCL_GRANA, cv::CCL_BOLELLI,
+                            cv::CCL_SAUF, cv::CCL_BBDT, cv::CCL_SPAGHETTI };
+
+    for (int connectivity : {4, 8})
+    {
+        for (size_t cclt = 0; cclt < sizeof(ccltype) / sizeof(ccltype[0]); ++cclt)
+        {
+            Mat1i labels_bool, labels_uchar;
+            int nlabels_bool = 0;
+            ASSERT_NO_THROW(nlabels_bool = connectedComponents(
+                                input_bool, labels_bool, connectivity, CV_32S, ccltype[cclt]));
+            const int nlabels_uchar = connectedComponents(
+                input_uchar, labels_uchar, connectivity, CV_32S, ccltype[cclt]);
+
+            normalizeLabels(labels_bool, nlabels_bool);
+            normalizeLabels(labels_uchar, nlabels_uchar);
+
+            EXPECT_EQ(nlabels_bool, nlabels_uchar)
+                << "connectivity = " << connectivity << ", ccltype = " << ccltype[cclt];
+            EXPECT_EQ(countNonZero(labels_bool != labels_uchar), 0)
+                << "connectivity = " << connectivity << ", ccltype = " << ccltype[cclt];
+
+            Mat stats_bool, centroids_bool, stats_uchar, centroids_uchar;
+            ASSERT_NO_THROW(nlabels_bool = connectedComponentsWithStats(
+                                input_bool, labels_bool, stats_bool, centroids_bool, connectivity, CV_32S, ccltype[cclt]));
+            const int nlabels_uchar_with_stats = connectedComponentsWithStats(
+                input_uchar, labels_uchar, stats_uchar, centroids_uchar, connectivity, CV_32S, ccltype[cclt]);
+
+            normalizeLabels(labels_bool, nlabels_bool);
+            normalizeLabels(labels_uchar, nlabels_uchar_with_stats);
+
+            EXPECT_EQ(nlabels_bool, nlabels_uchar_with_stats)
+                << "connectivity = " << connectivity << ", ccltype = " << ccltype[cclt];
+            EXPECT_EQ(countNonZero(labels_bool != labels_uchar), 0)
+                << "connectivity = " << connectivity << ", ccltype = " << ccltype[cclt];
+            EXPECT_EQ(countNonZero(stats_bool != stats_uchar), 0)
+                << "connectivity = " << connectivity << ", ccltype = " << ccltype[cclt];
+            EXPECT_EQ(cv::norm(centroids_bool, centroids_uchar, NORM_INF), 0)
+                << "connectivity = " << connectivity << ", ccltype = " << ccltype[cclt];
+        }
+    }
+}
 
 TEST(Imgproc_ConnectedComponents, 4conn_regression_21366)
 {
@@ -794,6 +861,21 @@ TEST(Imgproc_ConnectedComponents, regression_27568)
         }
     }
 }
+
+TEST(Imgproc_ConnectedComponents, empty_input_29854)
+{
+    // Regression test for #29854:
+    // Zero-size input must raise cv::Exception instead of SIGSEGV.
+    const int shapes[][2] = {{0, 400}, {400, 0}, {0, 0}};
+    for (const auto& s : shapes)
+    {
+        Mat mask(s[0], s[1], CV_8UC1);
+        Mat labels, stats, centroids;
+        EXPECT_THROW(connectedComponents(mask, labels), cv::Exception);
+        EXPECT_THROW(connectedComponentsWithStats(mask, labels, stats, centroids), cv::Exception);
+    }
+}
+
 
 }
 } // namespace

@@ -16,13 +16,23 @@ public:
         setParamsFrom(params);
 
         // shape as param
-        CV_CheckTrue(params.has("shape"), "DNN/Expand: shape is required in Expand layer initialization");
-        DictValue param_shape = params.get("shape");
-        int ndims_shape = param_shape.size();
-        CV_CheckGT(ndims_shape, 0, "DNN/Expand: ndims of shape must be > 0");
-        target_shape.resize(ndims_shape);
-        for (int i = 0; i < ndims_shape; i++) {
-            target_shape[i] = param_shape.get<int>(i);
+        if (params.has("shape")) {
+            DictValue param_shape = params.get("shape");
+            int ndims_shape = param_shape.size();
+            CV_CheckGT(ndims_shape, 0, "DNN/Expand: ndims of shape must be > 0");
+            target_shape.resize(ndims_shape);
+            for (int i = 0; i < ndims_shape; i++) {
+                target_shape[i] = param_shape.get<int>(i);
+            }
+        } else if (params.blobs.size() == 1) {
+            Mat expand_shape = params.blobs[0];
+            CV_Assert(expand_shape.total() > 0);
+            target_shape.resize(expand_shape.total());
+            for (int i = 0; i < expand_shape.total(); i++) {
+                target_shape[i] = expand_shape.at<int64_t>(i);
+            }
+        } else {
+            CV_Error(Error::StsBadArg, "DNN/Expand: shape is required in Expand layer initialization");
         }
 
         // FIXME: remove when 0d/1d mat is available
@@ -45,7 +55,7 @@ public:
 
         MatShape input_shape = inputs[0]; // 1d tensor is represented as 2d mat, e.g. [3] -> [3, 1]
         if (const_input_1d) {
-            input_shape = {inputs[0][0]};
+            input_shape = shape(inputs[0][0]);
         }
 
         auto& moreDimension = input_shape.size() > target_shape.size() ? input_shape : target_shape;
@@ -78,6 +88,17 @@ public:
         return false;
     }
 
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size());
+        outputs.assign(requiredOutputs, inputs[0]);
+    }
+
+
     virtual void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr) CV_OVERRIDE {
         std::vector<Mat> inputs;
         inputs_arr.getMatVector(inputs);
@@ -85,7 +106,7 @@ public:
         const auto &input = inputs[0];
         auto input_shape = shape(input);
         if (const_input_1d) {
-            input_shape = {input_shape[0]};
+            input_shape = shape(input_shape[0]);
         }
 
         auto& moreDimension = input_shape.size() > target_shape.size() ? input_shape : target_shape;
@@ -94,7 +115,7 @@ public:
         MatShape final_target_shape(moreDimension.size(), 1);
         for (int i = 0; i < moreDimension.size(); i++) {
             int d = moreDimension[i];
-            int j = i - (moreDimension.size() - lessDimension.size());
+            int j = i - (int)(moreDimension.size() - lessDimension.size());
             if (j >= 0) {
                 final_target_shape[i] = std::max(lessDimension[j], d);
             } else {
@@ -108,12 +129,6 @@ public:
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
-
-        if (inputs_arr.depth() == CV_16F)
-        {
-            forward_fallback(inputs_arr, outputs_arr, internals_arr);
-            return;
-        }
 
         std::vector<Mat> inputs, outputs;
         inputs_arr.getMatVector(inputs);

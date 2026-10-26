@@ -123,8 +123,6 @@ Building OpenCV from Source Using CMake
     -   `-DPYTHON3_EXECUTABLE=$(which python3)`
     -   `-DPYTHON3_INCLUDE_DIR=$(python3 -c "from sysconfig import get_paths as gp; print(gp()['include'])")`
     -   `-DPYTHON3_NUMPY_INCLUDE_DIRS=$(python3 -c "import numpy; print(numpy.get_include())")`
-    @note
-    Python 2 has reached its end of life. It is recommended to use Python 3 for building Python bindings.
 
 -#  Build. From build directory execute *make*, it is recommended to do this in several threads
 

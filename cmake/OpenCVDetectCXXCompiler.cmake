@@ -199,54 +199,36 @@ elseif(MINGW)
   endif()
 endif()
 
-# Fix handling of duplicated files in the same static library:
-# https://public.kitware.com/Bug/view.php?id=14874
-if(CMAKE_VERSION VERSION_LESS "3.1")
-  foreach(var CMAKE_C_ARCHIVE_APPEND CMAKE_CXX_ARCHIVE_APPEND)
-    if(${var} MATCHES "^<CMAKE_AR> r")
-      string(REPLACE "<CMAKE_AR> r" "<CMAKE_AR> q" ${var} "${${var}}")
-    endif()
-  endforeach()
-endif()
-
-# See https://github.com/opencv/opencv/issues/27105
-# - CMAKE_COMPILE_FEATURES is used to detect what features are available by the compiler.
-# - CMAKE_CXX_STANDARD is used to detect what features are available in this configuration.
 if(NOT OPENCV_SKIP_CMAKE_CXX_STANDARD)
-  if(DEFINED CMAKE_CXX_STANDARD AND ((CMAKE_CXX_STANDARD EQUAL 98) OR (CMAKE_CXX_STANDARD LESS 11)))
-    message(FATAL_ERROR "OpenCV 4.x requires C++11, but your configuration does not enable(CMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD}).")
-  endif()
-
-  ocv_update(CMAKE_CXX_STANDARD 11)
+  ocv_update(CMAKE_CXX_STANDARD 17)
   ocv_update(CMAKE_CXX_STANDARD_REQUIRED TRUE)
-  ocv_update(CMAKE_CXX_EXTENSIONS OFF) # use -std=c++11 instead of -std=gnu++11
+  ocv_update(CMAKE_CXX_EXTENSIONS OFF) # use -std=c++17 instead of -std=gnu++17
 endif()
 
-# Meta-feature "cxx_std_XX" in CMAKE_CXX_COMPILE_FEATURES are supported in CMake 3.8+.
-# - See https://cmake.org/cmake/help/latest/release/3.8.html
-# For CMake 3.7-, use CMAKE_CXXxx_COMPILE_FEATURES instead of it.
-if(CMAKE_CXX11_COMPILE_FEATURES OR ("cxx_std_11" IN_LIST CMAKE_CXX_COMPILE_FEATURES))
-  if((NOT DEFINED CMAKE_CXX_STANDARD) OR (CMAKE_CXX_STANDARD GREATER_EQUAL 11))
-    set(HAVE_CXX11 ON)
-  endif()
-endif()
-if(CMAKE_CXX17_COMPILE_FEATURES OR ("cxx_std_17" IN_LIST CMAKE_CXX_COMPILE_FEATURES))
-  if((NOT DEFINED CMAKE_CXX_STANDARD) OR (CMAKE_CXX_STANDARD GREATER_EQUAL 17))
-    set(HAVE_CXX17 ON)
-  endif()
+# Debian 9 - GCC 7.3.0
+if(CV_GCC AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7)
+  message(WARNING "OpenCV requires GCC >= 7.x (detected ${CMAKE_CXX_COMPILER_VERSION}). Your compilation may fail.")
 endif()
 
-if(NOT HAVE_CXX11)
-  message(FATAL_ERROR "OpenCV 4.x requires C++11, but your compiler does not support it")
+# Debian 10 - Clang 7.0
+if(CV_CLANG AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 7)
+  message(WARNING "OpenCV requires LLVM/Clang >= 7.x (detected ${CMAKE_CXX_COMPILER_VERSION}). Your compilation may fail.")
 endif()
+
+# Visual Studio 2017 15.7
+if(MSVC AND MSVC_VERSION LESS 1914)
+  message(WARNING "OpenCV requires MSVC >= 2017 15.7 / 1914 (detected ${CMAKE_CXX_COMPILER_VERSION} / ${MSVC_VERSION}). Your compilation may fail.")
+endif()
+
+# TODO: check other known compilers versions
 
 set(__OPENCV_ENABLE_ATOMIC_LONG_LONG OFF)
-if(HAVE_CXX11 AND (X86 OR X86_64))
+if(X86 OR X86_64)
   set(__OPENCV_ENABLE_ATOMIC_LONG_LONG ON)
 endif()
 option(OPENCV_ENABLE_ATOMIC_LONG_LONG "Enable C++ compiler support for atomic<long long>" ${__OPENCV_ENABLE_ATOMIC_LONG_LONG})
 
-if((HAVE_CXX11 AND OPENCV_ENABLE_ATOMIC_LONG_LONG
+if((OPENCV_ENABLE_ATOMIC_LONG_LONG
         AND NOT MSVC
         AND NOT (X86 OR X86_64)
     AND NOT OPENCV_SKIP_LIBATOMIC_COMPILER_CHECK)
@@ -265,6 +247,6 @@ if((HAVE_CXX11 AND OPENCV_ENABLE_ATOMIC_LONG_LONG
   else()
     set(HAVE_ATOMIC_LONG_LONG ON)
   endif()
-else(HAVE_CXX11 AND OPENCV_ENABLE_ATOMIC_LONG_LONG)
+else()
   set(HAVE_ATOMIC_LONG_LONG ${OPENCV_ENABLE_ATOMIC_LONG_LONG})
 endif()

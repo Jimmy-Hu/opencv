@@ -113,7 +113,12 @@ if(DOXYGEN_FOUND)
         list(APPEND deps ${bib_file})
       endif()
       # Reference entry
-      set(one_ref "\t- ${m}. @ref ${m}\n")
+      if("${m}" MATCHES "^[0-9].+")
+        set(ref_m "_${m} \"${m}\"")
+      else()
+        set(ref_m "${m}")
+      endif()
+      set(one_ref "\t- ${m}. @ref ${ref_m}\n")
       list(FIND OPENCV_MODULES_EXTRA ${m} _pos)
       if(${_pos} EQUAL -1)
         set(refs_main "${refs_main}${one_ref}")
@@ -148,6 +153,7 @@ if(DOXYGEN_FOUND)
   set(CMAKE_DOXYGEN_TUTORIAL_JS_ROOT "- @ref tutorial_js_root")
   set(tutorial_js_path "${CMAKE_CURRENT_SOURCE_DIR}/js_tutorials")
   set(example_path "${CMAKE_SOURCE_DIR}/samples")
+  set(apps_path "${CMAKE_SOURCE_DIR}/apps")
 
   set(doxygen_image_path
       ${CMAKE_CURRENT_SOURCE_DIR}/images
@@ -169,7 +175,7 @@ if(DOXYGEN_FOUND)
   string(REPLACE ";" " \\\n" CMAKE_DOXYGEN_EXCLUDE_LIST "${CMAKE_DOXYGEN_EXCLUDE_LIST}")
   string(REPLACE ";" " " CMAKE_DOXYGEN_ENABLED_SECTIONS "${CMAKE_DOXYGEN_ENABLED_SECTIONS}")
   # TODO: remove paths_doc from EXAMPLE_PATH after face module tutorials/samples moved to separate folders
-  string(REPLACE ";" " \\\n" CMAKE_DOXYGEN_EXAMPLE_PATH  "${example_path} ; ${paths_doc} ; ${paths_sample}")
+  string(REPLACE ";" " \\\n" CMAKE_DOXYGEN_EXAMPLE_PATH  "${example_path} ; ${apps_path} ; ${paths_doc} ; ${paths_sample}")
   string(REPLACE ";" " \\\n" CMAKE_DOXYGEN_INCLUDE_ROOTS "${paths_include}")
   set(CMAKE_DOXYGEN_LAYOUT "${CMAKE_CURRENT_BINARY_DIR}/DoxygenLayout.xml")
   set(CMAKE_DOXYGEN_OUTPUT_PATH "doxygen")
@@ -189,6 +195,9 @@ if(DOXYGEN_FOUND)
   list(APPEND CMAKE_DOXYGEN_HTML_FILES "${CMAKE_CURRENT_SOURCE_DIR}/bodybg.png")
   # list(APPEND CMAKE_DOXYGEN_HTML_FILES "${CMAKE_CURRENT_SOURCE_DIR}/mymath.sty")
   list(APPEND CMAKE_DOXYGEN_HTML_FILES "${CMAKE_CURRENT_SOURCE_DIR}/tutorial-utils.js")
+  # Version dropdown list (shared single source with the Sphinx 5.0 build). Copied
+  # next to the other doxygen assets so header.html can load it via $relpath^.
+  list(APPEND CMAKE_DOXYGEN_HTML_FILES "${CMAKE_CURRENT_SOURCE_DIR}/../docs_sphinx/_static/version.js")
   string(REPLACE ";" " \\\n" CMAKE_DOXYGEN_HTML_FILES "${CMAKE_DOXYGEN_HTML_FILES}")
 
   if (DOXYGEN_DOT_EXECUTABLE)
@@ -241,12 +250,6 @@ if(DOXYGEN_FOUND)
   elseif(DEFINED OPENCV_JS_LOCATION)
     list(APPEND js_assets "${OPENCV_JS_LOCATION}")
   endif()
-
-  # copy haar cascade files
-  set(haar_cascade_files "")
-  set(data_harrcascades_path "${OpenCV_SOURCE_DIR}/data/haarcascades/")
-  list(APPEND js_tutorials_assets_deps "${data_harrcascades_path}/haarcascade_frontalface_default.xml" "${data_harrcascades_path}/haarcascade_eye.xml")
-  list(APPEND js_assets "${data_harrcascades_path}/haarcascade_frontalface_default.xml" "${data_harrcascades_path}/haarcascade_eye.xml")
 
   foreach(f ${js_assets})
     get_filename_component(fname "${f}" NAME)
@@ -306,6 +309,6 @@ if(DOXYGEN_FOUND)
   install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/doxygen/html
     DESTINATION "${OPENCV_DOC_INSTALL_PATH}"
     COMPONENT "docs" OPTIONAL
-    ${compatible_MESSAGE_NEVER}
+    MESSAGE_NEVER
   )
 endif()

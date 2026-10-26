@@ -786,6 +786,8 @@ static inline int remap32fC4(int start, int end, const uchar *src_data, size_t s
     return CV_HAL_ERROR_OK;
 }
 
+} // anonymous
+
 // the algorithm is copied from 3rdparty/carotene/src/remap.cpp,
 // in the function void CAROTENE_NS::remapNearestNeighbor and void CAROTENE_NS::remapLinear
 template<bool s16 = false>
@@ -854,6 +856,23 @@ inline int remap32f(int src_type, const uchar *src_data, size_t src_step, int sr
     }
 
     return CV_HAL_ERROR_NOT_IMPLEMENTED;
+}
+
+inline int remap32fc2(int src_type, const uchar *src_data, size_t src_step, int src_width, int src_height,
+                      uchar *dst_data, size_t dst_step, int dst_width, int dst_height,
+                      float* map, size_t map_step, int interpolation, int border_type, const double border_value[4])
+{
+    return remap32f(src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, map, map_step, nullptr, 0, interpolation, border_type, border_value);
+}
+
+inline int remap16s(int src_type, const uchar *src_data, size_t src_step, int src_width, int src_height,
+                    uchar *dst_data, size_t dst_step, int dst_width, int dst_height,
+                    short* mapx, size_t mapx_step, ushort* mapy, size_t mapy_step,
+                    int interpolation, int border_type, const double border_value[4])
+{
+    if (CV_MAKETYPE(src_type, 1) != src_type)
+        return CV_HAL_ERROR_NOT_IMPLEMENTED;
+    return remap32f<true>(src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, reinterpret_cast<float*>(mapx), mapx_step, reinterpret_cast<float*>(mapy), mapy_step, interpolation, border_type, border_value);
 }
 
 template<bool perspective>
@@ -1122,33 +1141,6 @@ static inline int warpC4(int start, int end, const uchar *src_data, size_t src_s
     }
 
     return CV_HAL_ERROR_OK;
-}
-
-} // anonymous
-
-int remap32f(int src_type, const uchar *src_data, size_t src_step, int src_width, int src_height,
-             uchar *dst_data, size_t dst_step, int dst_width, int dst_height,
-             float* mapx, size_t mapx_step, float* mapy, size_t mapy_step,
-             int interpolation, int border_type, const double border_value[4])
-{
-    return remap32f<false>(src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, mapx, mapx_step, mapy, mapy_step, interpolation, border_type, border_value);
-}
-
-int remap32fc2(int src_type, const uchar *src_data, size_t src_step, int src_width, int src_height,
-               uchar *dst_data, size_t dst_step, int dst_width, int dst_height,
-               float* map, size_t map_step, int interpolation, int border_type, const double border_value[4])
-{
-    return remap32f<false>(src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, map, map_step, nullptr, 0, interpolation, border_type, border_value);
-}
-
-int remap16s(int src_type, const uchar *src_data, size_t src_step, int src_width, int src_height,
-             uchar *dst_data, size_t dst_step, int dst_width, int dst_height,
-             short* mapx, size_t mapx_step, ushort* mapy, size_t mapy_step,
-             int interpolation, int border_type, const double border_value[4])
-{
-    if (CV_MAKETYPE(src_type, 1) != src_type)
-        return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    return remap32f<true>(src_type, src_data, src_step, src_width, src_height, dst_data, dst_step, dst_width, dst_height, reinterpret_cast<float*>(mapx), mapx_step, reinterpret_cast<float*>(mapy), mapy_step, interpolation, border_type, border_value);
 }
 
 // the algorithm is copied from 3rdparty/carotene/src/warp_affine.cpp,

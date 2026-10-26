@@ -28,7 +28,7 @@ If you need help with anything of the above, you may refer to our @ref tutorial_
 This tutorial also assumes you have an Android operated device with OpenCL enabled.
 
 The related source code is located within OpenCV samples at
-[opencv/samples/android/tutorial-4-opencl](https://github.com/opencv/opencv/tree/4.x/samples/android/tutorial-4-opencl/) directory.
+[opencv/samples/android/tutorial-4-opencl](https://github.com/opencv/opencv/tree/5.x/samples/android/tutorial-4-opencl/) directory.
 
 How to build custom OpenCV Android SDK with OpenCL
 --------------------------------------------------
@@ -49,7 +49,7 @@ libOpenCL.so may be provided with BSP or just downloaded from any OpenCL-cabaple
 cd your_path/ANDROID_OPENCL_SDK && mkdir lib && cd lib
 adb pull /system/vendor/lib64/libOpenCL.so
 @endcode
-System verison of libOpenCL.so may have a lot of platform specific dependencies. `-Wl,--allow-shlib-undefined` flag allows
+System version of libOpenCL.so may have a lot of platform specific dependencies. `-Wl,--allow-shlib-undefined` flag allows
 to ignore 3rdparty symbols if they are not used during the build.
 The following CMake line allows to link the JNI part against standard OpenCL, but not include the loadLibrary into
 application package. System OpenCL API is used in run-time.
@@ -247,7 +247,7 @@ As you can see, inheritors for `Camera` and `Camera2` APIs should implement the 
 @endcode
 
 Let's leave the details of their implementation beyond of this tutorial, please refer the
-[source code](https://github.com/opencv/opencv/tree/4.x/samples/android/tutorial-4-opencl/) to see them.
+[source code](https://github.com/opencv/opencv/tree/5.x/samples/android/tutorial-4-opencl/) to see them.
 
 Preview Frames modification
 ---------------------------

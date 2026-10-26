@@ -44,7 +44,6 @@
 #include "layers_common.hpp"
 #include "opencv2/core/hal/intrin.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../op_webnn.hpp"
 #include "../op_cann.hpp"
@@ -68,16 +67,9 @@ using std::min;
 using namespace cv::dnn::ocl4dnn;
 #endif
 
-#ifdef HAVE_HALIDE
-#if 0  // size_t is not well supported in Halide operations
-typedef size_t HALIDE_DIFF_T;
-#else
-typedef int HALIDE_DIFF_T;
-#endif
-#endif
-
 #ifdef HAVE_CUDA
 #include "../cuda4dnn/primitives/pooling.hpp"
+#include "../cuda4dnn/primitives/average_pooling.hpp"
 #include "../cuda4dnn/primitives/roi_pooling.hpp"
 #include "../cuda4dnn/primitives/max_unpooling.hpp"
 using namespace cv::dnn::cuda4dnn;
@@ -164,13 +156,16 @@ public:
             out.push_back(outputs[0].size[i]);
         }
         if (globalPooling) {
+            CV_CheckLE(inp.size(), isGlobalPooling.size(), "");
             std::vector<size_t> finalKernel;
-            for (int i = 0; i < inp.size(); i++) {
-                int idx = isGlobalPooling.size() - inp.size() + i;
+            for (size_t i = 0; i < inp.size(); i++) {
+                size_t idx = isGlobalPooling.size() - inp.size() + i;
                 finalKernel.push_back(isGlobalPooling[idx] ? inp[i] : kernel_size[idx]);
-             }
-             kernel_size = finalKernel;
-         }
+            }
+            kernel_size = finalKernel;
+
+            expandGlobalPoolingParams(pads_begin, pads_end, strides, kernel_size.size());
+        }
 
         getConvPoolPaddings(inp, kernel_size, strides, padMode, pads_begin, pads_end);
 
@@ -216,12 +211,6 @@ public:
                 return true;
             else
                 return false;
-        }
-        else if (backendId == DNN_BACKEND_HALIDE)
-        {
-            if (kernel_size.empty() || kernel_size.size() == 2)
-                return haveHalide() &&
-                       (type == MAX || (type == AVE && !pads_begin[0] && !pads_begin[1] && !pads_end[0] && !pads_end[1]));
         }
         else if (backendId == DNN_BACKEND_WEBNN)
         {
@@ -363,8 +352,12 @@ public:
             case MAX:
             {
                 CV_Assert_N(inputs.size() == 1, !computeMaxIdx || outputs.size() == 2);
-                Mat mask = computeMaxIdx ? outputs[1] : Mat();
+                Mat mask;
+                if (computeMaxIdx)
+                    mask.create(shape(outputs[1]), CV_32F);
                 maxPooling(inputs[0], outputs[0], mask);
+                if (computeMaxIdx)
+                    mask.convertTo(outputs[1], CV_64S);
                 break;
             }
             case AVE: case SUM:
@@ -384,16 +377,18 @@ public:
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays inputs_,
+        InputArrayOfArrays outputs_
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
         if (type == ROI)
             return make_cuda_node<cuda4dnn::ROIPoolingOp>(preferableTarget, std::move(context->stream), spatialScale);
 
-        auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
-        auto input_shape = input_wrapper->getShape();
+        std::vector<UMat> inputs, outputs;
+        inputs_.getUMatVector(inputs);
+        outputs_.getUMatVector(outputs);
+        MatShape input_shape = cv::dnn::shape(inputs[0]);
 
         /* storing max indices is a special case and we deal with it separately */
         if (computeMaxIdx) {
@@ -423,8 +418,32 @@ public:
 
             config.input_shape.assign(std::begin(input_shape), std::end(input_shape));
 
-            return make_cuda_node<cuda4dnn::MaxPoolingOp>(preferableTarget, std::move(context->stream), config);
+            int indicesType = CV_MAT_DEPTH(outputs[1].type());
+            CV_CheckType(indicesType, indicesType == CV_32S || indicesType == CV_64S, "Unsupported indices type");
+
+            if (indicesType == CV_32S)
+                return make_cuda_node_with_indices<cuda4dnn::MaxPoolingOp, int32_t>(preferableTarget, CV_MAT_DEPTH(inputs[0].type()), std::move(context->stream), config);
+            else if (indicesType == CV_64S)
+                return make_cuda_node_with_indices<cuda4dnn::MaxPoolingOp, int64_t>(preferableTarget, CV_MAT_DEPTH(inputs[0].type()), std::move(context->stream), config);
+
+            CV_Error(Error::BadDepth, "Unsupported indices type");
+            return Ptr<BackendNode>();
         }
+
+#if defined(HAVE_CUDNNJIT) && !defined(HAVE_CUDNN)
+        if (type == AVE)
+        {
+            const int nspatial = (int)kernel_size.size();
+            cuda4dnn::AveragePoolingConfiguration apconfig;
+            apconfig.kernel_shape.assign(std::begin(kernel_size), std::end(kernel_size));
+            apconfig.strides.assign(std::begin(strides), std::end(strides));
+            apconfig.pads.assign(std::begin(pads_begin), std::end(pads_begin));
+            apconfig.pads.insert(apconfig.pads.end(), std::begin(pads_end), std::end(pads_end));
+            apconfig.dilations.assign(nspatial, 1);
+            apconfig.count_include_pad = avePoolPaddedArea;
+            return make_cuda_node<cuda4dnn::AveragePoolingOp>(preferableTarget, std::move(context->stream), apconfig);
+        }
+#endif
 
         if (input_shape.size() == 3)
         {
@@ -486,19 +505,10 @@ public:
 
         config.input_shape.assign(std::begin(input_shape), std::end(input_shape));
 
-        return make_cuda_node<cuda4dnn::PoolingOp>(preferableTarget, std::move(context->cudnn_handle), config);
+        return make_cuda_node<cuda4dnn::PoolingOp>(preferableTarget, std::move(context->stream),
+                                                   std::move(context->cudnn_handle), config);
     }
 #endif
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-        if (type == MAX)
-            return initMaxPoolingHalide(inputs);
-        else if (type == AVE)
-            return initAvePoolingHalide(inputs);
-        else
-            return Ptr<BackendNode>();
-    }
 
 #ifdef HAVE_CANN
     virtual Ptr<BackendNode> initCann(const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -1185,142 +1195,6 @@ public:
         PoolingInvoker::run(src, rois, dst, mask, kernel_size, strides, pads_begin, pads_end, avePoolPaddedArea, type, spatialScale, computeMaxIdx, nstripes);
     }
 
-    Ptr<BackendNode> initMaxPoolingHalide(const std::vector<Ptr<BackendWrapper> > &inputs)
-    {
-#ifdef HAVE_HALIDE
-        Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
-        const int inWidth = inputBuffer.width();
-        const int inHeight = inputBuffer.height();
-        const HALIDE_DIFF_T kernelHeight = (HALIDE_DIFF_T)kernel_size[0];
-        const HALIDE_DIFF_T kernelWidth = (HALIDE_DIFF_T)kernel_size[1];
-        const HALIDE_DIFF_T strideHeight = (HALIDE_DIFF_T)strides[0];
-        const HALIDE_DIFF_T strideWidth = (HALIDE_DIFF_T)strides[1];
-        const HALIDE_DIFF_T paddingTop = (HALIDE_DIFF_T)pads_begin[0];
-        const HALIDE_DIFF_T paddingLeft = (HALIDE_DIFF_T)pads_begin[1];
-
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::RDom r(0, kernelWidth, 0, kernelHeight);
-        Halide::Expr kx, ky;
-        if(paddingLeft || paddingTop)
-        {
-            kx = clamp(x * strideWidth + r.x - paddingLeft, 0, inWidth - 1);
-            ky = clamp(y * strideHeight + r.y - paddingTop, 0, inHeight - 1);
-        }
-        else
-        {
-            kx = min(x * strideWidth + r.x, inWidth - 1);
-            ky = min(y * strideHeight + r.y, inHeight - 1);
-        }
-
-        // Halide::argmax returns tuple (r.x, r.y, max).
-        Halide::Tuple res = argmax(inputBuffer(kx, ky, c, n));
-
-        if (!computeMaxIdx)
-        {
-            top(x, y, c, n) = res[2];
-            return Ptr<BackendNode>(new HalideBackendNode(top));
-        }
-
-        // Compute offset from argmax in range [0, kernel_size).
-        Halide::Expr max_index;
-        if(paddingLeft || paddingTop)
-        {
-            max_index = clamp(y * strideHeight + res[1] - paddingTop,
-                              0, inHeight - 1) * inWidth +
-                        clamp(x * strideWidth + res[0] - paddingLeft,
-                              0, inWidth - 1);
-        }
-        else
-        {
-            max_index = min(y * strideHeight + res[1], inHeight - 1) * inWidth +
-                        min(x * strideWidth + res[0], inWidth - 1);
-        }
-        top(x, y, c, n) = { res[2], Halide::cast<float>(max_index) };
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
-
-    Ptr<BackendNode> initAvePoolingHalide(const std::vector<Ptr<BackendWrapper> > &inputs)
-    {
-#ifdef HAVE_HALIDE
-        Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
-
-        const int inW = inputBuffer.width(), inH = inputBuffer.height();
-        const HALIDE_DIFF_T kernelHeight = (HALIDE_DIFF_T)kernel_size[0];
-        const HALIDE_DIFF_T kernelWidth = (HALIDE_DIFF_T)kernel_size[1];
-        const HALIDE_DIFF_T strideHeight = (HALIDE_DIFF_T)strides[0];
-        const HALIDE_DIFF_T strideWidth = (HALIDE_DIFF_T)strides[1];
-        if ((inW - kernelWidth) % strideWidth || (inH - kernelHeight) % strideHeight)
-        {
-            CV_Error(cv::Error::StsNotImplemented,
-                     "Halide backend for average pooling with partial "
-                     "kernels is not implemented");
-        }
-
-        const float norm = 1.0f / (kernelWidth * kernelHeight);
-
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::RDom r(0, kernelWidth, 0, kernelHeight);
-        top(x, y, c, n) = sum(
-            inputBuffer(x * strideWidth + r.x,
-                        y * strideHeight + r.y, c, n)) * norm;
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
-
-    virtual void applyHalideScheduler(Ptr<BackendNode>& node,
-                                      const std::vector<Mat*> &inputs,
-                                      const std::vector<Mat> &outputs,
-                                      int targetId) const CV_OVERRIDE
-    {
-#ifdef  HAVE_HALIDE
-        if (targetId != DNN_TARGET_CPU)
-        {
-            Layer::applyHalideScheduler(node, inputs, outputs, targetId);
-            return;
-        }
-        Halide::Var x("x"), y("y"), c("c"), n("n"), tile("tile"),
-                    xi("xi"), yi("yi"), ci("ci"), xo("xo"), yo("yo"), co("co");
-        Halide::Func& top = node.dynamicCast<HalideBackendNode>()->funcs.back();
-
-        int outW, outH, outC, outN;
-        getCanonicalSize(outputs[0].size, &outW, &outH, &outC, &outN);
-
-        if (outW < 8 || outH < 8)
-        {
-            if (outC > 8)
-                top.split(c, co, ci, 8)
-                   .fuse(x, y, tile).fuse(co, tile, tile).fuse(n, tile, tile)
-                   .parallel(tile)
-                   .vectorize(ci);
-            else
-            {
-                top.fuse(y, c, tile).fuse(n, tile, tile)
-                   .parallel(tile);
-                if (outW > 1)
-                    top.vectorize(x);
-            }
-        }
-        else
-        {
-            if (outC > 8)
-                top.split(x, xo, xi, 8).split(y, yo, yi, 8).split(c, co, ci, 8)
-                   .fuse(xo, yo, tile).fuse(co, tile, tile).fuse(n, tile, tile)
-                   .parallel(tile)
-                   .vectorize(xi);
-            else
-                top.split(x, xo, xi, 8).split(y, yo, yi, 8)
-                   .fuse(xo, yo, tile).fuse(c, tile, tile).fuse(n, tile, tile)
-                   .parallel(tile)
-                   .vectorize(xi);
-        }
-#endif  // HAVE_HALIDE
-    }
-
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                          const int requiredOutputs,
                          std::vector<MatShape> &outputs,
@@ -1334,13 +1208,19 @@ public:
 
         std::vector<size_t> local_kernel;
         if (globalPooling) {
-            for (int i = 0; i < inpShape.size(); i++) {
-                int idx = isGlobalPooling.size() - inpShape.size() + i;
+            CV_CheckLE(inpShape.size(), isGlobalPooling.size(), "");
+            for (size_t i = 0; i < inpShape.size(); i++) {
+                size_t idx = isGlobalPooling.size() - inpShape.size() + i;
                 local_kernel.push_back(isGlobalPooling[idx] ? inpShape[i] : kernel_size[idx]);
             }
         } else {
             local_kernel = kernel_size;
         }
+
+        std::vector<size_t> local_pads_begin = pads_begin, local_pads_end = pads_end;
+        std::vector<size_t> local_strides = strides;
+        if (globalPooling)
+            expandGlobalPoolingParams(local_pads_begin, local_pads_end, local_strides, inpShape.size());
 
         if (type == ROI || type == PSROI)
         {
@@ -1359,13 +1239,13 @@ public:
             {
                 size_t addedDims = isPool1D? inpShape.size() : local_kernel.size();
                 CV_CheckLE(addedDims, inpShape.size(), "");
-                CV_CheckLE(addedDims, pads_begin.size(), "");
-                CV_CheckLE(addedDims, pads_end.size(), "");
+                CV_CheckLE(addedDims, local_pads_begin.size(), "");
+                CV_CheckLE(addedDims, local_pads_end.size(), "");
                 CV_CheckLE(addedDims, local_kernel.size(), "");
-                CV_CheckLE(addedDims, strides.size(), "");
+                CV_CheckLE(addedDims, local_strides.size(), "");
                 for (int i = 0; i < addedDims; i++)
                 {
-                    float dst = (float) (inpShape[i] + pads_begin[i] + pads_end[i] - local_kernel[i]) / strides[i];
+                    float dst = (float) (inpShape[i] + local_pads_begin[i] + local_pads_end[i] - local_kernel[i]) / local_strides[i];
                     CV_CheckGE(dst, 0.0f, "");
                     outShape.push_back(1 + (ceilMode ? ceil(dst) : floor(dst)));
                 }
@@ -1373,13 +1253,13 @@ public:
                 // If we have padding, ensure that the last pooling starts strictly
                 // inside the image (instead of at the padding); otherwise clip the last.
                 for (int i = 0; i < addedDims; i++) {
-                    if (pads_end[i] && (outShape[2 + i] - 1) * strides[i] >= inpShape[i] + pads_end[i]) {
+                    if (local_pads_end[i] && (outShape[2 + i] - 1) * local_strides[i] >= inpShape[i] + local_pads_end[i]) {
                         --outShape[2 + i];
-                        CV_Assert((outShape[2 + i] - 1) * strides[i] < inpShape[i] + pads_end[i]);
+                        CV_Assert((outShape[2 + i] - 1) * local_strides[i] < inpShape[i] + local_pads_end[i]);
                     }
                 }
             } else {
-                getConvPoolOutParams(inpShape, local_kernel, strides, padMode,
+                getConvPoolOutParams(inpShape, local_kernel, local_strides, padMode,
                                      std::vector<size_t>(local_kernel.size(), 1), outShape);
             }
         }
@@ -1398,9 +1278,27 @@ public:
         int numOutputs = requiredOutputs ? requiredOutputs : (type == MAX ? 2 : 1);
         CV_Assert(numOutputs == 1 || (numOutputs == 2 && type == MAX));
 
-        outputs.assign(numOutputs, outShape);
+        outputs.assign(numOutputs, MatShape(outShape));
 
         return false;
+    }
+
+    virtual void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size());
+        if (preferableTarget == DNN_TARGET_OPENCL_FP16)
+            CV_CheckType(inputs[0], inputs[0] == CV_16F, "");
+        else
+            CV_CheckType(inputs[0], inputs[0] == CV_32F, "");
+
+        outputs.push_back(inputs[0]);
+        if (type == MAX && requiredOutputs == 2) {
+            outputs.push_back(CV_64S);
+        }
     }
 
     bool updateMemoryShapes(const std::vector<MatShape> &inputs) CV_OVERRIDE
@@ -1409,23 +1307,6 @@ public:
         CV_Assert(inputs[0][dims - 1] > 0 && inputs[0][dims - 2] > 0);
         shapesInitialized = true;
         return true;
-    }
-
-    virtual bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                             const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        if (type == MAX && !computeMaxIdx)
-        {
-            return true;
-        }
-        else if (type == AVE || type == SUM)
-        {
-            float multiplier = scales[0][0] / scales[1][0];
-            params.set("multiplier", multiplier);
-            params.set("input_zeropoint", zeropoints[0][0]);
-            return true;
-        }
-        return false;
     }
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,

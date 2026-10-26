@@ -41,6 +41,7 @@
 //M*/
 
 #include "precomp.hpp"
+#include "opencv2/core/hal/intrin.hpp"
 
 namespace cv
 {
@@ -237,11 +238,11 @@ static void getRectSubPix_8u32f
         float a = center.x - ip.x;
         float b = center.y - ip.y;
         a = MAX(a,0.0001f);
-        float a12 = a*(1.f-b);
+
+        float a11 = (1.f - a)*(1.f - b);
+        float a12 = a*(1.f - b);
+        float a21 = (1.f - a)*b;
         float a22 = a*b;
-        float b1 = 1.f - b;
-        float b2 = b;
-        double s = (1. - a)/a;
 
         src_step /= sizeof(src[0]);
         dst_step /= sizeof(dst[0]);
@@ -251,111 +252,35 @@ static void getRectSubPix_8u32f
 
         for( ; win_size.height--; src += src_step, dst += dst_step )
         {
-            float prev = (1 - a)*(b1*src[0] + b2*src[src_step]);
-            for( int j = 0; j < win_size.width; j++ )
+            int j = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
             {
-                float t = a12*src[j+1] + a22*src[j+1+src_step];
-                dst[j] = prev + t;
-                prev = (float)(t*s);
+                const int V = VTraits<v_float32>::vlanes();
+                const v_float32 va11 = vx_setall_f32(a11), va12 = vx_setall_f32(a12);
+                const v_float32 va21 = vx_setall_f32(a21), va22 = vx_setall_f32(a22);
+                for( ; j <= win_size.width - V; j += V )
+                {
+                    v_float32 s0 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j)));
+                    v_float32 s1 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j + 1)));
+                    v_float32 s2 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j + src_step)));
+                    v_float32 s3 = v_cvt_f32(v_reinterpret_as_s32(vx_load_expand_q(src + j + src_step + 1)));
+
+                    v_float32 s = v_mul(s0, va11);
+                    s = v_add(s, v_mul(s1, va12));
+                    s = v_add(s, v_mul(s2, va21));
+                    s = v_add(s, v_mul(s3, va22));
+                    v_store(dst + j, s);
+                }
             }
+#endif
+            for( ; j < win_size.width; j++ )
+                dst[j] = a11*src[j] + a12*src[j+1] + a21*src[j+src_step] + a22*src[j+1+src_step];
         }
     }
     else
     {
         getRectSubPix_Cn_<uchar, float, float, nop<float>, nop<float> >
         (src, src_step, src_size, dst, dst_step, win_size, center0, cn );
-    }
-}
-
-static void
-getQuadrangleSubPix_8u32f_CnR( const uchar* src, size_t src_step, Size src_size,
-                               float* dst, size_t dst_step, Size win_size,
-                               const double *matrix, int cn )
-{
-    int x, y, k;
-    double A11 = matrix[0], A12 = matrix[1], A13 = matrix[2];
-    double A21 = matrix[3], A22 = matrix[4], A23 = matrix[5];
-
-    src_step /= sizeof(src[0]);
-    dst_step /= sizeof(dst[0]);
-
-    for( y = 0; y < win_size.height; y++, dst += dst_step )
-    {
-        double xs = A12*y + A13;
-        double ys = A22*y + A23;
-        double xe = A11*(win_size.width-1) + A12*y + A13;
-        double ye = A21*(win_size.width-1) + A22*y + A23;
-
-        if( (unsigned)(cvFloor(xs)-1) < (unsigned)(src_size.width - 3) &&
-            (unsigned)(cvFloor(ys)-1) < (unsigned)(src_size.height - 3) &&
-            (unsigned)(cvFloor(xe)-1) < (unsigned)(src_size.width - 3) &&
-            (unsigned)(cvFloor(ye)-1) < (unsigned)(src_size.height - 3))
-        {
-            for( x = 0; x < win_size.width; x++ )
-            {
-                int ixs = cvFloor( xs );
-                int iys = cvFloor( ys );
-                const uchar *ptr = src + src_step*iys;
-                float a = (float)(xs - ixs), b = (float)(ys - iys), a1 = 1.f - a, b1 = 1.f - b;
-                float w00 = a1*b1, w01 = a*b1, w10 = a1*b, w11 = a*b;
-                xs += A11;
-                ys += A21;
-
-                if( cn == 1 )
-                {
-                    ptr += ixs;
-                    dst[x] = ptr[0]*w00 + ptr[1]*w01 + ptr[src_step]*w10 + ptr[src_step+1]*w11;
-                }
-                else if( cn == 3 )
-                {
-                    ptr += ixs*3;
-                    float t0 = ptr[0]*w00 + ptr[3]*w01 + ptr[src_step]*w10 + ptr[src_step+3]*w11;
-                    float t1 = ptr[1]*w00 + ptr[4]*w01 + ptr[src_step+1]*w10 + ptr[src_step+4]*w11;
-                    float t2 = ptr[2]*w00 + ptr[5]*w01 + ptr[src_step+2]*w10 + ptr[src_step+5]*w11;
-
-                    dst[x*3] = t0;
-                    dst[x*3+1] = t1;
-                    dst[x*3+2] = t2;
-                }
-                else
-                {
-                    ptr += ixs*cn;
-                    for( k = 0; k < cn; k++ )
-                        dst[x*cn+k] = ptr[k]*w00 + ptr[k+cn]*w01 +
-                                    ptr[src_step+k]*w10 + ptr[src_step+k+cn]*w11;
-                }
-            }
-        }
-        else
-        {
-            for( x = 0; x < win_size.width; x++ )
-            {
-                int ixs = cvFloor( xs ), iys = cvFloor( ys );
-                float a = (float)(xs - ixs), b = (float)(ys - iys), a1 = 1.f - a, b1 = 1.f - b;
-                float w00 = a1*b1, w01 = a*b1, w10 = a1*b, w11 = a*b;
-                const uchar *ptr0, *ptr1;
-                xs += A11; ys += A21;
-
-                if( (unsigned)iys < (unsigned)(src_size.height-1) )
-                    ptr0 = src + src_step*iys, ptr1 = ptr0 + src_step;
-                else
-                    ptr0 = ptr1 = src + (iys < 0 ? 0 : src_size.height-1)*src_step;
-
-                if( (unsigned)ixs < (unsigned)(src_size.width-1) )
-                {
-                    ptr0 += ixs*cn; ptr1 += ixs*cn;
-                    for( k = 0; k < cn; k++ )
-                        dst[x*cn + k] = ptr0[k]*w00 + ptr0[k+cn]*w01 + ptr1[k]*w10 + ptr1[k+cn]*w11;
-                }
-                else
-                {
-                    ixs = ixs < 0 ? 0 : src_size.width - 1;
-                    ptr0 += ixs*cn; ptr1 += ixs*cn;
-                    for( k = 0; k < cn; k++ )
-                        dst[x*cn + k] = ptr0[k]*b1 + ptr1[k]*b;
-                }
-            }
-        }
     }
 }
 
@@ -367,7 +292,16 @@ void cv::getRectSubPix( InputArray _image, Size patchSize, Point2f center,
 {
     CV_INSTRUMENT_REGION();
 
+    CV_CheckGT(patchSize.width, 0, "");
+    CV_CheckGT(patchSize.height, 0, "");
+
     Mat image = _image.getMat();
+    if( image.empty() )
+    {
+        _patch.release();
+        return;
+    }
+
     int depth = image.depth(), cn = image.channels();
     int ddepth = patchType < 0 ? depth : CV_MAT_DEPTH(patchType);
 
@@ -376,36 +310,10 @@ void cv::getRectSubPix( InputArray _image, Size patchSize, Point2f center,
     _patch.create(patchSize, CV_MAKETYPE(ddepth, cn));
     Mat patch = _patch.getMat();
 
-#if defined (HAVE_IPP) && (IPP_VERSION_X100 >= 700)
-    CV_IPP_CHECK()
-    {
-        typedef IppStatus (CV_STDCALL *ippiGetRectSubPixFunc)( const void* src, int src_step,
-                                                                IppiSize src_size, void* dst,
-                                                                int dst_step, IppiSize win_size,
-                                                                IppiPoint_32f center,
-                                                                IppiPoint* minpt, IppiPoint* maxpt );
-
-        IppiPoint minpt={0,0}, maxpt={0,0};
-        IppiPoint_32f icenter = {center.x, center.y};
-        IppiSize src_size={image.cols, image.rows}, win_size={patch.cols, patch.rows};
-        int srctype = image.type();
-        ippiGetRectSubPixFunc ippiCopySubpixIntersect =
-            srctype == CV_8UC1 && ddepth == CV_8U ? (ippiGetRectSubPixFunc)ippiCopySubpixIntersect_8u_C1R :
-            srctype == CV_8UC1 && ddepth == CV_32F ? (ippiGetRectSubPixFunc)ippiCopySubpixIntersect_8u32f_C1R :
-            srctype == CV_32FC1 && ddepth == CV_32F ? (ippiGetRectSubPixFunc)ippiCopySubpixIntersect_32f_C1R : 0;
-
-        if( ippiCopySubpixIntersect)
-        {
-            if (CV_INSTRUMENT_FUN_IPP(ippiCopySubpixIntersect, image.ptr(), (int)image.step, src_size, patch.ptr(),
-                        (int)patch.step, win_size, icenter, &minpt, &maxpt) >= 0)
-            {
-                CV_IMPL_ADD(CV_IMPL_IPP);
-                return;
-            }
-            setIppErrorStatus();
-        }
-    }
-#endif
+    CALL_HAL(getRectSubPix, cv_hal_getRectSubPix,
+             image.type(), image.data, image.step, image.cols, image.rows,
+             patch.type(), patch.data, patch.step, patch.cols, patch.rows,
+             center.x, center.y);
 
     if( depth == CV_8U && ddepth == CV_8U )
         getRectSubPix_Cn_<uchar, uchar, int, scale_fixpt, cast_8u>
@@ -419,70 +327,3 @@ void cv::getRectSubPix( InputArray _image, Size patchSize, Point2f center,
     else
         CV_Error( cv::Error::StsUnsupportedFormat, "Unsupported combination of input and output formats");
 }
-
-
-CV_IMPL void
-cvGetRectSubPix( const void* srcarr, void* dstarr, CvPoint2D32f center )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr);
-    const cv::Mat dst = cv::cvarrToMat(dstarr);
-    CV_Assert( src.channels() == dst.channels() );
-
-    cv::getRectSubPix(src, dst.size(), center, dst, dst.type());
-}
-
-
-CV_IMPL void
-cvGetQuadrangleSubPix( const void* srcarr, void* dstarr, const CvMat* mat )
-{
-    const cv::Mat src = cv::cvarrToMat(srcarr), m = cv::cvarrToMat(mat);
-    cv::Mat dst = cv::cvarrToMat(dstarr);
-
-    CV_Assert( src.channels() == dst.channels() );
-
-    cv::Size win_size = dst.size();
-    double matrix[6] = {0};
-    cv::Mat M(2, 3, CV_64F, matrix);
-    m.convertTo(M, CV_64F);
-    double dx = (win_size.width - 1)*0.5;
-    double dy = (win_size.height - 1)*0.5;
-    matrix[2] -= matrix[0]*dx + matrix[1]*dy;
-    matrix[5] -= matrix[3]*dx + matrix[4]*dy;
-
-    if( src.depth() == CV_8U && dst.depth() == CV_32F )
-        cv::getQuadrangleSubPix_8u32f_CnR( src.ptr(), src.step, src.size(),
-                                           dst.ptr<float>(), dst.step, dst.size(),
-                                           matrix, src.channels());
-    else
-    {
-        CV_Assert( src.depth() == dst.depth() );
-        cv::warpAffine(src, dst, M, dst.size(),
-                       cv::INTER_LINEAR + cv::WARP_INVERSE_MAP,
-                       cv::BORDER_REPLICATE);
-    }
-}
-
-
-CV_IMPL int
-cvSampleLine( const void* _img, CvPoint pt1, CvPoint pt2,
-              void* _buffer, int connectivity )
-{
-    cv::Mat img = cv::cvarrToMat(_img);
-    cv::LineIterator li(img, pt1, pt2, connectivity, false);
-    uchar* buffer = (uchar*)_buffer;
-    size_t pixsize = img.elemSize();
-
-    if( !buffer )
-        CV_Error( cv::Error::StsNullPtr, "" );
-
-    for( int i = 0; i < li.count; i++, ++li )
-    {
-        for( size_t k = 0; k < pixsize; k++ )
-            *buffer++ = li.ptr[k];
-    }
-
-    return li.count;
-}
-
-
-/* End of file. */

@@ -418,6 +418,7 @@ class ClassInfo(GeneralInfo):
     def generateObjcBodyCode(self, m, M):
         return Template(self.objc_body_template + "\n\n").substitute(
                             module = M,
+                            objcname = make_objcname(M),
                             nativePointerHandling=Template(
 """
 - (instancetype)initWithNativePtr:(cv::Ptr<$cName>)nativePtr {
@@ -434,14 +435,14 @@ class ClassInfo(GeneralInfo):
 """
                             ).substitute(
                                 cName = self.fullName(isCPP=True),
-                                objcName = self.objc_name,
+                                objcName = make_objcname(self.objc_name),
                                 native_ptr_name = self.native_ptr_name,
                                 init_call = "init" if self.is_base_class else "initWithNativePtr:nativePtr"
                             ),
                             manualMethodDeclations = "",
                             methodImplementations = self.method_implementations.getvalue(),
                             name = self.name,
-                            objcName = self.objc_name,
+                            objcName = make_objcname(self.objc_name),
                             cName = self.cname,
                             imports = "\n".join(self.getImports(M)),
                             docs = gen_class_doc(self.docstring, M, self.member_classes, self.member_enums),
@@ -590,8 +591,18 @@ def get_swift_type(ctype):
             swift_type = "[[" + swift_type + "]]"
     return swift_type
 
+SWIFT_KEYWORDS = {
+    "as", "break", "case", "catch", "class", "continue", "default", "defer", "deinit", "do", "else", "enum",
+    "extension", "fallthrough", "false", "for", "func", "guard", "if", "import", "in", "init", "inout", "is",
+    "let", "nil", "operator", "private", "protocol", "public", "repeat", "rethrows", "return", "self", "static",
+    "struct", "subscript", "super", "switch", "throw", "throws", "true", "try", "typealias", "var", "where", "while"
+}
+
+def swift_identifier(name):
+    return "`" + name + "`" if name in SWIFT_KEYWORDS else name
+
 def build_swift_extension_decl(name, args, constructor, static, ret_type):
-    extension_decl = "@nonobjc " + ("class " if static else "") + (("func " + name) if not constructor else "convenience init") + "("
+    extension_decl = "@nonobjc " + ("class " if static else "") + (("func " + swift_identifier(name)) if not constructor else "convenience init") + "("
     swift_args = []
     for a in args:
         if a.ctype not in type_dict:
@@ -649,7 +660,7 @@ def build_swift_signature(args):
     return swift_signature
 
 def build_unrefined_call(name, args, constructor, static, classname, has_ret):
-    swift_refine_call = ("let ret = " if has_ret and not constructor else "") + ((make_objcname(classname) + ".") if static else "") + (name if not constructor else "self.init")
+    swift_refine_call = ("let ret = " if has_ret and not constructor else "") + ((make_objcname(classname) + ".") if static else "") + (swift_identifier(name) if not constructor else "self.init")
     call_args = []
     for a in args:
         if a.ctype not in type_dict:
@@ -846,9 +857,14 @@ class ObjectiveCWrapperGenerator(object):
             objc_type = enumType.rsplit(".", 1)[-1]
             if objc_type in enum_ignore_list:
                 return
-            if constinfo.classname in enum_fix:
+            original_objc_type = objc_type
+            if not constinfo.classname or constinfo.classname == objc_type:
+                module_fix = enum_fix.get(self.Module, {})
+                objc_type = module_fix.get(objc_type, objc_type)
+                objc_type = enum_fix.get(objc_type, objc_type)
+            elif constinfo.classname in enum_fix:
                 objc_type = enum_fix[constinfo.classname].get(objc_type, objc_type)
-            import_module = constinfo.classname if constinfo.classname and constinfo.classname != objc_type else self.Module
+            import_module = constinfo.classname if constinfo.classname and constinfo.classname != original_objc_type else self.Module
             type_dict[ctype] = { "cast_from" : "int",
                                  "cast_to" : get_cname(enumType),
                                  "objc_type" : objc_type,

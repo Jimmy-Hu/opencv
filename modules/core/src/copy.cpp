@@ -50,7 +50,6 @@
 #include "precomp.hpp"
 #include "opencl_kernels_core.hpp"
 
-
 namespace cv
 {
 
@@ -73,28 +72,49 @@ void scalarToRawData(const Scalar& s, void* _buf, int type, int unroll_to)
     switch(depth)
     {
     case CV_8U:
-        scalarToRawData_<uchar>(s, (uchar*)_buf, cn, unroll_to);
+        scalarToRawData_(s, (uchar*)_buf, cn, unroll_to);
         break;
     case CV_8S:
-        scalarToRawData_<schar>(s, (schar*)_buf, cn, unroll_to);
+        scalarToRawData_(s, (schar*)_buf, cn, unroll_to);
+        break;
+    case CV_Bool:
+        scalarToRawData_(s, (bool*)_buf, cn, unroll_to);
         break;
     case CV_16U:
-        scalarToRawData_<ushort>(s, (ushort*)_buf, cn, unroll_to);
+        scalarToRawData_(s, (ushort*)_buf, cn, unroll_to);
         break;
     case CV_16S:
-        scalarToRawData_<short>(s, (short*)_buf, cn, unroll_to);
-        break;
-    case CV_32S:
-        scalarToRawData_<int>(s, (int*)_buf, cn, unroll_to);
-        break;
-    case CV_32F:
-        scalarToRawData_<float>(s, (float*)_buf, cn, unroll_to);
-        break;
-    case CV_64F:
-        scalarToRawData_<double>(s, (double*)_buf, cn, unroll_to);
+        scalarToRawData_(s, (short*)_buf, cn, unroll_to);
         break;
     case CV_16F:
-        scalarToRawData_<hfloat>(s, (hfloat*)_buf, cn, unroll_to);
+        scalarToRawData_(s, (hfloat*)_buf, cn, unroll_to);
+        break;
+    case CV_16BF:
+        scalarToRawData_(s, (bfloat*)_buf, cn, unroll_to);
+        break;
+    case CV_8F_E4M3FN:
+        scalarToRawData_(s, (fp8_t*)_buf, cn, unroll_to);
+        break;
+    case CV_8F_E4M3FNUZ:
+        scalarToRawData_(s, (fp8a_t*)_buf, cn, unroll_to);
+        break;
+    case CV_32U:
+        scalarToRawData_(s, (unsigned*)_buf, cn, unroll_to);
+        break;
+    case CV_32S:
+        scalarToRawData_(s, (int*)_buf, cn, unroll_to);
+        break;
+    case CV_32F:
+        scalarToRawData_(s, (float*)_buf, cn, unroll_to);
+        break;
+    case CV_64U:
+        scalarToRawData_(s, (uint64_t*)_buf, cn, unroll_to);
+        break;
+    case CV_64S:
+        scalarToRawData_(s, (int64_t*)_buf, cn, unroll_to);
+        break;
+    case CV_64F:
+        scalarToRawData_(s, (double*)_buf, cn, unroll_to);
         break;
     default:
         CV_Error(cv::Error::StsUnsupportedFormat,"");
@@ -436,40 +456,53 @@ void Mat::copyTo( OutputArray _dst ) const
     }
 #endif
 
+    int stype = type();
     int dtype = _dst.type();
-    if( _dst.fixedType() && dtype != type() )
+    if( _dst.fixedType() && dtype != stype )
     {
-        CV_Assert( channels() == CV_MAT_CN(dtype) );
+        CV_Assert( CV_MAT_CN(stype) == CV_MAT_CN(dtype) );
         convertTo( _dst, dtype );
         return;
     }
 
-    if( empty() )
+    if( dims == 0 && empty() )
     {
         _dst.release();
-        _dst.create(size(), type());
+        void* obj = _dst.getObj();
+        if (_dst.isMat())
+            reinterpret_cast<Mat*>(obj)->flags = Mat::MAGIC_VAL | Mat::CONTINUOUS_FLAG | stype;
+        else if (_dst.isUMat())
+            reinterpret_cast<UMat*>(obj)->flags = UMat::MAGIC_VAL | UMat::CONTINUOUS_FLAG | stype;
+        else if (_dst.isGpuMat())
+            reinterpret_cast<cuda::GpuMat*>(obj)->flags = stype;
         return;
     }
 
+    bool allowTransposed = dims == 1 ||
+        _dst.kind() == _InputArray::STD_VECTOR ||
+        (_dst.fixedSize() && _dst.dims() == 1);
     if( _dst.isUMat() )
     {
-        _dst.create( dims, size.p, type() );
+        _dst.create( dims, size.p, stype, -1, allowTransposed );
+        if (empty())
+            return;
         UMat dst = _dst.getUMat();
         CV_Assert(dst.u != NULL);
-        size_t i, sz[CV_MAX_DIM] = {0}, dstofs[CV_MAX_DIM], esz = elemSize();
-        CV_Assert(dims > 0 && dims < CV_MAX_DIM);
+        size_t i, sz[CV_MAX_DIM] = {1}, dstofs[CV_MAX_DIM] = {0}, esz = CV_ELEM_SIZE(stype);
+        CV_Assert(dims >= 0 && dims < CV_MAX_DIM);
         for( i = 0; i < (size_t)dims; i++ )
             sz[i] = size.p[i];
-        sz[dims-1] *= esz;
+        int lastdim = dims >= 1 ? dims-1 : 0;
+        sz[lastdim] *= esz;
         dst.ndoffset(dstofs);
-        dstofs[dims-1] *= esz;
-        dst.u->currAllocator->upload(dst.u, data, dims, sz, dstofs, dst.step.p, step.p);
+        dstofs[lastdim] *= esz;
+        dst.u->currAllocator->upload(dst.u, data, std::max(dims, 1), sz, dstofs, dst.step.p, step.p);
         return;
     }
 
     if( dims <= 2 )
     {
-        _dst.create( rows, cols, type() );
+        _dst.create( dims, size.p, stype, -1, allowTransposed );
         Mat dst = _dst.getMat();
         if( data == dst.data )
             return;
@@ -493,7 +526,7 @@ void Mat::copyTo( OutputArray _dst ) const
         return;
     }
 
-    _dst.create( dims, size, type() );
+    _dst.create( size, stype );
     Mat dst = _dst.getMat();
     if( data == dst.data )
         return;
@@ -558,7 +591,7 @@ void Mat::copyTo( OutputArray _dst, InputArray _mask ) const
     }
 
     int cn = channels(), mcn = mask.channels();
-    CV_Assert( mask.depth() == CV_8U && (mcn == 1 || mcn == cn) );
+    CV_Assert( (mask.depth() == CV_8U || mask.depth() == CV_8S || mask.depth() == CV_Bool) && (mcn == 1 || mcn == cn) );
     bool colorMask = mcn > 1;
     if( dims <= 2 )
     {
@@ -568,7 +601,7 @@ void Mat::copyTo( OutputArray _dst, InputArray _mask ) const
     Mat dst;
     {
         Mat dst0 = _dst.getMat();
-        _dst.create(dims, size, type()); // TODO Prohibit 'dst' re-creation, user should pass it explicitly with correct size/type or empty
+        _dst.create(size, type()); // TODO Prohibit 'dst' re-creation, user should pass it explicitly with correct size/type or empty
         dst = _dst.getMat();
 
         if (dst.data != dst0.data) // re-allocation happened
@@ -781,7 +814,8 @@ Mat& Mat::setTo(InputArray _value, InputArray _mask)
 
     CV_Assert( checkScalar(value, type(), _value.kind(), _InputArray::MAT ));
     int cn = channels(), mcn = mask.channels();
-    CV_Assert( mask.empty() || (mask.depth() == CV_8U && (mcn == 1 || mcn == cn) && size == mask.size) );
+    CV_Assert( mask.empty() || ((mask.depth() == CV_8U || mask.depth() == CV_8S || mask.depth() == CV_Bool) &&
+               (mcn == 1 || mcn == cn) && size == mask.size) );
 
     CV_IPP_RUN_FAST(ipp_Mat_setTo_Mat(*this, value, mask), *this)
 
@@ -814,6 +848,25 @@ Mat& Mat::setTo(InputArray _value, InputArray _mask)
             ptrs[0] += blockSize;
         }
     }
+    return *this;
+}
+
+
+Mat& Mat::setZero()
+{
+    CV_INSTRUMENT_REGION();
+
+    if( empty() )
+        return *this;
+
+    size_t esz = elemSize();
+
+    const Mat* arrays[] = { this, 0 };
+    uchar* ptrs[]={0};
+    NAryMatIterator it(arrays, ptrs);
+
+    for( size_t i = 0; i < it.nplanes; i++, ++it )
+        memset(ptrs[0], 0, esz*it.size);
     return *this;
 }
 
@@ -857,6 +910,12 @@ void repeat(InputArray _src, int ny, int nx, OutputArray _dst)
     CV_Assert( ny > 0 && nx > 0 );
 
     Size ssize = _src.size();
+    if( ssize.empty() )
+    {
+        _dst.create(0, 0, _src.type());
+        return;
+    }
+    CV_Assert( (int64_t)ssize.height * ny <= INT_MAX && (int64_t)ssize.width * nx <= INT_MAX );
     _dst.create(ssize.height*ny, ssize.width*nx, _src.type());
 
 #if !defined __APPLE__
@@ -937,10 +996,14 @@ int cv::borderInterpolate( int p, int len, int borderType )
     else if( borderType == BORDER_WRAP )
     {
         CV_Assert(len > 0);
-        if( p < 0 )
-            p -= ((p-len+1)/len)*len;
-        if( p >= len )
-            p %= len;
+        if( p < 0 || p >= len )
+        {
+            int64_t p64 = p;
+            p64 %= (int64_t)len;
+            if( p64 < 0 )
+                p64 += len;
+            p = (int)p64;
+        }
     }
     else if( borderType == BORDER_CONSTANT )
         p = -1;
@@ -1180,12 +1243,15 @@ void cv::copyMakeBorder( InputArray _src, OutputArray _dst, int top, int bottom,
 {
     CV_INSTRUMENT_REGION();
 
-    CV_Assert( top >= 0 && bottom >= 0 && left >= 0 && right >= 0 && _src.dims() <= 2);
+    CV_Assert( top >= 0 && bottom >= 0 && left >= 0 && right >= 0 && _src.dims() <= 2 );
+    CV_Assert( !_src.empty() );
+
+    Mat src = _src.getMat();
+    CV_Assert( (int64_t)src.rows + top + bottom <= INT_MAX );
+    CV_Assert( (int64_t)src.cols + left + right <= INT_MAX );
 
     CV_OCL_RUN(_dst.isUMat(),
                ocl_copyMakeBorder(_src, _dst, top, bottom, left, right, borderType, value))
-
-    Mat src = _src.getMat();
     int type = src.type();
 
     if( src.isSubmatrix() && (borderType & BORDER_ISOLATED) == 0 )
@@ -1237,124 +1303,4 @@ void cv::copyMakeBorder( InputArray _src, OutputArray _dst, int top, int bottom,
                                 top, left, (int)src.elemSize(), (uchar*)buf.data() );
     }
 }
-
-
-#ifndef OPENCV_EXCLUDE_C_API
-
-/* dst = src */
-CV_IMPL void
-cvCopy( const void* srcarr, void* dstarr, const void* maskarr )
-{
-    if( CV_IS_SPARSE_MAT(srcarr) && CV_IS_SPARSE_MAT(dstarr))
-    {
-        CV_Assert( maskarr == 0 );
-        CvSparseMat* src1 = (CvSparseMat*)srcarr;
-        CvSparseMat* dst1 = (CvSparseMat*)dstarr;
-        CvSparseMatIterator iterator;
-        CvSparseNode* node;
-
-        dst1->dims = src1->dims;
-        memcpy( dst1->size, src1->size, src1->dims*sizeof(src1->size[0]));
-        dst1->valoffset = src1->valoffset;
-        dst1->idxoffset = src1->idxoffset;
-        cvClearSet( dst1->heap );
-
-        if( src1->heap->active_count >= dst1->hashsize*CV_SPARSE_HASH_RATIO )
-        {
-            cvFree( &dst1->hashtable );
-            dst1->hashsize = src1->hashsize;
-            dst1->hashtable =
-                (void**)cvAlloc( dst1->hashsize*sizeof(dst1->hashtable[0]));
-        }
-
-        memset( dst1->hashtable, 0, dst1->hashsize*sizeof(dst1->hashtable[0]));
-
-        for( node = cvInitSparseMatIterator( src1, &iterator );
-             node != 0; node = cvGetNextSparseNode( &iterator ))
-        {
-            CvSparseNode* node_copy = (CvSparseNode*)cvSetNew( dst1->heap );
-            int tabidx = node->hashval & (dst1->hashsize - 1);
-            memcpy( node_copy, node, dst1->heap->elem_size );
-            node_copy->next = (CvSparseNode*)dst1->hashtable[tabidx];
-            dst1->hashtable[tabidx] = node_copy;
-        }
-        return;
-    }
-    cv::Mat src = cv::cvarrToMat(srcarr, false, true, 1), dst = cv::cvarrToMat(dstarr, false, true, 1);
-    CV_Assert( src.depth() == dst.depth() && src.size == dst.size );
-
-    int coi1 = 0, coi2 = 0;
-    if( CV_IS_IMAGE(srcarr) )
-        coi1 = cvGetImageCOI((const IplImage*)srcarr);
-    if( CV_IS_IMAGE(dstarr) )
-        coi2 = cvGetImageCOI((const IplImage*)dstarr);
-
-    if( coi1 || coi2 )
-    {
-        CV_Assert( (coi1 != 0 || src.channels() == 1) &&
-            (coi2 != 0 || dst.channels() == 1) );
-
-        int pair[] = { std::max(coi1-1, 0), std::max(coi2-1, 0) };
-        cv::mixChannels( &src, 1, &dst, 1, pair, 1 );
-        return;
-    }
-    else
-        CV_Assert( src.channels() == dst.channels() );
-
-    if( !maskarr )
-        src.copyTo(dst);
-    else
-        src.copyTo(dst, cv::cvarrToMat(maskarr));
-}
-
-CV_IMPL void
-cvSet( void* arr, CvScalar value, const void* maskarr )
-{
-    cv::Mat m = cv::cvarrToMat(arr);
-    if( !maskarr )
-        m = value;
-    else
-        m.setTo(cv::Scalar(value), cv::cvarrToMat(maskarr));
-}
-
-CV_IMPL void
-cvSetZero( CvArr* arr )
-{
-    if( CV_IS_SPARSE_MAT(arr) )
-    {
-        CvSparseMat* mat1 = (CvSparseMat*)arr;
-        cvClearSet( mat1->heap );
-        if( mat1->hashtable )
-            memset( mat1->hashtable, 0, mat1->hashsize*sizeof(mat1->hashtable[0]));
-        return;
-    }
-    cv::Mat m = cv::cvarrToMat(arr);
-    m = cv::Scalar(0);
-}
-
-CV_IMPL void
-cvFlip( const CvArr* srcarr, CvArr* dstarr, int flip_mode )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr);
-    cv::Mat dst;
-
-    if (!dstarr)
-      dst = src;
-    else
-      dst = cv::cvarrToMat(dstarr);
-
-    CV_Assert( src.type() == dst.type() && src.size() == dst.size() );
-    cv::flip( src, dst, flip_mode );
-}
-
-CV_IMPL void
-cvRepeat( const CvArr* srcarr, CvArr* dstarr )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst = cv::cvarrToMat(dstarr);
-    CV_Assert( src.type() == dst.type() &&
-        dst.rows % src.rows == 0 && dst.cols % src.cols == 0 );
-    cv::repeat(src, dst.rows/src.rows, dst.cols/src.cols, dst);
-}
-
-#endif  // OPENCV_EXCLUDE_C_API
 /* End of file. */

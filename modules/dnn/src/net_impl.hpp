@@ -5,7 +5,6 @@
 #ifndef __OPENCV_DNN_SRC_NET_IMPL_HPP__
 #define __OPENCV_DNN_SRC_NET_IMPL_HPP__
 
-#include "op_halide.hpp"
 #include "op_inf_engine.hpp"
 #include "ie_ngraph.hpp"
 #include "op_vkcom.hpp"
@@ -26,12 +25,64 @@
 
 #include "legacy_backend.hpp"  // wrapMat BlobManager OpenCLBackendWrapper
 
+#include "kv_cache_manager.hpp"
+
+#include <unordered_map>
+
+#ifdef HAVE_ONNXRUNTIME
+namespace Ort {
+    class Env;
+    class Session;
+    class SessionOptions;
+}
+#endif
+
 namespace cv {
 namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
 
 using std::make_pair;
 using std::string;
+
+typedef std::unordered_map<std::string, int64_t> NamesHash;
+
+#ifdef HAVE_ONNXRUNTIME
+struct OrtNamesCache;
+
+#ifdef _WIN32
+typedef std::wstring OrtPathString;
+#else
+typedef std::string OrtPathString;
+#endif
+OrtPathString toOrtPath(const std::string& utf8Path);
+#endif
+
+/** @brief Single entry in a @ref PerfProfile.
+ *
+ * In DNN_PROFILE_DETAILED mode, @p label is "layer_name (type)" and @p count is 1.
+ * In DNN_PROFILE_SUMMARY mode, @p label is the layer type and @p count is the
+ * number of layers of that type that contributed to @p timeMs.
+ */
+struct PerfProfileEntry
+{
+    PerfProfileEntry() : timeMs(0.0), count(0) {}
+    String label;
+    double timeMs;
+    int count;
+};
+
+/** @brief Self-describing snapshot of profiling data from one inference.
+ *
+ * Carries the @ref ProfilingMode it was captured in so it can be saved, kept across
+ * runs (e.g. best-of-N by total time), and printed later via @ref Net::printPerfProfile
+ * without needing access to the originating @ref Net.
+ */
+struct PerfProfile
+{
+    PerfProfile() : mode(DNN_PROFILE_NONE) {}
+    ProfilingMode mode;
+    std::vector<PerfProfileEntry> entries;
+};
 
 // NB: Implementation is divided between of multiple .cpp files
 struct Net::Impl : public detail::NetImplBase
@@ -54,7 +105,6 @@ struct Net::Impl : public detail::NetImplBase
     BlobManager blobManager;
     int preferableBackend;
     int preferableTarget;
-    String halideConfigFile;
     bool hasDynamicShapes;
     // Map host data to backend specific wrapper.
     std::map<void*, Ptr<BackendWrapper>> backendWrappers;
@@ -66,8 +116,64 @@ struct Net::Impl : public detail::NetImplBase
     bool fusion;
     bool isAsync;  // FIXIT: drop
     bool useWinograd;
+    bool useKVCache = false;
+
     std::vector<int64> layersTimings;
 
+    std::string modelFileName;
+    // Why an importer gave up on the model; empty for every net that loaded.
+    std::string importFailure;
+    ModelFormat modelFormat;
+    DataLayout originalLayout;
+    // int onnx_opset;
+
+    NamesHash argnames;
+    NamesHash dimnames;
+    NamesHash graphofs;
+    size_t totalLayers;
+    std::vector<std::string> dimnames_vec;
+    std::vector<ArgData> args;
+    std::vector<Mat> __tensors__;
+    std::vector<int> bufidxs;
+    std::vector<Mat> buffers;
+    std::vector<Mat> scratchBufs;
+    // interior tensors kept alive for forward-to-layer
+    // See https://github.com/opencv/opencv/issues/26349
+    std::vector<Arg> pinnedArgs;
+    std::vector<Ptr<Graph> > allgraphs;
+    KVCacheManager kvCacheManager;
+
+    Ptr<Graph> mainGraph;
+    std::vector<int> mainGraphOutTypes;
+    int globGraphIdx;
+
+    int accuracy;
+    // if you change DEFAULT_C0/defaultC0, don't forget to update
+    // implementation of convolution, convTranspose,
+    // maxpool, avgpool, resize, pad ... where defaultC0 is accessed and used.
+    enum { DEFAULT_C0 = 8 };
+    int defaultC0;
+    bool enableFP16, haveFP16;
+    bool prepared; // need to rerun graph transformations/optimizations
+    bool finalized = false; // executors have been selected for the current backend/target
+    std::vector<MatShape> pinnedInputShapes;
+
+    // Post-fusion (pre block-layout) snapshot so finalize() can re-run from a clean
+    // state on a backend/target change; useBlockLayout() is destructive and must
+    // run after backend assignment (see deviceOp handling in graph_block_layout.cpp).
+    struct FusedGraphSnapshot {
+        Ptr<Graph> graph;
+        std::vector<Ptr<LayerInfo> > prog;
+        std::vector<std::vector<Arg> > inputs;
+        std::vector<std::vector<Arg> > outputs;
+    };
+    bool fusedSnapshotValid = false;
+    std::vector<FusedGraphSnapshot> fusedSnapshot;
+    TracingMode tracingMode;
+    ProfilingMode profilingMode;
+    std::vector<int64_t> dimvalues;
+    std::ostream* dump_strm;
+    int dump_indent;
 
     virtual bool empty() const;
     virtual void setPreferableBackend(Net& net, int backendId);
@@ -75,7 +181,6 @@ struct Net::Impl : public detail::NetImplBase
 
     // FIXIT use inheritance
     virtual Ptr<BackendWrapper> wrap(Mat& host);
-
 
     virtual void clear();
 
@@ -156,6 +261,7 @@ struct Net::Impl : public detail::NetImplBase
     virtual void setInput(InputArray blob, const String& name, double scalefactor, const Scalar& mean);
     Mat getParam(int layer, int numParam) const;
     void setParam(int layer, int numParam, const Mat& blob);
+    void setParam(const std::string& outputTensorName, int numParam, const Mat& blob);
     std::vector<Ptr<Layer>> getLayerInputs(int layerId) const;
     std::vector<String> getLayerNames() const;
 
@@ -166,12 +272,6 @@ struct Net::Impl : public detail::NetImplBase
 
 
     virtual void initBackend(const std::vector<LayerPin>& blobsToKeep_);
-
-    void setHalideScheduler(const String& scheduler);
-#ifdef HAVE_HALIDE
-    void compileHalide();
-    void initHalideBackend();
-#endif
 
 #ifdef HAVE_WEBNN
     void addWebnnOutputs(LayerData& ld);
@@ -194,18 +294,52 @@ struct Net::Impl : public detail::NetImplBase
 #ifdef HAVE_CUDA
     struct CudaInfo_t
     {
-        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt, cuda4dnn::csl::Stream d2h_stream_)
+        CudaInfo_t(cuda4dnn::csl::CSLContext ctxt)
             : context(std::move(ctxt))
-            , d2h_stream(std::move(d2h_stream_))
         {}
         cuda4dnn::csl::CSLContext context;
-        cuda4dnn::csl::Stream d2h_stream;
         cuda4dnn::csl::Workspace workspace;
     };
 
     std::unique_ptr<CudaInfo_t> cudaInfo;
 
-    void initCUDABackend(const std::vector<LayerPin>& blobsToKeep_);
+    void initCUDABackend();
+
+    // New graph engine: per-Arg device-resident tensors owned directly by the net (no backend
+    // wrappers). Sized lazily via UMat::fit() and reused across forwards. Dirty flags track
+    // which copy (host cv::Mat vs device UMat) is authoritative so transfers happen only at
+    // CPU<->CUDA boundaries; intermediates stay device-resident across consecutive CUDA ops.
+    std::vector<UMat> cudaArgBuffers;
+    std::vector<uchar> cudaArgHostDirty;    // 1: host copy is authoritative -> needs H2D before device read
+    std::vector<uchar> cudaArgDeviceDirty;  // 1: device copy is authoritative -> needs D2H before host read
+    std::vector<UMat> cudaTempBuffers;
+    bool cudaPoolTemps = false;
+
+    // Device element type for a host tensor (half for float tensors under the FP16 target).
+    int cudaDeviceType(const Mat& hostMat) const;
+    // Returns the device buffer for @p arg, fit() to the host Mat's shape and device type.
+    UMat& getCudaArgBuffer(Arg arg, const Mat& hostMat);
+    UMat& cudaDeviceBuffer(Arg arg);
+    void cudaSetHostDirty(Arg arg);       // mark host authoritative (e.g. after a CPU op wrote it)
+    void cudaUploadArg(Arg arg, const Mat& hostMat);   // H2D if host dirty
+    void cudaDownloadArg(Arg arg, Mat& hostMat);       // D2H if device dirty
+#endif
+
+    #ifdef HAVE_ONNXRUNTIME
+    void finalizeOrt();
+    void refreshOrtMainGraphOutputs();
+    void applyStagedOrtInputs();
+    void collectOrtProfileData() const;
+    std::vector<std::pair<std::string, Mat>> ort_staged_inputs;
+    std::shared_ptr<Ort::Env> ort_env;
+    std::shared_ptr<Ort::Session> ort_session;
+    std::shared_ptr<OrtNamesCache> ort_names_cache;
+    bool useOrtEngine = false;   // true only when user explicitly selected ENGINE_ORT
+    bool ortNeedsReinit = false;  // session needs (re)creation on next finalizeNet
+    std::string ort_profile_path_prefix;          // prefix passed to EnableProfiling
+    mutable bool ort_profile_collected = false;   // EndProfiling was already called once
+    mutable int  ort_profile_runs = 0;            // number of session.Run calls since profiling started
+    mutable std::vector<std::tuple<String, String, double>> ort_profile_data;  // (name, type, ms_per_run)
 #endif
 
     void allocateLayer(int lid, const LayersShapesMap& layersShapes);
@@ -235,36 +369,51 @@ struct Net::Impl : public detail::NetImplBase
 
     void getLayersShapes(
             const ShapesVec& netInputShapes,
+            const TypesVec& netInputTypes,
             std::vector<int>& layersIds,
             std::vector<ShapesVec>& inLayersShapes,
             std::vector<ShapesVec>& outLayersShapes) /*const*/;
 
     void getLayersShapes(const ShapesVec& netInputShapes,
+            const TypesVec& netInputTypes,
             LayersShapesMap& inOutShapes);
 
     void getLayerShapes(const ShapesVec& netInputShapes,
+            const TypesVec& netInputTypes,
             const int layerId,
             LayerShapes& shapes);
 
     void updateLayersShapes();
 
-    int64 getFLOPS(const std::vector<MatShape>& netInputShapes) /*const*/;
+    int64 getFLOPS(const std::vector<MatShape>& netInputShapes,
+                   const std::vector<MatType>& netInputTypes) /*const*/;
     int64 getFLOPS(
             const int layerId,
-            const std::vector<MatShape>& netInputShapes) /*const*/;
+            const std::vector<MatShape>& netInputShapes,
+            const std::vector<MatType>& netInputTypes) /*const*/;
+    int64 getFLOPSGraph(const Ptr<Graph>& graph,
+                        const std::vector<MatShape>& shapeCache,
+                        const std::vector<MatType>& typeCache) const;
 
     void getMemoryConsumption(
             const int layerId,
             const std::vector<MatShape>& netInputShapes,
+            const std::vector<MatType>& netInputTypes,
             size_t& weights, size_t& blobs) /*const*/;
     void getMemoryConsumption(
             const std::vector<MatShape>& netInputShapes,
+            const std::vector<MatType>& netInputTypes,
             size_t& weights, size_t& blobs) /*const*/;
     void getMemoryConsumption(
             const std::vector<MatShape>& netInputShapes,
+            const std::vector<MatType>& netInputTypes,
             std::vector<int>& layerIds, std::vector<size_t>& weights,
             std::vector<size_t>& blobs) /*const*/;
     int64 getPerfProfile(std::vector<double>& timings) const;
+    void collectLayerInfo(std::vector<String>& names, std::vector<String>& types) const;
+    PerfProfile getPerfProfile() const;
+    void getPerfProfile(std::vector<std::string>& names, std::vector<std::string>& timems, std::vector<std::string>& counts) const;
+    void printPerfProfile() const;
 
     // TODO drop
     LayerPin getLatestLayerPin(const std::vector<LayerPin>& pins) const;
@@ -282,14 +431,175 @@ struct Net::Impl : public detail::NetImplBase
 
     void dumpNetworkToFile() const;
 
-    // FIXIT drop from inference API
-    Net quantize(Net& net, InputArrayOfArrays calibData, int inputsDtype, int outputsDtype, bool perChannel) /*const*/;
-    void getInputDetails(std::vector<float>& scales, std::vector<int>& zeropoints) /*const*/;
-    void getOutputDetails(std::vector<float>& scales, std::vector<int>& zeropoints) /*const*/;
+    ///////////////////////////// the new engine ////////////////////////////
+
+    // Create a new graph/subgraph, mode 2: we construct the graph manually.
+    // First, we create empty graph with certain input Args (they may or may not have names).
+    // once the graph is constructed, we set the graph outputs using Graph::setOutputs().
+    // When it's the first created graph, it automatically becomes the main model graph.
+    Ptr<Graph> newGraph(const std::string& name,
+                        const std::vector<Arg>& inputs,
+                        bool isMainGraph);
+
+    const ArgData& argData(Arg arg) const;
+    const std::string& argName(Arg arg) const;
+    ArgKind argKind(Arg arg) const;
+
+    // if the name is empty, always creates a new argument;
+    // if it's not empty, returns argument with the specific name if it already exists,
+    // otherwise creates new argument with the specified name
+    Arg getArg(const std::string& name);
+    bool haveArg(const std::string& name) const;
+
+    Arg newConstArg(const std::string& name, const Mat& m);
+    Arg newConstScalarArg(const std::string& name, int type, const void* value);
+    Arg newArg(const std::string& name, ArgKind kind, bool allowEmptyName=false);
+    bool isConstArg(Arg arg) const;
+    Mat& argTensor(Arg arg) const;
+    int argType(Arg arg) const;
+    void checkArg(Arg arg) const;
+    void checkArgs(const std::vector<Arg>& args) const;
+
+    int findDim(const std::string& name, bool insert=false);
+
+    void prepareForInference();
+    void finalize();
+    // Selects executors for a single graph (recursing into subgraphs).
+    void finalizeGraph(const Ptr<Graph>& graph, bool useCUDA);
+    // Save/restore the fused graph so finalize() is re-entrant across backend changes.
+    void saveFusedSnapshot();
+    void restoreFusedSnapshot();
+
+    // pre-allocates memory for output tensors.
+    // if useBufferPool==true, the method uses 'buffers'
+    // for outputs (according to bufidxs)
+    // instead of allocating fresh outputs
+    void allocateLayerOutputs(const Ptr<LayerInfo>& layer,
+                              const std::vector<int>& inpTypes,
+                              const std::vector<MatShape>& inpShapes,
+                              std::vector<int>& outTypes,
+                              std::vector<MatShape>& outShapes,
+                              std::vector<std::pair<uchar*, size_t> >& outOrigData,
+                              std::vector<Mat>& outputs, // [TODO] replace with something else to cover other backends
+                              std::vector<int>& tempTypes,
+                              std::vector<MatShape>& tempShapes,
+                              std::vector<Mat>& temps, // [TODO] ditto
+                              std::vector<Mat>& globalTemps,
+                              bool useBufferPool
+                              );
+
+    // set input of the model before running it
+    void setMainGraphInput(InputArray blob, const std::string& name);
+    // set input in some graph, the main one or a subgraph
+    void setGraphInput(Ptr<Graph>& graph, size_t idx, const Mat& m);
+    // run graph or subgraph.
+    void forwardGraph(Ptr<Graph>& graph, InputArrayOfArrays inputs, OutputArrayOfArrays outputs, bool isMainGraph);
+    // run the whole model
+    void forwardMainGraph(InputArrayOfArrays inputs, OutputArrayOfArrays outputs);
+#ifdef HAVE_ONNXRUNTIME
+    // Run inference through ONNX Runtime session (if configured).
+    // If outIdxs is empty, returns all ORT outputs in ORT-defined order.
+    std::vector<Mat> runOrtSession(std::vector<Mat> inputBlobs, const std::vector<int>& outIdxs);
+#endif
+    // run the whole model, convenience wrapper
+    void forwardWithSingleOutput(const std::string& outname, OutputArrayOfArrays outputBlobs);
+    // run the whole model, convenience wrapper
+    void forwardWithMultipleOutputs(OutputArrayOfArrays outputBlobs,
+                                    const std::vector<std::string>& outBlobNames);
+    // forward-to-layer: each name yields all outputs of the producing op
+    void forwardWithMultipleOutputsPerLayer(std::vector<std::vector<Mat> >& outputBlobs,
+                                            const std::vector<std::string>& outBlobNames);
+    // try infer shapes; if some layers produce tensors with dynamic shapes, shape inference is impossible
+    bool tryInferShapes(const std::vector<MatShape>& suggestedInpShapes,
+                        const std::vector<MatType>& suggestedInpTypes,
+                        LayerShapes& shapes,
+                        std::vector<MatShape>& shapeCache,
+                        std::vector<MatType>& typeCache) const;
+    bool tryInferGraphShapes(const Ptr<Graph>& graph,
+                             std::vector<MatShape>& shapeCache,
+                             std::vector<MatType>& typeCache) const;
+
+    // helper function for useCounts()
+    void updateUseCounts(const Ptr<Graph>& graph, std::vector<int>& usecounts) const;
+    // computes how many times each argument is used, i.e. on output usecounts.size() == args.size()
+    void useCounts(std::vector<int>& usecounts) const;
+
+    int updateGraphOfs(const Ptr<Graph>& graph, int currofs, bool ismain);
+
+    // deals with numeric and symblic shape values.
+    void checkAndUpdateDim(const Ptr<Graph>& graph, const Layer* layer, Arg inp, int j, int64_t value);
+
+    // dump information about certain input or output argument of an operation
+    void traceArg(std::ostream& strm_, const char* prefix, size_t i, Arg arg, bool dumpdata);
+    std::ostream& dumpArg(std::ostream& strm, Arg arg, int indent,
+                          bool comma, bool dump_details) const;
+    std::ostream& dumpDim(std::ostream& strm, int value) const;
+    std::ostream& dumpTypeShape(std::ostream& strm, int type, const MatShape& shape) const;
+    std::ostream& dump(std::ostream& strm);
+
+    ///////////////// various graph transformations ///////////////////////
+
+    // infers all types
+    void inferTypes();
+    // infers all shapes
+    void inferShapes(bool symbolic);
+    // sets certain buffer index for each intermediate argument (Arg)
+    void assignBuffers();
+    void pinInteriorArgs(const std::vector<Arg>& neededPins);
+    // collapse Reshape+InstanceNorm+Reshape+Mul+Add into InstanceNorm or GroupNormalization
+    void fuseInstanceNormAffine();
+    void fuseChains();
+    // fuseChains()'s chain pass limited to TransformLayout sinks; run
+    // after useBlockLayout(), which is what creates those nodes
+    void fuseTransformLayoutChains();
+    // fuse ViT-style multi-head attention subgraphs
+    void fuseAttention();
+    // rewrite MatMul(A, const_B [, const_bias]) into Gemm so projection-style
+    // matmuls reach the MLAS pre-packed sgemm path
+    void fuseMatMulConstBToGemm();
+    // fuse Gemm layers that share the same input into one wider Gemm
+    void fuseSharedInputGemm();
+    // collapse redundant Reshape/Transpose chains
+    void fuseReshapeTranspose();
+    // absorb a last-two-dims Transpose into the consuming MatMul
+    void fuseTransposeMatMul();
+    // fold a scalar Mul/Div before Softmax into Softmax::scale (CPU only)
+    void fuseScaleSoftmax();
+    // replace constant sub-expressions with their results
+
+    // widen FP16/BF16 constants to execution precision while the engine lacks half kernels
+    void widenHalfConstants();
+    void fuseQDQ();
+    void constFold();
+    // make some operations (activation, batch norm, convolution) unary if
+    // all their arguments except for the 1st one are constant.
+    void constArgs();
+    // insert transformLayout operations where necessary;
+    // use block layout for convolution, pooling and some other operations where it matters
+    void useBlockLayout();
+    // fuse BN into following Conv2 weights
+    void fuseBN();
 
 };  // Net::Impl
 
+inline Net::Impl* getNetImpl(const LayerInfo* op)
+{
+    return reinterpret_cast<Net::Impl*>(op->netimpl);
+}
+
+Net readNetFromONNX2(const String&);
+Net readNetFromONNX2(const char*, size_t);
+Net readNetFromONNX2(const std::vector<uchar>&);
+#ifdef HAVE_ONNXRUNTIME
+Net readNetFromONNX2_ORT(const String& onnxFile);
+#endif
 
 CV__DNN_INLINE_NS_END
+
+// residual (optional): added to the result in the same pass; see transform_layout_layer.cpp
+void transformLayout(const Mat& inp, Mat& out,
+                     DataLayout outlayout, DataLayout defaultLayout, int C0,
+                     const Mat& residual = Mat());
+
 }}  // namespace cv::dnn
 #endif  // __OPENCV_DNN_SRC_NET_IMPL_HPP__

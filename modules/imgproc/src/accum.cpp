@@ -47,45 +47,100 @@
 #define CV_CPU_OPTIMIZATION_DECLARATIONS_ONLY
 #include "accum.simd.hpp"
 #include "accum.simd_declarations.hpp"
-#include "opencv2/core/openvx/ovx_defs.hpp"
 
 namespace cv
 {
 
-typedef void(*AccFunc)(const uchar*, uchar*, const uchar*, int, int);
-typedef void(*AccProdFunc)(const uchar*, const uchar*, uchar*, const uchar*, int, int);
-typedef void(*AccWFunc)(const uchar*, uchar*, const uchar*, int, int, double);
-
-static AccFunc accTab[] =
+#ifdef HAVE_IPP
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, Ipp32f*, int, IppiSize)>
+static IppStatus CV_STDCALL ippiAddWrap(const void* pSrc, int srcStep, Ipp32f* pSrcDst, int srcdstStep, IppiSize roiSize)
 {
-    (AccFunc)acc_8u32f, (AccFunc)acc_8u64f,
-    (AccFunc)acc_16u32f, (AccFunc)acc_16u64f,
-    (AccFunc)acc_32f, (AccFunc)acc_32f64f,
-    (AccFunc)acc_64f
+    return fn((const T*)pSrc, srcStep, pSrcDst, srcdstStep, roiSize);
+}
+
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, const Ipp8u*, int, Ipp32f*, int, IppiSize)>
+static IppStatus CV_STDCALL ippiAddMaskWrap(const void* pSrc, int srcStep, const Ipp8u* pMask, int maskStep, Ipp32f* pSrcDst, int srcDstStep, IppiSize roiSize)
+{
+    return fn((const T*)pSrc, srcStep, pMask, maskStep, pSrcDst, srcDstStep, roiSize);
+}
+
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, const T*, int, Ipp32f*, int, IppiSize)>
+static IppStatus CV_STDCALL ippiAddProductWrap(const void* pSrc1, int src1Step, const void* pSrc2, int src2Step, Ipp32f* pSrcDst, int srcdstStep, IppiSize roiSize)
+{
+    return fn((const T*)pSrc1, src1Step, (const T*)pSrc2, src2Step, pSrcDst, srcdstStep, roiSize);
+}
+
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, const T*, int, const Ipp8u*, int, Ipp32f*, int, IppiSize)>
+static IppStatus CV_STDCALL ippiAddProductMaskWrap(const void* pSrc1, int src1Step, const void* pSrc2, int src2Step, const Ipp8u* pMask, int maskStep, Ipp32f* pSrcDst, int srcDstStep, IppiSize roiSize)
+{
+    return fn((const T*)pSrc1, src1Step, (const T*)pSrc2, src2Step, pMask, maskStep, pSrcDst, srcDstStep, roiSize);
+}
+
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, Ipp32f*, int, IppiSize, Ipp32f)>
+static IppStatus CV_STDCALL ippiAddWeightedWrap(const void* pSrc, int srcStep, Ipp32f* pSrcDst, int srcdstStep, IppiSize roiSize, Ipp32f alpha)
+{
+    return fn((const T*)pSrc, srcStep, pSrcDst, srcdstStep, roiSize, alpha);
+}
+
+template<typename T, IppStatus (CV_STDCALL *fn)(const T*, int, const Ipp8u*, int, Ipp32f*, int, IppiSize, Ipp32f)>
+static IppStatus CV_STDCALL ippiAddWeightedMaskWrap(const void* pSrc, int srcStep, const Ipp8u* pMask, int maskStep, Ipp32f* pSrcDst, int srcDstStep, IppiSize roiSize, Ipp32f alpha)
+{
+    return fn((const T*)pSrc, srcStep, pMask, maskStep, pSrcDst, srcDstStep, roiSize, alpha);
+}
+#endif
+
+typedef void(*AccFunc)(const void*, void*, const uchar*, int, int);
+typedef void(*AccProdFunc)(const void*, const void*, void*, const uchar*, int, int);
+typedef void(*AccWFunc)(const void*, void*, const uchar*, int, int, double);
+
+template<typename ST, typename DT, void (*fn)(const ST*, DT*, const uchar*, int, int)>
+static void accWrap(const void* src, void* dst, const uchar* mask, int len, int cn)
+{
+    fn((const ST*)src, (DT*)dst, mask, len, cn);
+}
+
+template<typename ST, typename DT, void (*fn)(const ST*, const ST*, DT*, const uchar*, int, int)>
+static void accProdWrap(const void* src1, const void* src2, void* dst, const uchar* mask, int len, int cn)
+{
+    fn((const ST*)src1, (const ST*)src2, (DT*)dst, mask, len, cn);
+}
+
+template<typename ST, typename DT, void (*fn)(const ST*, DT*, const uchar*, int, int, double)>
+static void accWWrap(const void* src, void* dst, const uchar* mask, int len, int cn, double alpha)
+{
+    fn((const ST*)src, (DT*)dst, mask, len, cn, alpha);
+}
+
+static AccFunc accTab[CV_DEPTH_MAX] =
+{
+    accWrap<uchar, float, acc_8u32f>, accWrap<uchar, double, acc_8u64f>,
+    accWrap<ushort, float, acc_16u32f>, accWrap<ushort, double, acc_16u64f>,
+    accWrap<float, float, acc_32f>, accWrap<float, double, acc_32f64f>,
+    accWrap<double, double, acc_64f>
 };
 
-static AccFunc accSqrTab[] =
+static AccFunc accSqrTab[CV_DEPTH_MAX] =
 {
-    (AccFunc)accSqr_8u32f, (AccFunc)accSqr_8u64f,
-    (AccFunc)accSqr_16u32f, (AccFunc)accSqr_16u64f,
-    (AccFunc)accSqr_32f, (AccFunc)accSqr_32f64f,
-    (AccFunc)accSqr_64f
+    accWrap<uchar, float, accSqr_8u32f>, accWrap<uchar, double, accSqr_8u64f>,
+    accWrap<ushort, float, accSqr_16u32f>, accWrap<ushort, double, accSqr_16u64f>,
+    accWrap<float, float, accSqr_32f>, accWrap<float, double, accSqr_32f64f>,
+    accWrap<double, double, accSqr_64f>
 };
 
-static AccProdFunc accProdTab[] =
+static AccProdFunc accProdTab[CV_DEPTH_MAX] =
 {
-    (AccProdFunc)accProd_8u32f, (AccProdFunc)accProd_8u64f,
-    (AccProdFunc)accProd_16u32f, (AccProdFunc)accProd_16u64f,
-    (AccProdFunc)accProd_32f, (AccProdFunc)accProd_32f64f,
-    (AccProdFunc)accProd_64f
+    accProdWrap<uchar, float, accProd_8u32f>, accProdWrap<uchar, double, accProd_8u64f>,
+    accProdWrap<ushort, float, accProd_16u32f>, accProdWrap<ushort, double, accProd_16u64f>,
+    accProdWrap<float, float, accProd_32f>, accProdWrap<float, double, accProd_32f64f>,
+    accProdWrap<double, double, accProd_64f>
 };
 
-static AccWFunc accWTab[] =
+static AccWFunc accWTab[CV_DEPTH_MAX] =
 {
-    (AccWFunc)accW_8u32f, (AccWFunc)accW_8u64f,
-    (AccWFunc)accW_16u32f, (AccWFunc)accW_16u64f,
-    (AccWFunc)accW_32f, (AccWFunc)accW_32f64f,
-    (AccWFunc)accW_64f
+    accWWrap<uchar, float, accW_8u32f>, accWWrap<uchar, double, accW_8u64f>,
+    accWWrap<ushort, float, accW_16u32f>, accWWrap<ushort, double, accW_16u64f>,
+    accWWrap<float, float, accW_32f>, accWWrap<float, double, accW_32f64f>,
+    accWWrap<double, double, accW_64f>
 };
 
 inline int getAccTabIdx(int sdepth, int ddepth)
@@ -188,16 +243,16 @@ static bool ipp_accumulate(InputArray _src, InputOutputArray _dst, InputArray _m
         if (mask.empty())
         {
             CV_SUPPRESS_DEPRECATED_START
-            ippiAdd_I = sdepth == CV_8U && ddepth == CV_32F ? (IppiAdd)ippiAdd_8u32f_C1IR :
-                sdepth == CV_16U && ddepth == CV_32F ? (IppiAdd)ippiAdd_16u32f_C1IR :
-                sdepth == CV_32F && ddepth == CV_32F ? (IppiAdd)ippiAdd_32f_C1IR : 0;
+            ippiAdd_I = sdepth == CV_8U && ddepth == CV_32F ? ippiAddWrap<Ipp8u, ippiAdd_8u32f_C1IR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddWrap<Ipp16u, ippiAdd_16u32f_C1IR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddWrap<Ipp32f, ippiAdd_32f_C1IR> : 0;
             CV_SUPPRESS_DEPRECATED_END
         }
         else if (scn == 1)
         {
-            ippiAdd_IM = sdepth == CV_8U && ddepth == CV_32F ? (IppiAddMask)ippiAdd_8u32f_C1IMR :
-                sdepth == CV_16U && ddepth == CV_32F ? (IppiAddMask)ippiAdd_16u32f_C1IMR :
-                sdepth == CV_32F && ddepth == CV_32F ? (IppiAddMask)ippiAdd_32f_C1IMR : 0;
+            ippiAdd_IM = sdepth == CV_8U && ddepth == CV_32F ? ippiAddMaskWrap<Ipp8u, ippiAdd_8u32f_C1IMR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddMaskWrap<Ipp16u, ippiAdd_16u32f_C1IMR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddMaskWrap<Ipp32f, ippiAdd_32f_C1IMR> : 0;
         }
 
         if (ippiAdd_I || ippiAdd_IM)
@@ -231,80 +286,6 @@ static bool ipp_accumulate(InputArray _src, InputOutputArray _dst, InputArray _m
 }
 #endif
 
-#ifdef HAVE_OPENVX
-namespace cv
-{
-enum
-{
-    VX_ACCUMULATE_OP = 0,
-    VX_ACCUMULATE_SQUARE_OP = 1,
-    VX_ACCUMULATE_WEIGHTED_OP = 2
-};
-
-namespace ovx {
-    template <> inline bool skipSmallImages<VX_KERNEL_ACCUMULATE>(int w, int h) { return w*h < 120 * 60; }
-}
-static bool openvx_accumulate(InputArray _src, InputOutputArray _dst, InputArray _mask, double _weight, int opType)
-{
-    Mat srcMat = _src.getMat(), dstMat = _dst.getMat();
-    if (ovx::skipSmallImages<VX_KERNEL_ACCUMULATE>(srcMat.cols, srcMat.rows))
-        return false;
-    if(!_mask.empty() ||
-       (opType == VX_ACCUMULATE_WEIGHTED_OP && dstMat.type() != CV_8UC1  ) ||
-       (opType != VX_ACCUMULATE_WEIGHTED_OP && dstMat.type() != CV_16SC1 ) ||
-       srcMat.type() != CV_8UC1)
-    {
-        return false;
-    }
-    //TODO: handle different number of channels (channel extract && channel combine)
-    //TODO: handle mask (threshold mask to 0xff && bitwise AND with src)
-    //(both things can be done by creating a graph)
-
-    try
-    {
-        ivx::Context context = ovx::getOpenVXContext();
-        ivx::Image srcImage = ivx::Image::createFromHandle(context, ivx::Image::matTypeToFormat(srcMat.type()),
-                                                           ivx::Image::createAddressing(srcMat), srcMat.data);
-        ivx::Image dstImage = ivx::Image::createFromHandle(context, ivx::Image::matTypeToFormat(dstMat.type()),
-                                                           ivx::Image::createAddressing(dstMat), dstMat.data);
-        ivx::Scalar shift = ivx::Scalar::create<VX_TYPE_UINT32>(context, 0);
-        ivx::Scalar alpha = ivx::Scalar::create<VX_TYPE_FLOAT32>(context, _weight);
-
-        switch (opType)
-        {
-        case VX_ACCUMULATE_OP:
-            ivx::IVX_CHECK_STATUS(vxuAccumulateImage(context, srcImage, dstImage));
-            break;
-        case VX_ACCUMULATE_SQUARE_OP:
-            ivx::IVX_CHECK_STATUS(vxuAccumulateSquareImage(context, srcImage, shift, dstImage));
-            break;
-        case VX_ACCUMULATE_WEIGHTED_OP:
-            ivx::IVX_CHECK_STATUS(vxuAccumulateWeightedImage(context, srcImage, alpha, dstImage));
-            break;
-        default:
-            break;
-        }
-
-#ifdef VX_VERSION_1_1
-        //we should take user memory back before release
-        //(it's not done automatically according to standard)
-        srcImage.swapHandle(); dstImage.swapHandle();
-#endif
-    }
-    catch (const ivx::RuntimeError & e)
-    {
-        VX_DbgThrow(e.what());
-    }
-    catch (const ivx::WrapperError & e)
-    {
-        VX_DbgThrow(e.what());
-    }
-
-    return true;
-}
-}
-#endif
-
 void cv::accumulate( InputArray _src, InputOutputArray _dst, InputArray _mask )
 {
     CV_INSTRUMENT_REGION();
@@ -313,16 +294,13 @@ void cv::accumulate( InputArray _src, InputOutputArray _dst, InputArray _mask )
     int dtype = _dst.type(), ddepth = CV_MAT_DEPTH(dtype), dcn = CV_MAT_CN(dtype);
 
     CV_Assert( _src.sameSize(_dst) && dcn == scn );
-    CV_Assert( _mask.empty() || (_src.sameSize(_mask) && _mask.type() == CV_8U) );
+    CV_Assert( _mask.empty() || (_src.sameSize(_mask) && (_mask.type() == CV_8U || _mask.type() == CV_Bool)) );
 
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_accumulate(_src, noArray(), _dst, 0.0, _mask, ACCUMULATE))
 
     CV_IPP_RUN((_src.dims() <= 2 || (_src.isContinuous() && _dst.isContinuous() && (_mask.empty() || _mask.isContinuous()))),
         ipp_accumulate(_src, _dst, _mask));
-
-    CV_OVX_RUN(_src.dims() <= 2,
-               openvx_accumulate(_src, _dst, _mask, 0.0, VX_ACCUMULATE_OP))
 
     Mat src = _src.getMat(), dst = _dst.getMat(), mask = _mask.getMat();
 
@@ -362,15 +340,15 @@ static bool ipp_accumulate_square(InputArray _src, InputOutputArray _dst, InputA
 
         if (mask.empty())
         {
-            ippiAddSquare_I = sdepth == CV_8U && ddepth == CV_32F ? (ippiAddSquare)ippiAddSquare_8u32f_C1IR :
-                sdepth == CV_16U && ddepth == CV_32F ? (ippiAddSquare)ippiAddSquare_16u32f_C1IR :
-                sdepth == CV_32F && ddepth == CV_32F ? (ippiAddSquare)ippiAddSquare_32f_C1IR : 0;
+            ippiAddSquare_I = sdepth == CV_8U && ddepth == CV_32F ? ippiAddWrap<Ipp8u, ippiAddSquare_8u32f_C1IR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddWrap<Ipp16u, ippiAddSquare_16u32f_C1IR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddWrap<Ipp32f, ippiAddSquare_32f_C1IR> : 0;
         }
         else if (scn == 1)
         {
-            ippiAddSquare_IM = sdepth == CV_8U && ddepth == CV_32F ? (ippiAddSquareMask)ippiAddSquare_8u32f_C1IMR :
-                sdepth == CV_16U && ddepth == CV_32F ? (ippiAddSquareMask)ippiAddSquare_16u32f_C1IMR :
-                sdepth == CV_32F && ddepth == CV_32F ? (ippiAddSquareMask)ippiAddSquare_32f_C1IMR : 0;
+            ippiAddSquare_IM = sdepth == CV_8U && ddepth == CV_32F ? ippiAddMaskWrap<Ipp8u, ippiAddSquare_8u32f_C1IMR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddMaskWrap<Ipp16u, ippiAddSquare_16u32f_C1IMR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddMaskWrap<Ipp32f, ippiAddSquare_32f_C1IMR> : 0;
         }
 
         if (ippiAddSquare_I || ippiAddSquare_IM)
@@ -412,16 +390,13 @@ void cv::accumulateSquare( InputArray _src, InputOutputArray _dst, InputArray _m
     int dtype = _dst.type(), ddepth = CV_MAT_DEPTH(dtype), dcn = CV_MAT_CN(dtype);
 
     CV_Assert( _src.sameSize(_dst) && dcn == scn );
-    CV_Assert( _mask.empty() || (_src.sameSize(_mask) && _mask.type() == CV_8U) );
+    CV_Assert( _mask.empty() || (_src.sameSize(_mask) && (_mask.type() == CV_8U || _mask.type() == CV_Bool)) );
 
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_accumulate(_src, noArray(), _dst, 0.0, _mask, ACCUMULATE_SQUARE))
 
     CV_IPP_RUN((_src.dims() <= 2 || (_src.isContinuous() && _dst.isContinuous() && (_mask.empty() || _mask.isContinuous()))),
         ipp_accumulate_square(_src, _dst, _mask));
-
-    CV_OVX_RUN(_src.dims() <= 2,
-               openvx_accumulate(_src, _dst, _mask, 0.0, VX_ACCUMULATE_SQUARE_OP))
 
     Mat src = _src.getMat(), dst = _dst.getMat(), mask = _mask.getMat();
 
@@ -462,15 +437,15 @@ static bool ipp_accumulate_product(InputArray _src1, InputArray _src2,
 
         if (mask.empty())
         {
-            ippiAddProduct_I = sdepth == CV_8U && ddepth == CV_32F ? (ippiAddProduct)ippiAddProduct_8u32f_C1IR :
-                sdepth == CV_16U && ddepth == CV_32F ? (ippiAddProduct)ippiAddProduct_16u32f_C1IR :
-                sdepth == CV_32F && ddepth == CV_32F ? (ippiAddProduct)ippiAddProduct_32f_C1IR : 0;
+            ippiAddProduct_I = sdepth == CV_8U && ddepth == CV_32F ? ippiAddProductWrap<Ipp8u, ippiAddProduct_8u32f_C1IR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddProductWrap<Ipp16u, ippiAddProduct_16u32f_C1IR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddProductWrap<Ipp32f, ippiAddProduct_32f_C1IR> : 0;
         }
         else if (scn == 1)
         {
-            ippiAddProduct_IM = sdepth == CV_8U && ddepth == CV_32F ? (ippiAddProductMask)ippiAddProduct_8u32f_C1IMR :
-                sdepth == CV_16U && ddepth == CV_32F ? (ippiAddProductMask)ippiAddProduct_16u32f_C1IMR :
-                sdepth == CV_32F && ddepth == CV_32F ? (ippiAddProductMask)ippiAddProduct_32f_C1IMR : 0;
+            ippiAddProduct_IM = sdepth == CV_8U && ddepth == CV_32F ? ippiAddProductMaskWrap<Ipp8u, ippiAddProduct_8u32f_C1IMR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddProductMaskWrap<Ipp16u, ippiAddProduct_16u32f_C1IMR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddProductMaskWrap<Ipp32f, ippiAddProduct_32f_C1IMR> : 0;
         }
 
         if (ippiAddProduct_I || ippiAddProduct_IM)
@@ -518,7 +493,7 @@ void cv::accumulateProduct( InputArray _src1, InputArray _src2,
 
     CV_Assert( _src1.sameSize(_src2) && stype == _src2.type() );
     CV_Assert( _src1.sameSize(_dst) && dcn == scn );
-    CV_Assert( _mask.empty() || (_src1.sameSize(_mask) && _mask.type() == CV_8U) );
+    CV_Assert( _mask.empty() || (_src1.sameSize(_mask) && (_mask.type() == CV_8U || _mask.type() == CV_Bool)) );
 
     CV_OCL_RUN(_src1.dims() <= 2 && _dst.isUMat(),
                ocl_accumulate(_src1, _src2, _dst, 0.0, _mask, ACCUMULATE_PRODUCT))
@@ -566,15 +541,15 @@ static bool ipp_accumulate_weighted( InputArray _src, InputOutputArray _dst,
 
         if (mask.empty())
         {
-            ippiAddWeighted_I = sdepth == CV_8U && ddepth == CV_32F ? (ippiAddWeighted)ippiAddWeighted_8u32f_C1IR :
-                sdepth == CV_16U && ddepth == CV_32F ? (ippiAddWeighted)ippiAddWeighted_16u32f_C1IR :
-                sdepth == CV_32F && ddepth == CV_32F ? (ippiAddWeighted)ippiAddWeighted_32f_C1IR : 0;
+            ippiAddWeighted_I = sdepth == CV_8U && ddepth == CV_32F ? ippiAddWeightedWrap<Ipp8u, ippiAddWeighted_8u32f_C1IR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddWeightedWrap<Ipp16u, ippiAddWeighted_16u32f_C1IR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddWeightedWrap<Ipp32f, ippiAddWeighted_32f_C1IR> : 0;
         }
         else if (scn == 1)
         {
-            ippiAddWeighted_IM = sdepth == CV_8U && ddepth == CV_32F ? (ippiAddWeightedMask)ippiAddWeighted_8u32f_C1IMR :
-                sdepth == CV_16U && ddepth == CV_32F ? (ippiAddWeightedMask)ippiAddWeighted_16u32f_C1IMR :
-                sdepth == CV_32F && ddepth == CV_32F ? (ippiAddWeightedMask)ippiAddWeighted_32f_C1IMR : 0;
+            ippiAddWeighted_IM = sdepth == CV_8U && ddepth == CV_32F ? ippiAddWeightedMaskWrap<Ipp8u, ippiAddWeighted_8u32f_C1IMR> :
+                sdepth == CV_16U && ddepth == CV_32F ? ippiAddWeightedMaskWrap<Ipp16u, ippiAddWeighted_16u32f_C1IMR> :
+                sdepth == CV_32F && ddepth == CV_32F ? ippiAddWeightedMaskWrap<Ipp32f, ippiAddWeighted_32f_C1IMR> : 0;
         }
 
         if (ippiAddWeighted_I || ippiAddWeighted_IM)
@@ -617,15 +592,12 @@ void cv::accumulateWeighted( InputArray _src, InputOutputArray _dst,
     int dtype = _dst.type(), ddepth = CV_MAT_DEPTH(dtype), dcn = CV_MAT_CN(dtype);
 
     CV_Assert( _src.sameSize(_dst) && dcn == scn );
-    CV_Assert( _mask.empty() || (_src.sameSize(_mask) && _mask.type() == CV_8U) );
+    CV_Assert( _mask.empty() || (_src.sameSize(_mask) && (_mask.type() == CV_8U || _mask.type() == CV_Bool)) );
 
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_accumulate(_src, noArray(), _dst, alpha, _mask, ACCUMULATE_WEIGHTED))
 
     CV_IPP_RUN((_src.dims() <= 2 || (_src.isContinuous() && _dst.isContinuous() && _mask.isContinuous())), ipp_accumulate_weighted(_src, _dst, alpha, _mask));
-
-    CV_OVX_RUN(_src.dims() <= 2,
-               openvx_accumulate(_src, _dst, _mask, alpha, VX_ACCUMULATE_WEIGHTED_OP))
 
     Mat src = _src.getMat(), dst = _dst.getMat(), mask = _mask.getMat();
 
@@ -644,42 +616,5 @@ void cv::accumulateWeighted( InputArray _src, InputOutputArray _dst,
 }
 
 
-CV_IMPL void
-cvAcc( const void* arr, void* sumarr, const void* maskarr )
-{
-    cv::Mat src = cv::cvarrToMat(arr), dst = cv::cvarrToMat(sumarr), mask;
-    if( maskarr )
-        mask = cv::cvarrToMat(maskarr);
-    cv::accumulate( src, dst, mask );
-}
-
-CV_IMPL void
-cvSquareAcc( const void* arr, void* sumarr, const void* maskarr )
-{
-    cv::Mat src = cv::cvarrToMat(arr), dst = cv::cvarrToMat(sumarr), mask;
-    if( maskarr )
-        mask = cv::cvarrToMat(maskarr);
-    cv::accumulateSquare( src, dst, mask );
-}
-
-CV_IMPL void
-cvMultiplyAcc( const void* arr1, const void* arr2,
-               void* sumarr, const void* maskarr )
-{
-    cv::Mat src1 = cv::cvarrToMat(arr1), src2 = cv::cvarrToMat(arr2);
-    cv::Mat dst = cv::cvarrToMat(sumarr), mask;
-    if( maskarr )
-        mask = cv::cvarrToMat(maskarr);
-    cv::accumulateProduct( src1, src2, dst, mask );
-}
-
-CV_IMPL void
-cvRunningAvg( const void* arr, void* sumarr, double alpha, const void* maskarr )
-{
-    cv::Mat src = cv::cvarrToMat(arr), dst = cv::cvarrToMat(sumarr), mask;
-    if( maskarr )
-        mask = cv::cvarrToMat(maskarr);
-    cv::accumulateWeighted( src, dst, alpha, mask );
-}
 
 /* End of file. */

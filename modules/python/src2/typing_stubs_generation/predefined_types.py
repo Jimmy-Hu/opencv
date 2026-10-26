@@ -199,7 +199,7 @@ _PREDEFINED_TYPES = (
                         PrimitiveTypeNode.float_("map_int_and_double::value"),
                         required_modules=("flann",)),
 
-    # G-API, optional
+    # G-API from opencv_contrib
     AliasTypeNode.union_("GProtoArg",
                          items=(AliasRefTypeNode("Scalar"),
                                 ASTNodeTypeNode("GMat"),

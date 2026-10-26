@@ -946,7 +946,7 @@ MatExpr operator < (const Mat& a, const Mat& b)
 {
     checkOperandsExist(a, b);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_LT, a, b);
+    MatOp_Cmp::makeExpr(e, cv::CMP_LT, a, b);
     return e;
 }
 
@@ -954,7 +954,7 @@ MatExpr operator < (const Mat& a, double s)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_LT, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_LT, a, s);
     return e;
 }
 
@@ -962,7 +962,7 @@ MatExpr operator < (double s, const Mat& a)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_GT, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_GT, a, s);
     return e;
 }
 
@@ -970,7 +970,7 @@ MatExpr operator <= (const Mat& a, const Mat& b)
 {
     checkOperandsExist(a, b);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_LE, a, b);
+    MatOp_Cmp::makeExpr(e, cv::CMP_LE, a, b);
     return e;
 }
 
@@ -978,7 +978,7 @@ MatExpr operator <= (const Mat& a, double s)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_LE, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_LE, a, s);
     return e;
 }
 
@@ -986,7 +986,7 @@ MatExpr operator <= (double s, const Mat& a)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_GE, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_GE, a, s);
     return e;
 }
 
@@ -994,7 +994,7 @@ MatExpr operator == (const Mat& a, const Mat& b)
 {
     checkOperandsExist(a, b);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_EQ, a, b);
+    MatOp_Cmp::makeExpr(e, cv::CMP_EQ, a, b);
     return e;
 }
 
@@ -1002,7 +1002,7 @@ MatExpr operator == (const Mat& a, double s)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_EQ, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_EQ, a, s);
     return e;
 }
 
@@ -1010,7 +1010,7 @@ MatExpr operator == (double s, const Mat& a)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_EQ, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_EQ, a, s);
     return e;
 }
 
@@ -1018,7 +1018,7 @@ MatExpr operator != (const Mat& a, const Mat& b)
 {
     checkOperandsExist(a, b);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_NE, a, b);
+    MatOp_Cmp::makeExpr(e, cv::CMP_NE, a, b);
     return e;
 }
 
@@ -1026,7 +1026,7 @@ MatExpr operator != (const Mat& a, double s)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_NE, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_NE, a, s);
     return e;
 }
 
@@ -1034,7 +1034,7 @@ MatExpr operator != (double s, const Mat& a)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_NE, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_NE, a, s);
     return e;
 }
 
@@ -1042,7 +1042,7 @@ MatExpr operator >= (const Mat& a, const Mat& b)
 {
     checkOperandsExist(a, b);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_GE, a, b);
+    MatOp_Cmp::makeExpr(e, cv::CMP_GE, a, b);
     return e;
 }
 
@@ -1050,7 +1050,7 @@ MatExpr operator >= (const Mat& a, double s)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_GE, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_GE, a, s);
     return e;
 }
 
@@ -1058,7 +1058,7 @@ MatExpr operator >= (double s, const Mat& a)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_LE, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_LE, a, s);
     return e;
 }
 
@@ -1066,7 +1066,7 @@ MatExpr operator > (const Mat& a, const Mat& b)
 {
     checkOperandsExist(a, b);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_GT, a, b);
+    MatOp_Cmp::makeExpr(e, cv::CMP_GT, a, b);
     return e;
 }
 
@@ -1074,7 +1074,7 @@ MatExpr operator > (const Mat& a, double s)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_GT, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_GT, a, s);
     return e;
 }
 
@@ -1082,7 +1082,7 @@ MatExpr operator > (double s, const Mat& a)
 {
     checkOperandsExist(a);
     MatExpr e;
-    MatOp_Cmp::makeExpr(e, CV_CMP_LT, a, s);
+    MatOp_Cmp::makeExpr(e, cv::CMP_LT, a, s);
     return e;
 }
 
@@ -1679,10 +1679,7 @@ void MatOp_Initializer::assign(const MatExpr& e, Mat& m, int _type) const
     if( _type == -1 )
         _type = e.a.type();
 
-    if( e.a.dims <= 2 )
-        m.create(e.a.size(), _type);
-    else
-        m.create(e.a.dims, e.a.size, _type);
+    m.create(e.a.size, _type);
 
     if( e.flags == 'I' && e.a.dims <= 2 )
         setIdentity(m, Scalar(e.alpha));
@@ -1738,8 +1735,16 @@ MatExpr Mat::mul(InputArray m, double scale) const
 {
     CV_INSTRUMENT_REGION();
 
+    Mat b = m.getMat();
+    // Unless the argument is a refcounted Mat/UMat, the header returned by getMat() may be
+    // a non-owning view of caller memory (e.g. a scalar bound to _InputArray(const double&),
+    // a Matx or a Vec) that the returned MatExpr can outlive, so snapshot it.
+    // See https://github.com/opencv/opencv/issues/23577
+    if( !m.isMat() && !m.isUMat() )
+        b = b.clone();
+
     MatExpr e;
-    MatOp_Bin::makeExpr(e, '*', *this, m.getMat(), scale);
+    MatOp_Bin::makeExpr(e, '*', *this, b, scale);
     return e;
 }
 
@@ -1770,6 +1775,15 @@ MatExpr Mat::zeros(int ndims, const int* sizes, int type)
     return e;
 }
 
+MatExpr Mat::zeros(const MatShape& shape, int type)
+{
+    CV_INSTRUMENT_REGION();
+
+    MatExpr e;
+    MatOp_Initializer::makeExpr(e, '0', shape.dims, shape.p, type);
+    return e;
+}
+
 MatExpr Mat::ones(int rows, int cols, int type)
 {
     CV_INSTRUMENT_REGION();
@@ -1794,6 +1808,15 @@ MatExpr Mat::ones(int ndims, const int* sizes, int type)
 
     MatExpr e;
     MatOp_Initializer::makeExpr(e, '1', ndims, sizes, type);
+    return e;
+}
+
+MatExpr Mat::ones(const MatShape& shape, int type)
+{
+    CV_INSTRUMENT_REGION();
+
+    MatExpr e;
+    MatOp_Initializer::makeExpr(e, '1', shape.dims, shape.p, type);
     return e;
 }
 

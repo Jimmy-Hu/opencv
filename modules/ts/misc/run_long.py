@@ -2,13 +2,12 @@
 """ Utility package for run.py
 """
 
-from __future__ import print_function
 import xml.etree.ElementTree as ET
 from glob import glob
 from pprint import PrettyPrinter as PP
 
 LONG_TESTS_DEBUG_VALGRIND = [
-    ('calib3d', 'Calib3d_InitUndistortRectifyMap.accuracy', 2017.22),
+    ('3d', 'Calib3d_InitUndistortRectifyMap.accuracy', 2017.22),
     ('dnn', 'Reproducibility*', 1000),  # large DNN models
     ('dnn', '*RCNN*', 1000),  # very large DNN models
     ('dnn', '*RFCN*', 1000),  # very large DNN models

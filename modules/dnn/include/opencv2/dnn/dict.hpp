@@ -60,13 +60,13 @@ CV__DNN_INLINE_NS_BEGIN
 struct CV_EXPORTS_W DictValue
 {
     DictValue(const DictValue &r);
-    explicit DictValue(bool i)           : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i ? 1 : 0; }       //!< Constructs integer scalar
-    explicit DictValue(int64 i = 0)      : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i; }       //!< Constructs integer scalar
-    CV_WRAP explicit DictValue(int i)    : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = i; }       //!< Constructs integer scalar
-    explicit DictValue(unsigned p)       : type(Param::INT), pi(new AutoBuffer<int64,1>) { (*pi)[0] = p; }       //!< Constructs integer scalar
-    CV_WRAP explicit DictValue(double p)         : type(Param::REAL), pd(new AutoBuffer<double,1>) { (*pd)[0] = p; }     //!< Constructs floating point scalar
-    CV_WRAP explicit DictValue(const String &s)  : type(Param::STRING), ps(new AutoBuffer<String,1>) { (*ps)[0] = s; }   //!< Constructs string scalar
-    explicit DictValue(const char *s)            : type(Param::STRING), ps(new AutoBuffer<String,1>) { (*ps)[0] = s; }   //!< @overload
+    explicit DictValue(bool i)           : type(Param::INT), pi(new AutoBuffer<int64,1>(1)) { (*pi)[0] = i ? 1 : 0; }       //!< Constructs integer scalar
+    explicit DictValue(int64 i = 0)      : type(Param::INT), pi(new AutoBuffer<int64,1>(1)) { (*pi)[0] = i; }       //!< Constructs integer scalar
+    CV_WRAP explicit DictValue(int i)    : type(Param::INT), pi(new AutoBuffer<int64,1>(1)) { (*pi)[0] = i; }       //!< Constructs integer scalar
+    explicit DictValue(unsigned p)       : type(Param::INT), pi(new AutoBuffer<int64,1>(1)) { (*pi)[0] = p; }       //!< Constructs integer scalar
+    CV_WRAP explicit DictValue(double p)         : type(Param::REAL), pd(new AutoBuffer<double,1>(1)) { (*pd)[0] = p; }     //!< Constructs floating point scalar
+    CV_WRAP explicit DictValue(const String &s)  : type(Param::STRING), ps(new AutoBuffer<String,1>(1)) { (*ps)[0] = s; }   //!< Constructs string scalar
+    explicit DictValue(const char *s)            : type(Param::STRING), ps(new AutoBuffer<String,1>(1)) { (*ps)[0] = s; }   //!< @overload
 
     template<typename TypeIter>
     static DictValue arrayInt(TypeIter begin, int size);    //!< Constructs integer array
@@ -137,6 +137,10 @@ public:
     //! If the @p key in the dictionary then returns its value, else returns @p defaultValue.
     template <typename T>
     T get(const String &key, const T &defaultValue) const;
+
+    //! If the @p key in the dictionary then returns its value, else returns empty vector.
+    template <typename T>
+    std::vector<T> getVector(const String &key) const;
 
     //! Sets new @p value for the @p key, or adds new key-value pair into the dictionary.
     template<typename T>

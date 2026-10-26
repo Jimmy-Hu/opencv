@@ -16,6 +16,8 @@
 #include "opencv2/stitching/detail/seam_finders.hpp"
 #include "opencv2/stitching/detail/warpers.hpp"
 #include "opencv2/stitching/warpers.hpp"
+#include "opencv2/features.hpp"
+#include "opencv2/core/ocl.hpp"
 
 #ifdef HAVE_OPENCV_XFEATURES2D
 #include "opencv2/xfeatures2d.hpp"
@@ -45,10 +47,12 @@ static void printUsage(char** argv)
         "\nMotion Estimation Flags:\n"
         "  --work_megapix <float>\n"
         "      Resolution for image registration step. The default is 0.6 Mpx.\n"
-        "  --features (surf|orb|sift|akaze)\n"
+        "  --features (surf|orb|sift|akaze|aliked|disk|xfeat)\n"
         "      Type of features used for images matching.\n"
         "      The default is surf if available, orb otherwise.\n"
-        "  --matcher (homography|affine)\n"
+        "      When using 'aliked' or 'disk', requires --matcher lightglue and DNN model paths.\n"
+        "      When using 'xfeat', requires --xfeat_model and uses the standard matcher.\n"
+        "  --matcher (homography|affine|lightglue)\n"
         "      Matcher used for pairwise image matching.\n"
         "  --estimator (homography|affine)\n"
         "      Type of estimator used for transformation estimation.\n"
@@ -103,7 +107,18 @@ static void printUsage(char** argv)
         "  --timelapse (as_is|crop) \n"
         "      Output warped images separately as frames of a time lapse movie, with 'fixed_' prepended to input file names.\n"
         "  --rangewidth <int>\n"
-        "      uses range_width to limit number of images to match with.\n";
+        "      uses range_width to limit number of images to match with.\n"
+        "\nDNN Feature Options:\n"
+        "  --aliked_model <path>\n"
+        "      Path to ALIKED ONNX model file. Required with --features aliked.\n"
+        "  --disk_model <path>\n"
+        "      Path to DISK ONNX model file. Required with --features disk.\n"
+        "  --lightglue_model <path>\n"
+        "      Path to LightGlue ONNX model file for the selected feature type.\n"
+        "  --lg_score_thresh <float>\n"
+        "      LightGlue confidence threshold. The default is 0.0 (accept all).\n"
+        "  --xfeat_model <path>\n"
+        "      Path to XFeat ONNX model file.\n";
 }
 
 
@@ -142,6 +157,11 @@ float blend_strength = 5;
 string result_name = "result.jpg";
 bool timelapse = false;
 int range_width = -1;
+String aliked_model_path;
+String disk_model_path;
+String lightglue_model_path;
+String xfeat_model_path;
+float lg_score_thresh = 0.0f;
 
 
 static int parseCmdArgs(int argc, char** argv)
@@ -204,7 +224,7 @@ static int parseCmdArgs(int argc, char** argv)
         }
         else if (string(argv[i]) == "--matcher")
         {
-            if (string(argv[i + 1]) == "homography" || string(argv[i + 1]) == "affine")
+            if (string(argv[i + 1]) == "homography" || string(argv[i + 1]) == "affine" || string(argv[i + 1]) == "lightglue")
                 matcher_type = argv[i + 1];
             else
             {
@@ -376,6 +396,31 @@ static int parseCmdArgs(int argc, char** argv)
             result_name = argv[i + 1];
             i++;
         }
+        else if (string(argv[i]) == "--aliked_model")
+        {
+            aliked_model_path = argv[i + 1];
+            i++;
+        }
+        else if (string(argv[i]) == "--disk_model")
+        {
+            disk_model_path = argv[i + 1];
+            i++;
+        }
+        else if (string(argv[i]) == "--lightglue_model")
+        {
+            lightglue_model_path = argv[i + 1];
+            i++;
+        }
+        else if (string(argv[i]) == "--xfeat_model")
+        {
+            xfeat_model_path = argv[i + 1];
+            i++;
+        }
+        else if (string(argv[i]) == "--lg_score_thresh")
+        {
+            lg_score_thresh = static_cast<float>(atof(argv[i + 1]));
+            i++;
+        }
         else
             img_names.push_back(argv[i]);
     }
@@ -383,6 +428,40 @@ static int parseCmdArgs(int argc, char** argv)
     {
         compose_megapix = 0.6;
     }
+
+    // Validate DNN options
+    bool is_dnn_feature = features_type == "aliked" || features_type == "disk";
+    if (is_dnn_feature && matcher_type != "lightglue")
+    {
+        cout << "Error: --features " << features_type << " requires --matcher lightglue\n";
+        return -1;
+    }
+    if (is_dnn_feature && lightglue_model_path.empty())
+    {
+        cout << "Error: --features " << features_type << " requires --lightglue_model\n";
+        return -1;
+    }
+    if (features_type == "aliked" && aliked_model_path.empty())
+    {
+        cout << "Error: --features aliked requires --aliked_model\n";
+        return -1;
+    }
+    if (features_type == "disk" && disk_model_path.empty())
+    {
+        cout << "Error: --features disk requires --disk_model\n";
+        return -1;
+    }
+    if (features_type == "xfeat" && xfeat_model_path.empty())
+    {
+        cout << "Error: --features xfeat requires --xfeat_model\n";
+        return -1;
+    }
+    if (features_type == "xfeat" && matcher_type == "lightglue")
+    {
+        cout << "Error: --features xfeat does not support --matcher lightglue; use homography or affine\n";
+        return -1;
+    }
+
     return 0;
 }
 
@@ -401,6 +480,16 @@ int main(int argc, char* argv[])
     if (retval)
         return retval;
 
+    bool use_aliked = (features_type == "aliked");
+    bool use_disk = (features_type == "disk");
+    bool use_xfeat = (features_type == "xfeat");
+    // LightGlue-compatible DNN features
+    bool use_dnn_feature = use_aliked || use_disk;
+
+    // Disable OpenCL for DNN-based features to avoid backend sync issues
+    if (use_dnn_feature || use_xfeat)
+        cv::ocl::setUseOpenCL(false);
+
     // Check if have enough images
     int num_images = static_cast<int>(img_names.size());
     if (num_images < 2)
@@ -418,23 +507,53 @@ int main(int argc, char* argv[])
 #endif
 
     Ptr<Feature2D> finder;
-    if (features_type == "orb")
+    if (features_type == "aliked")
+    {
+        finder = ALIKED::create(aliked_model_path);
+    }
+    else if (features_type == "disk")
+    {
+#ifdef HAVE_OPENCV_DNN
+        finder = DISK::create(disk_model_path, 1024);
+#else
+        cout << "OpenCV is built without opencv_dnn module. DISK algorithm is not available!" << std::endl;
+        return -1;
+#endif
+    }
+    else if (features_type == "orb")
     {
         finder = ORB::create();
     }
     else if (features_type == "akaze")
     {
-        finder = AKAZE::create();
-    }
 #ifdef HAVE_OPENCV_XFEATURES2D
+        finder = xfeatures2d::AKAZE::create();
+#else
+        cout << "OpenCV is built without opencv_contrib modules. AKAZE algorithm is not available!" << std::endl;
+        return -1;
+#endif
+    }
     else if (features_type == "surf")
     {
+#if defined(HAVE_OPENCV_XFEATURES2D) && defined(HAVE_OPENCV_NONFREE)
         finder = xfeatures2d::SURF::create();
-    }
+#else
+        cout << "OpenCV is built without NONFREE modules. SURF algorithm is not available!" << std::endl;
+        return -1;
 #endif
+    }
     else if (features_type == "sift")
     {
         finder = SIFT::create();
+    }
+    else if (features_type == "xfeat")
+    {
+#ifdef HAVE_OPENCV_DNN
+        finder = XFeat::create(xfeat_model_path, 4096, 0.05f, Size(640, 640));
+#else
+        cout << "OpenCV is built without opencv_dnn module. XFeat algorithm is not available!" << std::endl;
+        return -1;
+#endif
     }
     else
     {
@@ -499,7 +618,18 @@ int main(int argc, char* argv[])
 #endif
     vector<MatchesInfo> pairwise_matches;
     Ptr<FeaturesMatcher> matcher;
-    if (matcher_type == "affine")
+    if (use_dnn_feature && matcher_type == "lightglue")
+    {
+        Ptr<LightGlueMatcher> lg;
+        if (use_disk)
+            lg = LightGlueMatcher::create(lightglue_model_path, 0.0f, 0, 0, LG_DISK);
+        else
+            lg = LightGlueMatcher::create(lightglue_model_path);
+        Ptr<LightGlueFeaturesMatcher> lgMatcher = makePtr<LightGlueFeaturesMatcher>(lg);
+        lgMatcher->setScoreThreshold(lg_score_thresh);
+        matcher = lgMatcher;
+    }
+    else if (matcher_type == "affine")
         matcher = makePtr<AffineBestOf2NearestMatcher>(false, try_cuda, match_conf);
     else if (range_width==-1)
         matcher = makePtr<BestOf2NearestMatcher>(try_cuda, match_conf);

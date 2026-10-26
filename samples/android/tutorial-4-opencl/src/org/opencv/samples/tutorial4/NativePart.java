@@ -4,7 +4,7 @@ package org.opencv.samples.tutorial4;
 public class NativePart {
     static
     {
-        System.loadLibrary("opencv_java4");
+        System.loadLibrary("opencv_java5");
         System.loadLibrary("JNIpart");
     }
 

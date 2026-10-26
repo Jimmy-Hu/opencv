@@ -144,144 +144,6 @@ std::vector<std::vector<cv::Range> > finalizeSliceRange(const MatShape& inpShape
     return sliceRanges;
 }
 
-
-template <typename T>
-class ParallelSlice : public cv::ParallelLoopBody
-{
-public:
-    ParallelSlice(const Mat& inp, Mat& out,
-                  const std::vector<Range>& ranges,
-                  const std::vector<int>& steps,
-                  int nstripes)
-        : inp_(inp), out_(out), ranges_(ranges), steps_(steps), nstripes_(nstripes)
-    {
-        dims_ = inp.dims;
-        es_ = inp.elemSize();
-
-        inp_strides_.resize(dims_);
-        out_strides_.resize(dims_);
-        for(int i=0; i<dims_; ++i) {
-            inp_strides_[i] = inp.step.p[i];
-            out_strides_[i] = out.step.p[i];
-        }
-    }
-
-    void operator()(const Range& range) const CV_OVERRIDE
-    {
-        // Parallelize over outer dims, process inner dim as block
-        // Total tasks = product of dimensions except the last one
-        size_t total_outer = 1;
-        for (int i = 0; i < dims_ - 1; ++i)
-        {
-             int n = ranges_[i].end - ranges_[i].start;
-             int s = steps_[i];
-             if (s == 1)
-                 total_outer *= n;
-             else
-                 total_outer *= (n - 1) / s + 1;
-        }
-
-        // Special case for 1D: total_outer is 1, we just run the loop once for the single dim
-        if (dims_ == 1) total_outer = 1;
-
-        size_t stripeSize = (total_outer + nstripes_ - 1) / nstripes_;
-        size_t stripeStart = range.start * stripeSize;
-        size_t stripeEnd = std::min(total_outer, range.end * stripeSize);
-
-        const uchar* src_base = inp_.ptr();
-        uchar* dst_base = out_.ptr();
-
-        int inner_dim = dims_ - 1;
-        int inner_len = ranges_[inner_dim].end - ranges_[inner_dim].start;
-        int inner_step = steps_[inner_dim];
-        int inner_count = (inner_step == 1) ? inner_len : ((inner_len - 1) / inner_step + 1);
-        size_t inner_src_step = inner_step * inp_strides_[inner_dim];
-        size_t inner_dst_step = out_strides_[inner_dim];
-
-        if (dims_ == 1)
-        {
-            // pure 1D handling
-            // For 1D, "outer" loop is just 1 iteration
-            if (stripeStart >= 1) return;
-
-             // Logic for inner loop same as below
-            int begin = ranges_[0].start;
-            size_t src_offset = begin * inp_strides_[0];
-            size_t dst_offset = 0;
-
-            if (inner_step == 1)
-            {
-                std::memcpy(dst_base + dst_offset, src_base + src_offset, inner_count * es_);
-            }
-            else
-            {
-                 const uchar* s = src_base + src_offset;
-                 uchar* d = dst_base + dst_offset;
-                 for (int i = 0; i < inner_count; ++i)
-                 {
-                     std::memcpy(d, s, es_);
-                     s += inner_src_step;
-                     d += inner_dst_step;
-                 }
-            }
-            return;
-        }
-
-        for (size_t i = stripeStart; i < stripeEnd; ++i)
-        {
-            size_t idx = i;
-            size_t src_offset = 0;
-            size_t dst_offset = 0;
-
-            // Reconstruct indices for outer dims
-            for (int d = dims_ - 2; d >= 0; --d)
-            {
-                int range_len = ranges_[d].end - ranges_[d].start;
-                int step = steps_[d];
-                int count = (step == 1) ? range_len : ((range_len - 1) / step + 1);
-
-                int k = idx % count;
-                idx /= count;
-
-                src_offset += (ranges_[d].start + k * step) * inp_strides_[d];
-                dst_offset += k * out_strides_[d];
-            }
-
-            // Process inner dimension
-            int begin = ranges_[inner_dim].start;
-            // Add bias for inner dim start
-            src_offset += begin * inp_strides_[inner_dim];
-
-            if (inner_step == 1)
-            {
-                std::memcpy(dst_base + dst_offset, src_base + src_offset, inner_count * es_);
-            }
-            else
-            {
-                const uchar* s = src_base + src_offset;
-                uchar* d = dst_base + dst_offset;
-                for (int k = 0; k < inner_count; ++k)
-                {
-                   std::memcpy(d, s, es_);
-                   s += inner_src_step;
-                   d += inner_dst_step;
-                }
-            }
-        }
-    }
-
-private:
-    const Mat& inp_;
-    Mat& out_;
-    const std::vector<Range>& ranges_;
-    const std::vector<int>& steps_;
-    int nstripes_;
-    int dims_;
-    size_t es_;
-    std::vector<size_t> inp_strides_;
-    std::vector<size_t> out_strides_;
-};
-
 class SliceLayerImpl : public SliceLayer
 {
 public:
@@ -329,7 +191,7 @@ public:
                     CV_Assert(step != 0);
                     if (step < 0)
                         neg_step_dims.push_back(i);
-                    if (std::abs(step) > 1)
+                    if (std::abs(step) > 1 || step < 0)
                         hasSteps = true;
                     sliceSteps[0][i] = step;
                 }
@@ -375,6 +237,8 @@ public:
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CANN;
     }
 
+    bool isDataShuffling() const CV_OVERRIDE { return true; }
+
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                             const int requiredOutputs,
                             std::vector<MatShape> &outputs,
@@ -417,6 +281,25 @@ public:
         }
         return false;
     }
+
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_CheckEQ(inputs.size(), (size_t)1, "");
+        for (auto input : inputs)
+        {
+            if (preferableTarget == DNN_TARGET_OPENCL_FP16)
+                CV_CheckType(input, input == CV_16F || input == CV_8S || input == CV_8U || input == CV_32S || input == CV_64S || input == CV_Bool, "");
+            else
+                CV_CheckType(input, input == CV_32F || input == CV_8S || input == CV_8U || input == CV_32S || input == CV_64S || input == CV_Bool, "");
+        }
+
+        outputs.assign(requiredOutputs, inputs[0]);
+    }
+
 
     bool updateMemoryShapes(const std::vector<MatShape> &inputs) CV_OVERRIDE
     {
@@ -736,12 +619,12 @@ public:
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
-                   forward_ocl(inputs_arr, outputs_arr, internals_arr))
-
         std::vector<Mat> inputs, outputs;
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
+
+        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
+                   forward_ocl(inputs_arr, outputs_arr, internals_arr))
 
         const Mat& inpMat = inputs[0];
         CV_Assert(outputs.size() == finalSliceRanges.size());
@@ -755,23 +638,18 @@ public:
                 }
             }
         }
-        else
+        if (hasSteps)
         {
-            int dimsNum = inpMat.dims;
-            int nstripes = getNumThreads();
-            std::vector<int> dummy_steps(dimsNum, 1);
+            if (inpMat.depth() == CV_32S) run_parallel<int32_t>(inpMat, outputs);
+            else if (inpMat.depth() == CV_64S) run_parallel<int64_t>(inpMat, outputs);
+            else if (inpMat.depth() == CV_16F) run_parallel<int16_t>(inpMat, outputs);
+            else if (inpMat.depth() == CV_8S) run_parallel<int8_t>(inpMat, outputs);
+            else if (inpMat.depth() == CV_8U) run_parallel<uint8_t>(inpMat, outputs);
+            else if (inpMat.depth() == CV_Bool) run_parallel<uint8_t>(inpMat, outputs);
+            else run_parallel<float>(inpMat, outputs);
 
             for (size_t i = 0; i < outputs.size(); i++)
-            {
-                if (inpMat.type() == CV_16F)
-                    parallel_for_(Range(0, nstripes), ParallelSlice<int16_t>(inpMat, outputs[i], finalSliceRanges[i], sliceSteps.empty() ? dummy_steps : sliceSteps[i], nstripes), nstripes);
-                else if (inpMat.type() == CV_8S)
-                    parallel_for_(Range(0, nstripes), ParallelSlice<int8_t>(inpMat, outputs[i], finalSliceRanges[i], sliceSteps.empty() ? dummy_steps : sliceSteps[i], nstripes), nstripes);
-                else
-                    parallel_for_(Range(0, nstripes), ParallelSlice<float>(inpMat, outputs[i], finalSliceRanges[i], sliceSteps.empty() ? dummy_steps : sliceSteps[i], nstripes), nstripes);
-                // flip for negative steps
                 flip(outputs[i]);
-            }
         }
     }
 
@@ -946,26 +824,150 @@ public:
                 offsets_i.push_back(range.start);
             offsets.push_back(std::move(offsets_i));
         }
-
-        return make_cuda_node<cuda4dnn::SliceOp>(preferableTarget, std::move(context->stream), std::move(offsets));
+        if (inputs[0]->getHostMatDepth() == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::SliceOp>(std::move(context->stream), std::move(offsets));
+        else
+            return make_cuda_node_with_type<cuda4dnn::SliceOp>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), std::move(offsets));
     }
 #endif
 
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        const int numOutputs = scales[1].size();
-        for (int i = 0; i < numOutputs; i++)
-        {
-            if (scales[1][i] != scales[0][0])
-             return false;
-        }
-        return true;
-    }
-
 private:
+    template <typename T>
+    class ParallelSlice : public cv::ParallelLoopBody
+    {
+    public:
+        ParallelSlice(const Mat& inp, Mat& out,
+                      const std::vector<Range>& ranges,
+                      const std::vector<int>& steps)
+            : inp_(inp), out_(out), ranges_(ranges), steps_(steps)
+        {
+            dims_ = inp.dims;
+            es_ = inp.elemSize();
 
+            inp_strides_.resize(dims_);
+            out_strides_.resize(dims_);
+            for(int i=0; i<dims_; ++i) {
+                inp_strides_[i] = inp.step.p[i];
+                out_strides_[i] = out.step.p[i];
+            }
+        }
 
+        void operator()(const Range& range) const CV_OVERRIDE
+        {
+            int b = ranges_[0].start;
+            int s = steps_[0];
+
+            const uchar* src_base = inp_.ptr();
+            uchar* dst_base = out_.ptr();
+
+            for (int i = range.start; i < range.end; ++i)
+            {
+                int k = b + i * s;
+                size_t src_offset = k * inp_strides_[0];
+                size_t dst_offset = i * out_strides_[0];
+                if (dims_ == 1)
+                    std::memcpy(dst_base + dst_offset, src_base + src_offset, es_);
+                else
+                    recursive_copy(1, src_base + src_offset, dst_base + dst_offset);
+            }
+        }
+
+        void recursive_copy(int dim, const uchar* src_ptr, uchar* dst_ptr) const
+        {
+            if (dim >= dims_) return;
+
+            int begin = ranges_[dim].start;
+            int end = ranges_[dim].end;
+            int step = steps_[dim];
+
+            if (dim == dims_ - 1)
+            {
+                if (step == 1)
+                {
+                    size_t count = end - begin;
+                    std::memcpy(dst_ptr, src_ptr + begin * inp_strides_[dim], count * es_);
+                }
+                else
+                {
+                    const uchar* s_ptr = src_ptr + begin * inp_strides_[dim];
+                    uchar* d_ptr = dst_ptr;
+                    size_t s_stride = step * inp_strides_[dim];
+                    size_t d_stride = out_strides_[dim];
+
+                    for (int k = begin; k < end; k += step)
+                    {
+                        *(T*)d_ptr = *(const T*)s_ptr;
+                        s_ptr += s_stride;
+                        d_ptr += d_stride;
+                    }
+                }
+                return;
+            }
+
+            if (step == 1 && is_fully_contiguous(dim))
+            {
+               size_t count = end - begin;
+               size_t bytes = count * inp_strides_[dim];
+               std::memcpy(dst_ptr, src_ptr + begin * inp_strides_[dim], bytes);
+               return;
+            }
+
+            size_t src_stride = step * inp_strides_[dim];
+            size_t dst_stride = out_strides_[dim];
+
+            const uchar* s_ptr = src_ptr + begin * inp_strides_[dim];
+            uchar* d_ptr = dst_ptr;
+
+            for (int k = begin; k < end; k += step)
+            {
+                recursive_copy(dim + 1, s_ptr, d_ptr);
+                s_ptr += src_stride;
+                d_ptr += dst_stride;
+            }
+        }
+
+        bool is_fully_contiguous(int dim) const
+        {
+            size_t expected_step = es_;
+            for (int d = dims_ - 1; d >= dim; --d)
+            {
+                 if (inp_.step[d] != expected_step) return false;
+                 if (d > dim) {
+                     if (steps_[d] != 1) return false;
+                     if (ranges_[d].start != 0 || ranges_[d].end != inp_.size[d]) return false;
+                     expected_step *= inp_.size[d];
+                 }
+            }
+            return true;
+        }
+
+    private:
+        const Mat& inp_;
+        Mat& out_;
+        const std::vector<Range>& ranges_;
+        const std::vector<int>& steps_;
+        int dims_;
+        size_t es_;
+        std::vector<size_t> inp_strides_;
+        std::vector<size_t> out_strides_;
+    };
+
+    template <typename T>
+    void run_parallel(const Mat& inp, std::vector<Mat>& outputs)
+    {
+        int dimsNum = inp.dims;
+        for(size_t i=0; i<outputs.size(); ++i) {
+             std::vector<int> steps;
+             if (!sliceSteps.empty() && i < sliceSteps.size() && !sliceSteps[i].empty())
+                 steps = sliceSteps[i];
+             else
+                 steps.assign(dimsNum, 1);
+
+             ParallelSlice<T> body(inp, outputs[i], finalSliceRanges[i], steps);
+             int dim0_size = outputs[i].size[0];
+             parallel_for_(Range(0, dim0_size), body);
+        }
+    }
     void flip(Mat& output) // break if 1d tensor?
     {
         for (int i = 0; i < neg_step_dims.size(); ++i)
@@ -1011,6 +1013,24 @@ public:
         }
         outputs.resize(1, dstShape);
         return false;
+    }
+
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_CheckEQ(inputs.size(), (size_t)2, "");
+        for (auto input : inputs)
+        {
+            if (preferableTarget == DNN_TARGET_OPENCL_FP16)
+                CV_CheckType(input, input == CV_16F || input == CV_8S || input == CV_8U || input == CV_32S || input == CV_64S || input == CV_Bool, "");
+            else
+                CV_CheckType(input, input == CV_32F || input == CV_8S || input == CV_8U || input == CV_32S || input == CV_64S || input == CV_Bool, "");
+        }
+
+        outputs.assign(requiredOutputs, inputs[0]);
     }
 
     void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE

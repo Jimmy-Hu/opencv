@@ -3,6 +3,8 @@
 // of this distribution and at http://opencv.org/license.html.
 #include "test_precomp.hpp"
 
+#define CV_TEST_DXT_MUL_CONJ 8 /**< conjugate the second argument of cvMulSpectrums */
+
 namespace opencv_test { namespace {
 
 static Mat initDFTWave( int n, bool inv )
@@ -145,7 +147,11 @@ static Mat initDCTWave( int n, bool inv )
     scale *= sqrt(2.);
     for( i = 1; i < n; i++ )
         for( k = 0; k < n; k++ )
-            wave.at<double>(i, k) = scale*cos( angle*i*(2*k + 1) );
+        {
+            // reduce the angle exactly (period 4n) before the cosine to keep the reference accurate
+            int m = (int)(((int64)i*(2*k + 1)) % (4*n));
+            wave.at<double>(i, k) = scale*cos( angle*m );
+        }
 
     if( inv )
         cv::transpose( wave, wave );
@@ -449,7 +455,7 @@ static void mulComplex( const Mat& src1, const Mat& src2, Mat& dst, int flags )
             const float* b = src2_->ptr<float>(i);
             float* c = dst.ptr<float>(i);
 
-            if( !(flags & CV_DXT_MUL_CONJ) )
+            if( !(flags & CV_TEST_DXT_MUL_CONJ) )
                 for( j = 0; j < cols; j += 2 )
                 {
                     double re = (double)a[j]*(double)b[j] - (double)a[j+1]*(double)b[j+1];
@@ -474,7 +480,7 @@ static void mulComplex( const Mat& src1, const Mat& src2, Mat& dst, int flags )
             const double* b = src2_->ptr<double>(i);
             double* c = dst.ptr<double>(i);
 
-            if( !(flags & CV_DXT_MUL_CONJ) )
+            if( !(flags & CV_TEST_DXT_MUL_CONJ) )
                 for( j = 0; j < cols; j += 2 )
                 {
                     double re = a[j]*b[j] - a[j+1]*b[j+1];
@@ -546,22 +552,22 @@ void CxCore_DXTBaseTest::get_test_array_types_and_sizes( int test_case_idx,
     Size size;
     Base::get_test_array_types_and_sizes( test_case_idx, sizes, types );
 
-    flags = bits & (CV_DXT_INVERSE | CV_DXT_SCALE | CV_DXT_ROWS | CV_DXT_MUL_CONJ);
+    flags = bits & (cv::DFT_INVERSE | cv::DFT_SCALE | cv::DFT_ROWS | CV_TEST_DXT_MUL_CONJ);
     if( spectrum_mode )
-        flags &= ~CV_DXT_INVERSE;
+        flags &= ~cv::DFT_INVERSE;
     types[TEMP][0] = types[TEMP][1] = types[INPUT][0] =
     types[OUTPUT][0] = CV_MAKETYPE(depth, cn);
     size = sizes[INPUT][0];
 
     temp_dst = false;
 
-    if( flags & CV_DXT_ROWS && (bits&1024) )
+    if( flags & cv::DFT_ROWS && (bits&1024) )
     {
         if( bits&16 )
             size.width = 1;
         else
             size.height = 1;
-        flags &= ~CV_DXT_ROWS;
+        flags &= ~cv::DFT_ROWS;
     }
 
     const int P2_MIN_SIZE = 32;
@@ -578,18 +584,18 @@ void CxCore_DXTBaseTest::get_test_array_types_and_sizes( int test_case_idx,
         if( size.width > 1 && (size.width&1) != 0 )
             size.width = (size.width + 1) & -2;
 
-        if( size.height > 1 && (size.height&1) != 0 && !(flags & CV_DXT_ROWS) )
+        if( size.height > 1 && (size.height&1) != 0 && !(flags & cv::DFT_ROWS) )
             size.height = (size.height + 1) & -2;
     }
 
     sizes[INPUT][0] = sizes[OUTPUT][0] = size;
-    sizes[TEMP][0] = sizes[TEMP][1] = cvSize(0,0);
+    sizes[TEMP][0] = sizes[TEMP][1] = cv::Size(0,0);
 
     if( spectrum_mode )
     {
         if( cn == 1 )
         {
-            types[OUTPUT][0] = depth + 8;
+            types[OUTPUT][0] = CV_MAKETYPE(depth, 2);
             sizes[TEMP][0] = size;
         }
         sizes[INPUT][0] = sizes[INPUT][1] = size;
@@ -597,11 +603,11 @@ void CxCore_DXTBaseTest::get_test_array_types_and_sizes( int test_case_idx,
     }
     else if( /*(cn == 2 && (bits&32)) ||*/ (cn == 1 && allow_complex) )
     {
-        types[TEMP][0] = depth + 8; // CV_??FC2
+        types[TEMP][0] = CV_MAKETYPE(depth, 2); // CV_??FC2
         sizes[TEMP][0] = size;
-        size = cvSize(size.width/2+1, size.height);
+        size = cv::Size(size.width/2+1, size.height);
 
-        if( flags & CV_DXT_INVERSE )
+        if( flags & cv::DFT_INVERSE )
         {
             if( cn == 2 )
             {
@@ -614,7 +620,7 @@ void CxCore_DXTBaseTest::get_test_array_types_and_sizes( int test_case_idx,
         else
         {
             if( allow_complex )
-                types[OUTPUT][0] = depth + 8;
+                types[OUTPUT][0] = CV_MAKETYPE(depth, 2);
 
             if( cn == 2 )
             {
@@ -690,7 +696,7 @@ double CxCore_DFTTest::get_success_error_level( int test_case_idx, int i, int j 
     CV_Assert(i == OUTPUT);
     CV_Assert(j == 0);
 
-    int depth = CV_MAT_DEPTH(cvGetElemType(test_array[i][j]));
+    int depth = test_mat[i][j].depth();
 
     // NOTE: non-default threshold intorduced for ARMPL integration
     if (depth == CV_32F)
@@ -704,10 +710,10 @@ void CxCore_DFTTest::run_func()
     Mat& dst = temp_dst ? test_mat[TEMP][1] : test_mat[OUTPUT][0];
     const Mat& src = inplace ? dst : test_mat[INPUT][0];
 
-    if(!(flags & CV_DXT_INVERSE))
+    if(!(flags & cv::DFT_INVERSE))
         cv::dft( src, dst, flags );
     else
-        cv::idft(src, dst, flags & ~CV_DXT_INVERSE);
+        cv::idft(src, dst, flags & ~cv::DFT_INVERSE);
 }
 
 
@@ -724,7 +730,7 @@ void CxCore_DFTTest::prepare_to_validation( int /*test_case_idx*/ )
     {
         tmp_src = &test_mat[TEMP][0];
 
-        if( !(flags & CV_DXT_INVERSE ) )
+        if( !(flags & cv::DFT_INVERSE ) )
         {
             Mat& cvdft_dst = test_mat[TEMP][1];
             convertFromCCS( cvdft_dst, cvdft_dst,
@@ -739,7 +745,7 @@ void CxCore_DFTTest::prepare_to_validation( int /*test_case_idx*/ )
         }
     }
 
-    if( src.rows == 1 || (src.cols == 1 && !(flags & CV_DXT_ROWS)) )
+    if( src.rows == 1 || (src.cols == 1 && !(flags & cv::DFT_ROWS)) )
         DFT_1D( *tmp_src, *tmp_dst, flags );
     else
         DFT_2D( *tmp_src, *tmp_dst, flags );
@@ -772,7 +778,7 @@ double CxCore_DCTTest::get_success_error_level(int, int i, int j)
     CV_Assert(i == OUTPUT);
     CV_Assert(j == 0);
 
-    int depth = CV_MAT_DEPTH(cvGetElemType(test_array[i][j]));
+    int depth = test_mat[i][j].depth();
 
     if (depth == CV_32F)
         return 1.67e-5;
@@ -786,10 +792,10 @@ void CxCore_DCTTest::run_func()
     Mat& dst = test_mat[OUTPUT][0];
     const Mat& src = inplace ? dst : test_mat[INPUT][0];
 
-    if(!(flags & CV_DXT_INVERSE))
+    if(!(flags & cv::DFT_INVERSE))
         cv::dct( src, dst, flags );
     else
-        cv::idct( src, dst, flags & ~CV_DXT_INVERSE);
+        cv::idct( src, dst, flags & ~cv::DFT_INVERSE);
 }
 
 
@@ -798,7 +804,7 @@ void CxCore_DCTTest::prepare_to_validation( int /*test_case_idx*/ )
     const Mat& src = test_mat[INPUT][0];
     Mat& dst = test_mat[REF_OUTPUT][0];
 
-    if( src.rows == 1 || (src.cols == 1 && !(flags & CV_DXT_ROWS)) )
+    if( src.rows == 1 || (src.cols == 1 && !(flags & cv::DFT_ROWS)) )
         DCT_1D( src, dst, flags );
     else
         DCT_2D( src, dst, flags );
@@ -826,7 +832,7 @@ double CxCore_MulSpectrumsTest::get_success_error_level( int test_case_idx, int 
     CV_UNUSED(test_case_idx);
     CV_Assert(i == OUTPUT);
     CV_Assert(j == 0);
-    int elem_depth = CV_MAT_DEPTH(cvGetElemType(test_array[i][j]));
+    const int elem_depth = test_mat[i][j].depth();
     CV_Assert(elem_depth == CV_32F || elem_depth == CV_64F);
 
     element_wise_relative_error = false;
@@ -839,7 +845,7 @@ void CxCore_MulSpectrumsTest::run_func()
 {
     Mat& dst = !test_mat[TEMP].empty() && !test_mat[TEMP][0].empty() ?
         test_mat[TEMP][0] : test_mat[OUTPUT][0];
-    const Mat* src1 = &test_mat[INPUT][0], *src2 = &test_mat[INPUT][1];
+    Mat *src1 = &test_mat[INPUT][0], *src2 = &test_mat[INPUT][1];
 
     if( inplace )
     {
@@ -849,7 +855,7 @@ void CxCore_MulSpectrumsTest::run_func()
             src1 = &dst;
     }
 
-    cv::mulSpectrums( *src1, *src2, dst, flags, (flags & CV_DXT_MUL_CONJ) != 0 );
+    cv::mulSpectrums( *src1, *src2, dst, flags, (flags & CV_TEST_DXT_MUL_CONJ) != 0 );
 }
 
 
@@ -877,9 +883,283 @@ void CxCore_MulSpectrumsTest::prepare_to_validation( int /*test_case_idx*/ )
     }
 }
 
+////////////////////// DivSpectrums ////////////////////////
+class CV_DivSpectrumsTest : public cvtest::ArrayTest
+{
+public:
+    CV_DivSpectrumsTest();
+protected:
+    void run_func();
+    void get_test_array_types_and_sizes( int, vector<vector<Size> >& sizes, vector<vector<int> >& types );
+    void prepare_to_validation( int test_case_idx );
+    int flags;
+};
+
+
+CV_DivSpectrumsTest::CV_DivSpectrumsTest() : flags(0)
+{
+    // Allocate test matrices.
+    test_array[INPUT].push_back(NULL);  // first input DFT as a CCS-packed array or complex matrix.
+    test_array[INPUT].push_back(NULL);  // second input DFT as a CCS-packed array or complex matrix.
+    test_array[OUTPUT].push_back(NULL);  // output DFT as a complex matrix.
+    test_array[REF_OUTPUT].push_back(NULL);  // reference output DFT as a complex matrix.
+    test_array[TEMP].push_back(NULL);  // first input DFT converted to a complex matrix.
+    test_array[TEMP].push_back(NULL);  // second input DFT converted to a complex matrix.
+    test_array[TEMP].push_back(NULL);  // output DFT as a CCV-packed array.
+}
+
+void CV_DivSpectrumsTest::get_test_array_types_and_sizes( int test_case_idx, vector<vector<Size> >& sizes, vector<vector<int> >& types )
+{
+    cvtest::ArrayTest::get_test_array_types_and_sizes(test_case_idx, sizes, types);
+    RNG& rng = ts->get_rng();
+
+    // Get the flag of the input.
+    const int rand_int_flags = cvtest::randInt(rng);
+    flags = rand_int_flags & (CV_TEST_DXT_MUL_CONJ | DFT_ROWS);
+
+    // Get input type.
+    const int rand_int_type = cvtest::randInt(rng);
+    int type;
+
+    if (rand_int_type % 4)
+    {
+        type = CV_32FC1;
+    }
+    else if (rand_int_type % 4 == 1)
+    {
+        type = CV_32FC2;
+    }
+    else if (rand_int_type % 4 == 2)
+    {
+        type = CV_64FC1;
+    }
+    else
+    {
+        type = CV_64FC2;
+    }
+
+    for( size_t i = 0; i < types.size(); i++ )
+    {
+        for( size_t j = 0; j < types[i].size(); j++ )
+        {
+            types[i][j] = type;
+        }
+    }
+
+    // Inputs are CCS-packed arrays.  Prepare outputs and temporary inputs as complex matrices.
+    if( type == CV_32FC1 || type == CV_64FC1 )
+    {
+        types[OUTPUT][0] += CV_DEPTH_MAX;
+        types[REF_OUTPUT][0] += CV_DEPTH_MAX;
+        types[TEMP][0] += CV_DEPTH_MAX;
+        types[TEMP][1] += CV_DEPTH_MAX;
+    }
+}
+
+/// Helper function to convert a ccs array of depth_t into a complex matrix.
+template<typename depth_t>
+static void convert_from_ccs_helper( const Mat& src0, const Mat& src1, Mat& dst )
+{
+    const int cn = src0.channels();
+    int srcstep = cn;
+    int dststep = 1;
+
+    if( !dst.isContinuous() )
+        dststep = (int)(dst.step/dst.elemSize());
+
+    if( !src0.isContinuous() )
+        srcstep = (int)(src0.step/src0.elemSize1());
+
+    Complex<depth_t> *dst_data = dst.ptr<Complex<depth_t> >();
+    const depth_t* src0_data = src0.ptr<depth_t>();
+    const depth_t* src1_data = src1.ptr<depth_t>();
+    dst_data->re = src0_data[0];
+    dst_data->im = 0;
+    const int n = dst.cols + dst.rows - 1;
+    const int n2 = (n+1) >> 1;
+
+    if( (n & 1) == 0 )
+    {
+        dst_data[n2*dststep].re = src0_data[(cn == 1 ? n-1 : n2)*srcstep];
+        dst_data[n2*dststep].im = 0;
+    }
+
+    int delta0 = srcstep;
+    int delta1 = delta0 + (cn == 1 ? srcstep : 1);
+
+    if( cn == 1 )
+        srcstep *= 2;
+
+    for( int i = 1; i < n2; i++, delta0 += srcstep, delta1 += srcstep )
+    {
+        depth_t t0 = src0_data[delta0];
+        depth_t t1 = src0_data[delta1];
+
+        dst_data[i*dststep].re = t0;
+        dst_data[i*dststep].im = t1;
+
+        t0 = src1_data[delta0];
+        t1 = -src1_data[delta1];
+
+        dst_data[(n-i)*dststep].re = t0;
+        dst_data[(n-i)*dststep].im = t1;
+    }
+}
+
+/// Helper function to convert a ccs array into a complex matrix.
+static void convert_from_ccs( const Mat& src0, const Mat& src1, Mat& dst, const int flags )
+{
+    if( dst.rows > 1 && (dst.cols > 1 || (flags & DFT_ROWS)) )
+    {
+        const int count = dst.rows;
+        const int len = dst.cols;
+        const bool is2d = (flags & DFT_ROWS) == 0;
+        for( int i = 0; i < count; i++ )
+        {
+            const int j = !is2d || i == 0 ? i : count - i;
+            const Mat& src0row = src0.row(i);
+            const Mat& src1row = src1.row(j);
+            Mat dstrow = dst.row(i);
+            convert_from_ccs( src0row, src1row, dstrow, 0 );
+        }
+
+        if( is2d )
+        {
+            const Mat& src0row = src0.col(0);
+            Mat dstrow = dst.col(0);
+            convert_from_ccs( src0row, src0row, dstrow, 0 );
+
+            if( (len & 1) == 0 )
+            {
+                const Mat& src0row_even = src0.col(src0.cols - 1);
+                Mat dstrow_even = dst.col(len/2);
+                convert_from_ccs( src0row_even, src0row_even, dstrow_even, 0 );
+            }
+        }
+    }
+    else
+    {
+        if( dst.depth() == CV_32F )
+        {
+            convert_from_ccs_helper<float>( src0, src1, dst );
+        }
+        else
+        {
+            convert_from_ccs_helper<double>( src0, src1, dst );
+        }
+    }
+}
+
+/// Helper function to compute complex number (nu_re + nu_im * i) / (de_re + de_im * i).
+static std::pair<double, double> divide_complex_numbers( const double nu_re, const double nu_im,
+                                                         const double de_re, const double de_im,
+                                                         const bool conj_de )
+{
+    if ( conj_de )
+    {
+        return divide_complex_numbers( nu_re, nu_im, de_re, -de_im, false /* conj_de */ );
+    }
+
+    const double result_de = de_re * de_re + de_im * de_im + DBL_EPSILON;
+    const double result_re = nu_re * de_re + nu_im * de_im;
+    const double result_im = nu_re * (-de_im) + nu_im * de_re;
+    return std::pair<double, double>(result_re / result_de, result_im / result_de);
+}
+
+/// Helper function to divide a DFT in src1 by a DFT in src2 with depths depth_t.  The DFTs are
+/// complex matrices.
+template <typename depth_t>
+static void div_complex_helper( const Mat& src1, const Mat& src2, Mat& dst, int flags )
+{
+    CV_Assert( src1.size == src2.size && src1.type() == src2.type() );
+    dst.create( src1.rows, src1.cols, src1.type() );
+    const int cn = src1.channels();
+    int cols = src1.cols * cn;
+
+    for( int i = 0; i < dst.rows; i++ )
+    {
+        const depth_t *src1_data = src1.ptr<depth_t>(i);
+        const depth_t *src2_data = src2.ptr<depth_t>(i);
+        depth_t *dst_data = dst.ptr<depth_t>(i);
+        for( int j = 0; j < cols; j += 2 )
+        {
+            std::pair<double, double> result =
+            divide_complex_numbers( src1_data[j], src1_data[j + 1],
+                                    src2_data[j], src2_data[j + 1],
+                                    (flags & CV_TEST_DXT_MUL_CONJ) != 0 );
+            dst_data[j] = (depth_t)result.first;
+            dst_data[j + 1] = (depth_t)result.second;
+        }
+    }
+}
+
+/// Helper function to divide a DFT in src1 by a DFT in src2.  The DFTs are complex matrices.
+static void div_complex( const Mat& src1, const Mat& src2, Mat& dst, const int flags )
+{
+    const int type = src1.type();
+    CV_Assert( type == CV_32FC2 || type == CV_64FC2 );
+
+    if ( src1.depth() == CV_32F )
+    {
+        return div_complex_helper<float>( src1, src2, dst, flags );
+    }
+    else
+    {
+        return div_complex_helper<double>( src1, src2, dst, flags );
+    }
+}
+
+void CV_DivSpectrumsTest::prepare_to_validation( int /* test_case_idx */ )
+{
+    Mat &src1 = test_mat[INPUT][0];
+    Mat &src2 = test_mat[INPUT][1];
+    Mat &ref_dst = test_mat[REF_OUTPUT][0];
+    const int cn = src1.channels();
+    // Inputs are CCS-packed arrays.  Convert them to complex matrices and get the expected output
+    // as a complex matrix.
+    if( cn == 1 )
+    {
+        Mat &converted_src1 = test_mat[TEMP][0];
+        Mat &converted_src2 = test_mat[TEMP][1];
+        convert_from_ccs( src1, src1, converted_src1, flags );
+        convert_from_ccs( src2, src2, converted_src2, flags );
+        div_complex( converted_src1, converted_src2, ref_dst, flags );
+    }
+    // Inputs are complex matrices.  Get the expected output as a complex matrix.
+    else
+    {
+        div_complex( src1, src2, ref_dst, flags );
+    }
+}
+
+void CV_DivSpectrumsTest::run_func()
+{
+    const Mat &src1 = test_mat[INPUT][0];
+    const Mat &src2 = test_mat[INPUT][1];
+    const int cn = src1.channels();
+
+    // Inputs are CCS-packed arrays.  Get the output as a CCS-packed array and convert it to a
+    // complex matrix.
+    if ( cn == 1 )
+    {
+        Mat &dst = test_mat[TEMP][2];
+        cv::divSpectrums( src1, src2, dst, flags, (flags & CV_TEST_DXT_MUL_CONJ) != 0 );
+        Mat &converted_dst = test_mat[OUTPUT][0];
+        convert_from_ccs( dst, dst, converted_dst, flags );
+    }
+    // Inputs are complex matrices.  Get the output as a complex matrix.
+    else
+    {
+        Mat &dst = test_mat[OUTPUT][0];
+        cv::divSpectrums( src1, src2, dst, flags, (flags & CV_TEST_DXT_MUL_CONJ) != 0 );
+    }
+}
+
 TEST(Core_DCT, accuracy) { CxCore_DCTTest test; test.safe_run(); }
 TEST(Core_DFT, accuracy) { CxCore_DFTTest test; test.safe_run(); }
 TEST(Core_MulSpectrums, accuracy) { CxCore_MulSpectrumsTest test; test.safe_run(); }
+TEST(Core_DivSpectrums, accuracy) { CV_DivSpectrumsTest test; test.safe_run(); }
+
 
 class Core_DFTComplexOutputTest : public cvtest::BaseTest
 {
@@ -1012,5 +1292,302 @@ protected:
 
 TEST(Core_DFT, reverse) { Core_DXTReverseTest test(Core_DXTReverseTest::ModeDFT); test.safe_run(); }
 TEST(Core_DCT, reverse) { Core_DXTReverseTest test(Core_DXTReverseTest::ModeDCT); test.safe_run(); }
+
+//////////////////////// 1D size sweep against the naive references ////////////////////////
+// Covers every 5-smooth length up to 2048 plus small, odd, prime and "awkward" lengths, so that
+// all radices (2/4/8 first stage, 3, 5, generic odd), all stage modes and all packing variants
+// (CCS even/odd, DFT_COMPLEX_OUTPUT, DFT_REAL_OUTPUT, DCT/IDCT rows and columns) are exercised.
+// Comparisons are tolerance-based: |out - ref| <= c*(log2(n)+2)*eps(T)*max|ref|.
+
+static std::vector<int> dxtSweepSizes()
+{
+    std::vector<int> sizes;
+    for (int n = 1; n <= 2048; n++)
+    {
+        int m = n;
+        while (m % 2 == 0) m /= 2;
+        while (m % 3 == 0) m /= 3;
+        while (m % 5 == 0) m /= 5;
+        if (m == 1)
+            sizes.push_back(n);
+    }
+    static const int extra[] = { 7, 11, 13, 14, 21, 22, 26, 49, 77, 98, 121, 143, 154, 242, 338, 1001, 2018 };
+    for (size_t i = 0; i < sizeof(extra)/sizeof(extra[0]); i++)
+        sizes.push_back(extra[i]);
+    return sizes;
+}
+
+static double dxtSweepThresh(int depth, int n)
+{
+    double eps = depth == CV_32F ? FLT_EPSILON : DBL_EPSILON;
+    // a generic odd-radix stage accumulates O(radix) terms per output, so the largest prime
+    // factor enters the error bound linearly
+    int m = n, maxf = 1;
+    for (int f = 2; f*f <= m; f++)
+        while (m % f == 0) { m /= f; maxf = f; }
+    maxf = std::max(maxf, m);
+    return 32*eps*(std::log((double)n)/std::log(2.) + 2 + maxf/16.);
+}
+
+// max |a - b| relative to max |b|
+static double dxtRelDiff(const Mat& a, const Mat& b)
+{
+    double maxb = cvtest::norm(b, NORM_INF);
+    return cvtest::norm(a, b, NORM_INF)/std::max(maxb, 1e-300);
+}
+
+static Mat dxtRandom(RNG& rng, int rows, int cols, int type)
+{
+    Mat m(rows, cols, type);
+    cvtest::randUni(rng, m, Scalar::all(-1.), Scalar::all(1.));
+    return m;
+}
+
+TEST(Core_DFT, sweep_1d)
+{
+    RNG& rng = cvtest::TS::ptr()->get_rng();
+    std::vector<int> sizes = dxtSweepSizes();
+    for (size_t si = 0; si < sizes.size(); si++)
+    {
+        int n = sizes[si];
+        for (int depth = CV_32F; depth <= CV_64F; depth += CV_64F - CV_32F)
+        {
+            double thresh = dxtSweepThresh(depth, n);
+            for (int sc = 0; sc < 2; sc++)
+            {
+                int scale_flag = sc ? DFT_SCALE : 0;
+                SCOPED_TRACE(cv::format("n=%d depth=%d scale=%d", n, depth, sc));
+
+                // complex -> complex, forward and inverse, and the round trip
+                Mat x = dxtRandom(rng, 1, n, CV_MAKETYPE(depth, 2)), ref, out, back;
+                DFT_1D(x, ref, scale_flag);
+                cv::dft(x, out, scale_flag);
+                EXPECT_LE(dxtRelDiff(out, ref), thresh) << "C2C forward";
+                DFT_1D(x, ref, DFT_INVERSE | scale_flag);
+                cv::dft(x, out, DFT_INVERSE | scale_flag);
+                EXPECT_LE(dxtRelDiff(out, ref), thresh) << "C2C inverse";
+                cv::dft(x, out, 0);
+                cv::dft(out, back, DFT_INVERSE | DFT_SCALE);
+                EXPECT_LE(dxtRelDiff(back, x), thresh) << "C2C round trip";
+
+                // real -> CCS, real -> complex, and back
+                Mat xr = dxtRandom(rng, 1, n, depth), xc(1, n, CV_MAKETYPE(depth, 2)), full;
+                xc = Scalar::all(0);
+                cvtest::insert(xr, xc, 0);
+                DFT_1D(xc, ref, scale_flag);
+                cv::dft(xr, out, scale_flag);
+                ASSERT_EQ(out.type(), depth);
+                full.create(1, n, CV_MAKETYPE(depth, 2));
+                convertFromCCS(out, out, full, 0);
+                EXPECT_LE(dxtRelDiff(full, ref), thresh) << "R2C (CCS)";
+                cv::dft(xr, out, scale_flag | DFT_COMPLEX_OUTPUT);
+                ASSERT_EQ(out.type(), CV_MAKETYPE(depth, 2));
+                EXPECT_LE(dxtRelDiff(out, ref), thresh) << "R2C (complex output)";
+
+                cv::dft(xr, out, 0);
+                cv::dft(out, back, DFT_INVERSE | DFT_SCALE);            // CCS -> real
+                ASSERT_EQ(back.type(), depth);
+                EXPECT_LE(dxtRelDiff(back, xr), thresh) << "C2R (CCS input)";
+                cv::dft(xr, out, DFT_COMPLEX_OUTPUT);
+                cv::dft(out, back, DFT_INVERSE | DFT_SCALE | DFT_REAL_OUTPUT);   // complex -> real
+                ASSERT_EQ(back.type(), depth);
+                EXPECT_LE(dxtRelDiff(back, xr), thresh) << "C2R (complex input)";
+
+                // in-place
+                Mat y = x.clone();
+                cv::dft(y, y, scale_flag);
+                DFT_1D(x, ref, scale_flag);
+                EXPECT_LE(dxtRelDiff(y, ref), thresh) << "C2C in-place";
+                y = xr.clone();
+                cv::dft(y, y, scale_flag);
+                cv::dft(xr, out, scale_flag);
+                EXPECT_LE(dxtRelDiff(y, out), thresh) << "R2C in-place";
+                cv::dft(y, y, DFT_INVERSE | DFT_SCALE);
+                if (!sc)
+                {
+                    EXPECT_LE(dxtRelDiff(y, xr), thresh) << "C2R in-place";
+                }
+
+                // column vectors
+                Mat xcol = x.t(), refcol;
+                DFT_1D(xcol, refcol, scale_flag);
+                cv::dft(xcol, out, scale_flag);
+                EXPECT_LE(dxtRelDiff(out, refcol), thresh) << "C2C column";
+            }
+        }
+    }
+}
+
+// several rows through one plan (DFT_ROWS): every row must match the 1D transform of that row
+TEST(Core_DFT, sweep_rows)
+{
+    RNG& rng = cvtest::TS::ptr()->get_rng();
+    static const int sizes[] = { 1, 2, 3, 4, 5, 6, 8, 12, 15, 16, 30, 64, 100, 128, 243, 256, 1000, 1024 };
+    for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); si++)
+    {
+        int n = sizes[si], rows = 5;
+        for (int depth = CV_32F; depth <= CV_64F; depth += CV_64F - CV_32F)
+        {
+            double thresh = dxtSweepThresh(depth, n);
+            SCOPED_TRACE(cv::format("n=%d depth=%d", n, depth));
+            for (int cn = 1; cn <= 2; cn++)
+            {
+                for (int inv = 0; inv < 2; inv++)
+                {
+                    int flags = DFT_ROWS | (inv ? DFT_INVERSE | DFT_SCALE : 0);
+                    Mat x = dxtRandom(rng, rows, n, CV_MAKETYPE(depth, cn)), out, rowout;
+                    cv::dft(x, out, flags);
+                    for (int i = 0; i < rows; i++)
+                    {
+                        cv::dft(x.row(i), rowout, flags & ~DFT_ROWS);
+                        EXPECT_LE(dxtRelDiff(out.row(i), rowout), thresh) << "cn=" << cn << " inv=" << inv << " row " << i;
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST(Core_DCT, sweep_1d)
+{
+    RNG& rng = cvtest::TS::ptr()->get_rng();
+    std::vector<int> sizes = dxtSweepSizes();
+    for (size_t si = 0; si < sizes.size(); si++)
+    {
+        int n = sizes[si];
+        if (n % 2 != 0)
+            continue;   // cv::dct() supports even lengths only
+        for (int depth = CV_32F; depth <= CV_64F; depth += CV_64F - CV_32F)
+        {
+            double thresh = dxtSweepThresh(depth, n);
+            SCOPED_TRACE(cv::format("n=%d depth=%d", n, depth));
+            Mat x = dxtRandom(rng, 1, n, depth), ref, out, back;
+            DCT_1D(x, ref, 0);
+            cv::dct(x, out, 0);
+            EXPECT_LE(dxtRelDiff(out, ref), thresh) << "DCT";
+            DCT_1D(x, ref, DCT_INVERSE);
+            cv::dct(x, out, DCT_INVERSE);
+            EXPECT_LE(dxtRelDiff(out, ref), thresh) << "IDCT";
+            cv::dct(x, out, 0);
+            cv::dct(out, back, DCT_INVERSE);
+            EXPECT_LE(dxtRelDiff(back, x), thresh) << "DCT round trip";
+
+            // in-place
+            Mat y = x.clone();
+            cv::dct(y, y, 0);
+            EXPECT_LE(dxtRelDiff(y, out), thresh) << "DCT in-place";
+
+            // column vector (strided source/destination inside the engine)
+            Mat xcol = x.t(), refcol;
+            DCT_1D(xcol, refcol, 0);
+            cv::dct(xcol, out, 0);
+            EXPECT_LE(dxtRelDiff(out, refcol), thresh) << "DCT column";
+            DCT_1D(xcol, refcol, DCT_INVERSE);
+            cv::dct(xcol, out, DCT_INVERSE);
+            EXPECT_LE(dxtRelDiff(out, refcol), thresh) << "IDCT column";
+
+            // rows batch
+            Mat xm = dxtRandom(rng, 3, n, depth), outm, rowout;
+            cv::dct(xm, outm, DCT_ROWS);
+            for (int i = 0; i < 3; i++)
+            {
+                cv::dct(xm.row(i), rowout, 0);
+                EXPECT_LE(dxtRelDiff(outm.row(i), rowout), thresh) << "DCT rows, row " << i;
+            }
+        }
+    }
+}
+
+// large 2D / DFT_ROWS / DCT transforms go through the parallel path; they must match the
+// single-threaded result (same plan, different workspaces)
+TEST(Core_DFT, parallel_large)
+{
+    RNG& rng = cvtest::TS::ptr()->get_rng();
+    int nthreads0 = getNumThreads();
+    static const int sizes[][2] = { {1024, 1024}, {700, 1500}, {1, 1 << 20}, {1 << 18, 1}, {513, 2000} };
+    for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); si++)
+    {
+        int rows = sizes[si][0], cols = sizes[si][1];
+        for (int depth = CV_32F; depth <= CV_64F; depth += CV_64F - CV_32F)
+        {
+            double thresh = dxtSweepThresh(depth, std::max(rows, cols));
+            for (int cn = 1; cn <= 2; cn++)
+            {
+                static const int flag_sets[] = { 0, DFT_ROWS, DFT_INVERSE | DFT_SCALE, DFT_COMPLEX_OUTPUT,
+                                                 DFT_INVERSE | DFT_SCALE | DFT_REAL_OUTPUT };
+                for (size_t fi = 0; fi < sizeof(flag_sets)/sizeof(flag_sets[0]); fi++)
+                {
+                    int flags = flag_sets[fi];
+                    if ((flags & DFT_COMPLEX_OUTPUT) && cn != 1) continue;
+                    if ((flags & DFT_REAL_OUTPUT) && cn != 2) continue;
+                    SCOPED_TRACE(cv::format("%dx%d depth=%d cn=%d flags=%d", rows, cols, depth, cn, flags));
+                    Mat x = dxtRandom(rng, rows, cols, CV_MAKETYPE(depth, cn)), ref, out;
+                    if ((flags & DFT_INVERSE) && cn == 1)
+                    {
+                        Mat xr = dxtRandom(rng, rows, cols, depth);
+                        cv::dft(xr, x, 0);   // a valid CCS spectrum
+                    }
+                    setNumThreads(1);
+                    cv::dft(x, ref, flags);
+                    setNumThreads(nthreads0);
+                    cv::dft(x, out, flags);
+                    EXPECT_LE(dxtRelDiff(out, ref), thresh);
+                    if (cn == 1 && !(flags & (DFT_INVERSE | DFT_COMPLEX_OUTPUT)) && rows % 2 == 0 && cols % 2 == 0)
+                    {
+                        setNumThreads(1);
+                        cv::dct(x, ref, flags & DFT_ROWS ? DCT_ROWS : 0);
+                        setNumThreads(nthreads0);
+                        cv::dct(x, out, flags & DFT_ROWS ? DCT_ROWS : 0);
+                        EXPECT_LE(dxtRelDiff(out, ref), thresh) << "dct";
+                    }
+                }
+            }
+        }
+    }
+    setNumThreads(nthreads0);
+}
+
+// 2D transform with nonzero_rows (only the first rows of the input are non-zero; the rest is
+// not read on the forward pass, and only the first rows of the output are needed on the inverse)
+TEST(Core_DFT, nonzero_rows)
+{
+    RNG& rng = cvtest::TS::ptr()->get_rng();
+    static const int sizes[][2] = { {8, 16}, {15, 20}, {32, 32}, {60, 100}, {128, 96} };
+    for (size_t si = 0; si < sizeof(sizes)/sizeof(sizes[0]); si++)
+    {
+        int rows = sizes[si][0], cols = sizes[si][1];
+        for (int depth = CV_32F; depth <= CV_64F; depth += CV_64F - CV_32F)
+        {
+            double thresh = dxtSweepThresh(depth, rows*cols);
+            SCOPED_TRACE(cv::format("%dx%d depth=%d", rows, cols, depth));
+            for (int cn = 1; cn <= 2; cn++)
+            {
+                int nz = rows/2 + 1;
+                Mat x = dxtRandom(rng, rows, cols, CV_MAKETYPE(depth, cn));
+                x.rowRange(nz, rows) = Scalar::all(0);
+                Mat ref, out;
+                cv::dft(x, ref, 0);
+                cv::dft(x, out, 0, nz);
+                EXPECT_LE(dxtRelDiff(out, ref), thresh) << "forward, cn=" << cn;
+                Mat back, backref;
+                if (cn == 1)
+                {
+                    // real inverse (columns first, then rows): only the first nz output rows are computed
+                    cv::dft(ref, backref, DFT_INVERSE | DFT_SCALE);
+                    cv::dft(ref, back, DFT_INVERSE | DFT_SCALE, nz);
+                    EXPECT_LE(dxtRelDiff(back.rowRange(0, nz), backref.rowRange(0, nz)), thresh) << "inverse, cn=" << cn;
+                }
+                else
+                {
+                    // complex inverse (rows first, then columns): nonzero_rows refers to the input rows
+                    ref.rowRange(nz, rows) = Scalar::all(0);
+                    cv::dft(ref, backref, DFT_INVERSE | DFT_SCALE);
+                    cv::dft(ref, back, DFT_INVERSE | DFT_SCALE, nz);
+                    EXPECT_LE(dxtRelDiff(back, backref), thresh) << "inverse, cn=" << cn;
+                }
+            }
+        }
+    }
+}
 
 }} // namespace

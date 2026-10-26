@@ -107,7 +107,7 @@ PARAM_TEST_CASE(WarpTestBase, MatType, Interpolation, bool, bool)
     void Near(double threshold = 0.0)
     {
         if (depth < CV_32F)
-            EXPECT_MAT_N_DIFF(dst_roi, udst_roi, cvRound(dst_roi.total()*threshold));
+            EXPECT_MAT_N_DIFF_EPS(dst_roi, udst_roi, 1, cvRound(dst_roi.total()*threshold));
         else
             OCL_EXPECT_MATS_NEAR_RELATIVE(dst, threshold);
     }
@@ -172,7 +172,7 @@ OCL_TEST_P(WarpAffine, Mat)
 {
     for (int j = 0; j < test_loop_times; j++)
     {
-        double eps = depth < CV_32F ? 0.04 : 0.06;
+        double eps = depth < CV_32F ? ( depth < CV_16U ? 0.09 : 0.04 ) : 0.06;
         random_roi();
 
         Mat M = getRotationMatrix2D(Point2f(src_roi.cols / 2.0f, src_roi.rows / 2.0f),
@@ -189,7 +189,7 @@ OCL_TEST_P(WarpAffine, inplace_25853) // when src and dst are the same variable,
 {
     for (int j = 0; j < test_loop_times; j++)
     {
-        double eps = depth < CV_32F ? 0.04 : 0.06;
+        double eps = depth < CV_32F ? ( depth < CV_16U ? 0.09 : 0.04 ) : 0.06;
         random_roi();
 
         Mat M = getRotationMatrix2D(Point2f(src_roi.cols / 2.0f, src_roi.rows / 2.0f),

@@ -20,7 +20,8 @@ struct NormDiffInf_RVV {
     inline ST operator() (const T* src1, const T* src2, int n) const {
         ST s = 0;
         for (int i = 0; i < n; i++) {
-            s = std::max(s, (ST)std::abs(src1[i] - src2[i]));
+            ST v = (ST)cv_absdiff(src1[i], src2[i]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -31,7 +32,8 @@ struct NormDiffL1_RVV {
     inline ST operator() (const T* src1, const T* src2, int n) const {
         ST s = 0;
         for (int i = 0; i < n; i++) {
-            s += std::abs(src1[i] - src2[i]);
+            ST v = (ST)cv_absdiff(src1[i], src2[i]);
+            s += v;
         }
         return s;
     }
@@ -118,8 +120,8 @@ struct NormDiffInf_RVV<short, int> {
 };
 
 template<>
-struct NormDiffInf_RVV<int, int> {
-    int operator() (const int* src1, const int* src2, int n) const {
+struct NormDiffInf_RVV<int, unsigned> {
+    unsigned operator() (const int* src1, const int* src2, int n) const {
         int vlmax = __riscv_vsetvlmax_e32m8();
         auto s = __riscv_vmv_v_x_u32m8(0, vlmax);
         int vl;
@@ -127,8 +129,8 @@ struct NormDiffInf_RVV<int, int> {
             vl = __riscv_vsetvl_e32m8(n - i);
             auto v1 = __riscv_vle32_v_i32m8(src1 + i, vl);
             auto v2 = __riscv_vle32_v_i32m8(src2 + i, vl);
-            // auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
-            auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
+            auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
+            // auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
             s = __riscv_vmaxu_tu(s, s, v, vl);
         }
         return __riscv_vmv_x(__riscv_vredmaxu(s, __riscv_vmv_s_x_u32m1(0, __riscv_vsetvlmax_e32m1()), vlmax));
@@ -245,8 +247,8 @@ struct NormDiffL1_RVV<int, double> {
             vl = __riscv_vsetvl_e32m4(n - i);
             auto v1 = __riscv_vle32_v_i32m4(src1 + i, vl);
             auto v2 = __riscv_vle32_v_i32m4(src2 + i, vl);
-            // auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
-            auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
+            auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
+            // auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
             s = __riscv_vfadd_tu(s, s, __riscv_vfwcvt_f(v, vl), vl);
         }
         return __riscv_vfmv_f(__riscv_vfredosum(s, __riscv_vfmv_s_f_f64m1(0, __riscv_vsetvlmax_e64m1()), vlmax));
@@ -418,7 +420,7 @@ struct MaskedNormDiffInf_RVV {
         for( int i = 0; i < len; i++, src1 += cn, src2 += cn ) {
             if( mask[i] ) {
                 for( int k = 0; k < cn; k++ ) {
-                    s = std::max(s, (ST)std::abs(src1[k] - src2[k]));
+                    s = std::max(s, (ST)cv_absdiff(src1[k], src2[k]));
                 }
             }
         }
@@ -433,7 +435,7 @@ struct MaskedNormDiffL1_RVV {
         for( int i = 0; i < len; i++, src1 += cn, src2 += cn ) {
             if( mask[i] ) {
                 for( int k = 0; k < cn; k++ ) {
-                    s += std::abs(src1[k] - src2[k]);
+                    s += (ST)cv_absdiff(src1[k], src2[k]);
                 }
             }
         }
@@ -566,8 +568,8 @@ struct MaskedNormDiffInf_RVV<short, int> {
 };
 
 template<>
-struct MaskedNormDiffInf_RVV<int, int> {
-    int operator() (const int* src1, const int* src2, const uchar* mask, int len, int cn) const {
+struct MaskedNormDiffInf_RVV<int, unsigned> {
+    unsigned operator() (const int* src1, const int* src2, const uchar* mask, int len, int cn) const {
         int vlmax = __riscv_vsetvlmax_e32m8();
         auto s = __riscv_vmv_v_x_u32m8(0, vlmax);
         for (int cn_index = 0; cn_index < cn; cn_index++) {
@@ -576,8 +578,8 @@ struct MaskedNormDiffInf_RVV<int, int> {
                 vl = __riscv_vsetvl_e32m8(len - i);
                 auto v1 = __riscv_vlse32_v_i32m8(src1 + cn * i + cn_index, sizeof(int) * cn, vl);
                 auto v2 = __riscv_vlse32_v_i32m8(src2 + cn * i + cn_index, sizeof(int) * cn, vl);
-                // auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
-                auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
+                auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
+                // auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
                 auto m = __riscv_vle8_v_u8m2(mask + i, vl);
                 auto b = __riscv_vmsne(m, 0, vl);
                 s = __riscv_vmaxu_tumu(b, s, s, v, vl);
@@ -759,8 +761,8 @@ struct MaskedNormDiffL1_RVV<int, double> {
                 vl = __riscv_vsetvl_e32m4(len - i);
                 auto v1 = __riscv_vlse32_v_i32m4(src1 + cn * i + cn_index, sizeof(int) * cn, vl);
                 auto v2 = __riscv_vlse32_v_i32m4(src2 + cn * i + cn_index, sizeof(int) * cn, vl);
-                // auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
-                auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
+                auto v = common::__riscv_vabd(v1, v2, vl); // 5.x
+                // auto v = common::__riscv_vabs(__riscv_vsub(v1, v2, vl), vl); // 4.x
                 auto m = __riscv_vle8_v_u8m1(mask + i, vl);
                 auto b = __riscv_vmsne(m, 0, vl);
                 s = __riscv_vfadd_tumu(b, s, s, __riscv_vfwcvt_f(b, v, vl), vl);
@@ -1068,7 +1070,7 @@ CV_HAL_RVV_DEF_NORM_DIFF_ALL(8u, uchar, int, int, int)
 CV_HAL_RVV_DEF_NORM_DIFF_ALL(8s, schar, int, int, int)
 CV_HAL_RVV_DEF_NORM_DIFF_ALL(16u, ushort, int, int, double)
 CV_HAL_RVV_DEF_NORM_DIFF_ALL(16s, short, int, int, double)
-CV_HAL_RVV_DEF_NORM_DIFF_ALL(32s, int, int, double, double)
+CV_HAL_RVV_DEF_NORM_DIFF_ALL(32s, int, unsigned, double, double)
 CV_HAL_RVV_DEF_NORM_DIFF_ALL(32f, float, float, double, double)
 CV_HAL_RVV_DEF_NORM_DIFF_ALL(64f, double, double, double, double)
 
@@ -1089,25 +1091,27 @@ int normDiff(const uchar* src1, size_t src1_step, const uchar* src2, size_t src2
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
     }
 
-    // [FIXME] append 0's when merging to 5.x
     static NormDiffFunc norm_diff_tab[3][CV_DEPTH_MAX] = {
         {
             (NormDiffFunc)(normDiffInf_8u),  (NormDiffFunc)(normDiffInf_8s),
             (NormDiffFunc)(normDiffInf_16u), (NormDiffFunc)(normDiffInf_16s),
             (NormDiffFunc)(normDiffInf_32s), (NormDiffFunc)(normDiffInf_32f),
             (NormDiffFunc)(normDiffInf_64f), 0,
+            0, 0, 0, 0, 0, 0,
         },
         {
             (NormDiffFunc)(normDiffL1_8u),  (NormDiffFunc)(normDiffL1_8s),
             (NormDiffFunc)(normDiffL1_16u), (NormDiffFunc)(normDiffL1_16s),
             (NormDiffFunc)(normDiffL1_32s), (NormDiffFunc)(normDiffL1_32f),
             (NormDiffFunc)(normDiffL1_64f), 0,
+            0, 0, 0, 0, 0, 0,
         },
         {
             (NormDiffFunc)(normDiffL2_8u),  (NormDiffFunc)(normDiffL2_8s),
             (NormDiffFunc)(normDiffL2_16u), (NormDiffFunc)(normDiffL2_16s),
             (NormDiffFunc)(normDiffL2_32s), (NormDiffFunc)(normDiffL2_32f),
             (NormDiffFunc)(normDiffL2_64f), 0,
+            0, 0, 0, 0, 0, 0,
         },
     };
 

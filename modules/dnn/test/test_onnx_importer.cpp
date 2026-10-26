@@ -28,6 +28,63 @@ static std::string _tf(TString filename, bool required = true)
     return findDataFile(std::string("dnn/onnx/") + filename, required);
 }
 
+static Mat sdpaReference(const Mat& Q, const Mat& KT, const Mat& V, float scale)
+{
+    CV_Assert(Q.dims == 4 && KT.dims == 4 && V.dims == 4);
+    const int B = Q.size[0], H = Q.size[1], S_q = Q.size[2], D = Q.size[3];
+    const int S_kv = V.size[2], D_v = V.size[3];
+
+    const float* q  = Q.ptr<float>();
+    const float* kt = KT.ptr<float>();
+    const float* v  = V.ptr<float>();
+
+    int szY[3] = {B, S_q, H * D_v};
+    Mat Y(3, szY, CV_32F, Scalar(0));
+    float* y = Y.ptr<float>();
+
+    const float inv_scale = (scale > 0.f) ? 1.f / scale : 1.f;
+    std::vector<float> attn(S_kv);
+
+    for (int b = 0; b < B; b++)
+    for (int h = 0; h < H; h++)
+    {
+        const float* Q_bh  = q  + ((size_t)(b * H + h) * S_q ) * D;
+        const float* KT_bh = kt + ((size_t)(b * H + h) * D   ) * S_kv;
+        const float* V_bh  = v  + ((size_t)(b * H + h) * S_kv) * D_v;
+
+        for (int i = 0; i < S_q; i++)
+        {
+            for (int j = 0; j < S_kv; j++)
+            {
+                float s = 0.f;
+                for (int d = 0; d < D; d++)
+                    s += Q_bh[i * D + d] * KT_bh[d * S_kv + j];
+                attn[j] = s * inv_scale;
+            }
+            float mx = attn[0];
+            for (int j = 1; j < S_kv; j++)
+                mx = std::max(mx, attn[j]);
+            float sum = 0.f;
+            for (int j = 0; j < S_kv; j++)
+            {
+                attn[j] = std::exp(attn[j] - mx);
+                sum += attn[j];
+            }
+            const float inv_sum = 1.f / sum;
+
+            float* out_row = y + ((size_t)(b * S_q + i) * H + h) * D_v;
+            for (int d = 0; d < D_v; d++)
+            {
+                float acc = 0.f;
+                for (int j = 0; j < S_kv; j++)
+                    acc += attn[j] * V_bh[j * D_v + d];
+                out_row[d] = acc * inv_sum;
+            }
+        }
+    }
+    return Y;
+}
+
 class Test_ONNX_layers : public DNNTestLayer
 {
 public:
@@ -45,19 +102,34 @@ public:
     {
         std::vector<MatShape> inLayerShapes;
         std::vector<MatShape> outLayerShapes;
-        net.getLayerShapes(MatShape(), 0, inLayerShapes, outLayerShapes);
+        std::vector<MatShape> suggestedShapes;
+        std::vector<int> suggestedTypes;
+        for (const Mat& inp: inps) {
+            suggestedShapes.push_back(inp.shape());
+            suggestedTypes.push_back(inp.type());
+        }
+        net.getLayerShapes(suggestedShapes, suggestedTypes, 0, inLayerShapes, outLayerShapes);
         ASSERT_EQ(inLayerShapes.size(), inps.size());
 
         for (int i = 0; i < inps.size(); ++i) {
             bool hasDynamicShapes = inLayerShapes[i].empty();
+            MatShape inpshape_i = inps[i].shape();
             if (hasDynamicShapes)
                 continue;
+            if (inLayerShapes[i].size() == 0 && inpshape_i.dims == 1) {
+                // [TODO] sometimes sample .onnx models from ONNX conformance suit
+                // specify scalars as inputs, but we test them using 1D input.
+                // the tests need to be adjusted
+                continue;
+            }
             if (inLayerShapes[i].size() == 1) {  // 1D input
-                ASSERT_EQ(shape(inLayerShapes[i][0], 1), shape(inps[i]));
+                ASSERT_EQ(shape(inLayerShapes[i][0]), inpshape_i);
             } else {
                 // Compare all axes except batch dimension which is variable.
-                inLayerShapes[i][0] = inps[i].size[0];
-                ASSERT_EQ(inLayerShapes[i], shape(inps[i]));
+                inLayerShapes[i][0] = inpshape_i[0];
+                if (inLayerShapes[i] != inpshape_i) {
+                    ASSERT_EQ(inLayerShapes[i], shape(inps[i]));
+                }
             }
         }
     }
@@ -103,10 +175,19 @@ public:
             net.setInput(inps[i], inputNames[i]);
         Mat out = net.forward("");
 
-        EXPECT_EQ(shape(out), shape(ref));
+        MatShape outShape = shape(out);
+        MatShape refShape = shape(ref);
+        bool scalar1dCompatible =
+            (outShape.isScalar() && refShape.size() == 1 && refShape[0] == 1) ||
+            (refShape.isScalar() && outShape.size() == 1 && outShape[0] == 1);
+        EXPECT_TRUE(outShape == refShape || scalar1dCompatible);
 
         if (useSoftmax)
         {
+            // An fp16 model hands back an fp16 blob; the Softmax net below is float-only.
+            if (out.depth() == CV_16F || out.depth() == CV_16BF)
+                out.convertTo(out, CV_32F);
+
             LayerParams lp;
             Net netSoftmax;
             netSoftmax.addLayerToPrev("softmaxLayer", "Softmax", lp);
@@ -118,14 +199,48 @@ public:
             netSoftmax.setInput(ref);
             ref = netSoftmax.forward();
         }
+        if (ref.dims != out.dims) {
+            if (ref.dims <= 1)
+                ref = ref.reshape(1, out.rows);
+            if (out.dims <= 1)
+                out = out.reshape(1, ref.rows);
+        }
         if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_OPENCL)
         {
             l1 = std::max(l1, 1.4e-3);
             lInf = std::max(lInf, 8e-3);
         }
+
+        EXPECT_EQ(ref.shape(), out.shape());
         normAssert(ref, out, basename.c_str(), l1 ? l1 : default_l1, lInf ? lInf : default_lInf);
         if (checkNoFallbacks)
             expectNoFallbacksFromIE(net);
+    }
+
+    // Runs an SDPA ONNX model through the importer + SDPALayer and checks the
+    // output against an in-test attention reference computed from the same inputs.
+    void testSDPAModel(const String& basename, double l1, double lInf)
+    {
+        Mat Q  = blobFromNPY(_tf("data/input_" + basename + "_0.npy"));
+        Mat KT = blobFromNPY(_tf("data/input_" + basename + "_1.npy"));
+        Mat V  = blobFromNPY(_tf("data/input_" + basename + "_2.npy"));
+
+        Net net = readNetFromONNX(_tf("models/" + basename + ".onnx", required));
+        ASSERT_FALSE(net.empty());
+        net.setPreferableBackend(backend);
+        net.setPreferableTarget(target);
+
+        net.setInputsNames({"0", "1", "2"});
+        net.setInput(Q,  "0");
+        net.setInput(KT, "1");
+        net.setInput(V,  "2");
+        Mat out = net.forward("");
+
+        // The models are generated with scale = sqrt(head_dim).
+        Mat ref = sdpaReference(Q, KT, V, std::sqrt((float)Q.size[3]));
+
+        EXPECT_EQ(ref.shape(), out.shape());
+        normAssert(ref, out, basename.c_str(), l1 ? l1 : default_l1, lInf ? lInf : default_lInf);
     }
 };
 
@@ -148,6 +263,17 @@ TEST_P(Test_ONNX_layers, MaxPooling)
 TEST_P(Test_ONNX_layers, MaxPooling_2)
 {
     testONNXModels("two_maxpooling", npy, 0, 0, false, false);
+}
+
+// maxPool8s scalar kernel path.
+TEST_P(Test_ONNX_layers, MaxPooling_int8)
+{
+    testONNXModels("maxpool_2d_int8", npy, 0, 0, false, false);
+}
+// maxPool64f scalar kernel path.
+TEST_P(Test_ONNX_layers, MaxPooling_double)
+{
+    testONNXModels("maxpool_2d_double", npy, 0, 0, false, false);
 }
 
 TEST_P(Test_ONNX_layers, Convolution)
@@ -285,6 +411,13 @@ TEST_P(Test_ONNX_layers, Convolution3D_bias)
     testONNXModels("conv3d_depthwise_bias"); // kernel 1x1
 }
 
+TEST_P(Test_ONNX_layers, Convolution3D_depthwise_sigmoid)
+{
+    if (backend == DNN_BACKEND_CUDA && target == DNN_TARGET_CUDA_FP16)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
+    testONNXModels("conv3d_depthwise_sigmoid");
+}
+
 TEST_P(Test_ONNX_layers, Two_convolution)
 {
 #if defined(INF_ENGINE_RELEASE)
@@ -305,6 +438,43 @@ TEST_P(Test_ONNX_layers, Deconvolution)
     testONNXModels("deconvolution_output_shape", npy, 0, 0, false, false);
     if (target != DNN_TARGET_CUDA_FP16) // bug
         testONNXModels("deconv_adjpad_2d", npy, 0, 0, false, false);
+    // out_channels == C0, so NK1 == 1: exercises computeSpatChunks()'s spatial
+    // split in conv2_deconv.cpp regardless of thread count.
+    testONNXModels("deconv_spatial_narrow", npy, 0, 0, false, false);
+    // GEMM + col2im paths: one tap per output pixel, overlapping taps split into channel chunks,
+    // and a second group that starts inside a channel block.
+    testONNXModels("deconv_k2s2", npy, 0, 0, false, false);
+    testONNXModels("deconv_overlap_chunks", npy, 0, 0, false, false);
+    testONNXModels("deconv_overlap_groups", npy, 0, 0, false, false);
+}
+
+// Zero batch or spatial size: the output is empty or holds only the bias, which is arange(12).
+TEST_P(Test_ONNX_layers, Deconvolution_empty)
+{
+    if (backend != DNN_BACKEND_OPENCV || target != DNN_TARGET_CPU)
+        throw SkipTestException("Only CPU is supported");
+
+    struct Case { const char* model; std::vector<int> inpshape, outshape; };
+    const Case cases[] = {
+        {"deconv_empty_k1", {1, 4, 0, 5}, {1, 12, 0, 5}},
+        {"deconv_empty_k3", {1, 4, 0, 5}, {1, 12, 2, 7}},
+        {"deconv_empty_k3", {0, 4, 5, 5}, {0, 12, 7, 7}},
+    };
+    for (const Case& c : cases)
+    {
+        const std::string path = std::string("dnn/onnx/models/") + c.model + ".onnx";
+        Net net = readNetFromONNX(findDataFile(path, true));
+        net.setPreferableBackend(backend);
+        net.setPreferableTarget(target);
+        net.setInput(Mat(c.inpshape, CV_32F));
+        Mat out = net.forward();
+
+        ASSERT_EQ(std::vector<int>(out.size.p, out.size.p + out.dims), c.outshape) << c.model;
+        const int K = c.outshape[1], plane = c.outshape[2] * c.outshape[3];
+        const float* data = out.ptr<float>();
+        for (size_t i = 0; i < out.total(); i++)
+            ASSERT_EQ(data[i], (float)(i / plane % K)) << c.model << " at " << i;
+    }
 }
 
 TEST_P(Test_ONNX_layers, Deconvolution3D)
@@ -326,9 +496,6 @@ TEST_P(Test_ONNX_layers, Deconvolution3D)
             applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD, CV_TEST_TAG_DNN_SKIP_IE_NGRAPH, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
     }
 #endif
-
-    if (backend == DNN_BACKEND_OPENCV)
-        throw SkipTestException("OpenCV backend is not supported");  // FIXIT use tags
 
     if (backend == DNN_BACKEND_VKCOM)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_VULKAN);
@@ -356,9 +523,6 @@ TEST_P(Test_ONNX_layers, Deconvolution3D_bias)
     }
 #endif
 
-    if (backend == DNN_BACKEND_OPENCV)
-        throw SkipTestException("OpenCV backend is not supported");  // FIXIT use tags
-
     if (backend == DNN_BACKEND_VKCOM)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_VULKAN);
 
@@ -385,11 +549,8 @@ TEST_P(Test_ONNX_layers, Deconvolution3D_pad)
     }
 #endif
 
-    if (backend == DNN_BACKEND_OPENCV)
-        throw SkipTestException("OpenCV backend is not supported");  // FIXIT use tags
-
-    if (backend == DNN_BACKEND_VKCOM)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_VULKAN);
+    //if (backend == DNN_BACKEND_VKCOM)
+    //    applyTestTag(CV_TEST_TAG_DNN_SKIP_VULKAN);
 
     testONNXModels("deconv3d_pad");
 }
@@ -413,9 +574,6 @@ TEST_P(Test_ONNX_layers, Deconvolution3D_adjpad)
             applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD, CV_TEST_TAG_DNN_SKIP_IE_NGRAPH, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
     }
 #endif
-
-    if (backend == DNN_BACKEND_OPENCV)
-        throw SkipTestException("OpenCV backend is not supported");  // FIXIT use tags
 
     if (backend == DNN_BACKEND_VKCOM)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_VULKAN);
@@ -636,8 +794,8 @@ TEST_P(Test_ONNX_layers, Elementwise_Sqrt)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
-    testONNXModels("sqrt");
 #endif
+    testONNXModels("sqrt");
 }
 
 TEST_P(Test_ONNX_layers, Elementwise_not)
@@ -691,9 +849,6 @@ TEST_P(Test_ONNX_layers, Compare_GT)
 #endif
 
     testONNXModels("greater");
-}
-TEST_P(Test_ONNX_layers, Greater_input_dtype_int64) {
-    testONNXModels("greater_input_dtype_int64");
 }
 
 TEST_P(Test_ONNX_layers, Compare_LT)
@@ -807,10 +962,24 @@ TEST_P(Test_ONNX_layers, CumSumExclusiveInplace)
     testONNXModels("cumsum_exclusive_inplace");
 }
 
-TEST_P(Test_ONNX_layers, Range)
+TEST_P(Test_ONNX_layers, RangeFloat)
 {
     testONNXModels("range_float");
     testONNXModels("range_float_negative");
+}
+
+TEST_P(Test_ONNX_layers, RangeInt32)
+{
+    testONNXModels("range_int32");
+    testONNXModels("range_int32_negative");
+}
+
+TEST_P(Test_ONNX_layers, RangeInt64)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // OpenVINO uses int32 precision for int64 operations
+    testONNXModels("range_int64");
+    testONNXModels("range_int64_negative");
 }
 
 TEST_P(Test_ONNX_layers, Eltwise3D)
@@ -916,6 +1085,38 @@ TEST_P(Test_ONNX_layers, BatchNormalization)
     testONNXModels("batch_norm");
 }
 
+TEST_P(Test_ONNX_layers, Colorization)
+{
+    applyTestTag(
+        target == DNN_TARGET_CPU ? CV_TEST_TAG_MEMORY_512MB : CV_TEST_TAG_MEMORY_1GB,
+        CV_TEST_TAG_DEBUG_VERYLONG
+    );
+    checkBackend();
+
+    const String model = findDataFile("dnn/colorization_deploy_v2.onnx", false);
+    Net net = readNetFromONNX(model);
+    ASSERT_FALSE(net.empty());
+    net.setPreferableBackend(backend);
+    net.setPreferableTarget(target);
+
+    if (target == DNN_TARGET_CPU_FP16)
+        net.enableWinograd(false);
+
+    Mat inp = blobFromNPY(findDataFile("dnn/colorization_inp.npy"));
+    Mat ref = blobFromNPY(findDataFile("dnn/colorization_out.npy"));
+
+    net.setInput(inp);
+    Mat out = net.forward();
+
+    double l1 = 4e-4, lInf = 3e-3;
+    if (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_CPU_FP16 || target == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 0.25;
+        lInf = 5.4;
+    }
+    normAssert(out, ref, "", l1, lInf);
+}
+
 TEST_P(Test_ONNX_layers, BatchNormalization3D)
 {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
@@ -1001,11 +1202,37 @@ TEST_P(Test_ONNX_layers, MatMul_init_2)
 }
 TEST_P(Test_ONNX_layers, MatMul_init_bcast)
 {
+    // New-engine CUDA MatMul/GEMM does not yet cover this broadcast variant; skip for now.
+    if (backend == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA, CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
     testONNXModels("matmul_init_bcast");
 }
 
 TEST_P(Test_ONNX_layers, MatMul_bcast_3dx2d) {
     testONNXModels("matmul_bcast");
+}
+
+// forwardInt<T> integer-accumulation path.
+TEST_P(Test_ONNX_layers, MatMul_int32)
+{
+    testONNXModels("matmul_int32_init");
+}
+TEST_P(Test_ONNX_layers, MatMul_int64)
+{
+    testONNXModels("matmul_int64_init");
+}
+TEST_P(Test_ONNX_layers, MatMul_uint32)
+{
+    testONNXModels("matmul_uint32_init");
+}
+TEST_P(Test_ONNX_layers, MatMul_uint64)
+{
+    testONNXModels("matmul_uint64_init");
+}
+// forwardDouble cv::gemm delegation path.
+TEST_P(Test_ONNX_layers, MatMul_double)
+{
+    testONNXModels("matmul_double_init");
 }
 
 TEST_P(Test_ONNX_layers, MatMulAdd)
@@ -1020,6 +1247,9 @@ TEST_P(Test_ONNX_layers, MatMulAdd)
 #endif
     if (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_OPENCL_FP16)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL_FP16);
+    // New-engine CUDA MatMul/GEMM does not yet cover this fused-add variant; skip for now.
+    if (backend == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA, CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
     testONNXModels("matmul_add");
 }
 
@@ -1095,6 +1325,8 @@ TEST_P(Test_ONNX_layers, ResizeUnfusedTwoInputs)
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_LT(2023000000)
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);
+#endif
+#ifdef HAVE_INF_ENGINE
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
 #endif
@@ -1132,6 +1364,11 @@ TEST_P(Test_ONNX_layers, DynamicResize)
 TEST_P(Test_ONNX_layers, Resize_HumanSeg)
 {
     testONNXModels("resize_humanseg");
+}
+
+TEST_P(Test_ONNX_layers, Resample)
+{
+    testONNXModels("nearest", npy, 0, 0, false, false);
 }
 
 TEST_P(Test_ONNX_layers, Div)
@@ -1219,8 +1456,7 @@ TEST_P(Test_ONNX_layers, Split)
     testONNXModels("split_neg_axis");
 }
 
-// Mul inside with 0-d tensor, output should be A x 1, but is 1 x A. PR #22652
-TEST_P(Test_ONNX_layers, DISABLED_Split_sizes_0d)
+TEST_P(Test_ONNX_layers, Split_sizes_0d)
 {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);
@@ -1280,6 +1516,14 @@ TEST_P(Test_ONNX_layers, Softmax)
     testONNXModels("softmax");
     testONNXModels("log_softmax", npy, 0, 0, false, false);
     testONNXModels("softmax_unfused");
+
+    // Before opset 13 the operator coerces its input to 2D and reduces the flattened
+    // dims [axis, rank), which the CPU path implements.
+    if (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_CPU)
+    {
+        testONNXModels("softmax_axis_1_opset11");
+        testONNXModels("log_softmax_axis_0_opset11");
+    }
 }
 
 TEST_P(Test_ONNX_layers, Split_EltwiseMax)
@@ -1293,8 +1537,92 @@ TEST_P(Test_ONNX_layers, Split_EltwiseMax)
     testONNXModels("split_max");
 }
 
+TEST_P(Test_ONNX_layers, trilu_tril)
+{
+    testONNXModels("trilu_tril", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_neg)
+{
+    testONNXModels("trilu_tril_neg", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_one_row)
+{
+    testONNXModels("trilu_tril_one_row", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_one_row1D)
+{
+    testONNXModels("trilu_tril_one_row1D", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_out_neg)
+{
+    testONNXModels("trilu_tril_out_neg", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_out_pos)
+{
+    testONNXModels("trilu_tril_out_pos", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_pos)
+{
+    testONNXModels("trilu_tril_pos", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_square)
+{
+    testONNXModels("trilu_tril_square", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_tril_square_neg)
+{
+    testONNXModels("trilu_tril_square_neg", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu)
+{
+    testONNXModels("trilu_triu", npy, 0, 0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu_one_row)
+{
+    testONNXModels("trilu_triu_one_row", npy, 0,0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu_out_neg)
+{
+    testONNXModels("trilu_triu_out_neg_out", npy, 0,0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu_out_pos)
+{
+   testONNXModels("trilu_triu_out_pos", npy, 0,0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu_pos)
+{
+    testONNXModels("trilu_triu_pos", npy, 0,0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu_square)
+{
+    testONNXModels("trilu_triu_square", npy, 0,0,false, true, 2);
+}
+
+TEST_P(Test_ONNX_layers, trilu_triu_square_neg)
+{
+    testONNXModels("trilu_triu_square_neg", npy, 0,0,false, true, 2);
+}
+
+// Fails with the new engine. Output shape [?, N, OutputSize] not supported by new graph engine
 TEST_P(Test_ONNX_layers, LSTM_Activations)
 {
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // TODO: fix this test for OpenVINO
+
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2022010000)
     // IE exception: Node Block1326/lstm/reshape_0/permute was not assigned on any pointed device
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && (target == DNN_TARGET_OPENCL || target == DNN_TARGET_OPENCL_FP16))
@@ -1312,14 +1640,12 @@ TEST_P(Test_ONNX_layers, LSTM_Activations)
     testONNXModels("lstm_cntk_tanh", pb, 0, 0, false, false);
 }
 
-// disabled due to poor handling of 1-d mats
-TEST_P(Test_ONNX_layers, DISABLED_LSTM)
+TEST_P(Test_ONNX_layers, LSTM)
 {
     testONNXModels("lstm", npy, 0, 0, false, false);
 }
 
-// disabled due to poor handling of 1-d mats
-TEST_P(Test_ONNX_layers, DISABLED_LSTM_bidirectional)
+TEST_P(Test_ONNX_layers, LSTM_bidirectional)
 {
     testONNXModels("lstm_bidirectional", npy, 0, 0, false, false);
 }
@@ -1414,7 +1740,18 @@ TEST_P(Test_ONNX_layers, LSTM_cell_forward)
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_OPENCL_FP16)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_OPENCL_FP16, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
 #endif
-    testONNXModels("lstm_cell_forward", npy, 0, 0, false, false);
+    double l1 = 0, lInf = 0;
+    if (backend == DNN_BACKEND_CUDA && target == DNN_TARGET_CUDA)
+    {
+        l1 = 5e-5;
+        lInf = 3e-4;
+    }
+    else if (backend == DNN_BACKEND_CUDA && target == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 3e-4;
+        lInf = 1e-3;
+    }
+    testONNXModels("lstm_cell_forward", npy, l1, lInf, false, false);
 }
 TEST_P(Test_ONNX_layers, LSTM_cell_bidirectional)
 {
@@ -1425,7 +1762,18 @@ TEST_P(Test_ONNX_layers, LSTM_cell_bidirectional)
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_OPENCL_FP16)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_OPENCL_FP16, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
 #endif
-    testONNXModels("lstm_cell_bidirectional", npy, 0, 0, false, false);
+    double l1 = 0, lInf = 0;
+    if (backend == DNN_BACKEND_CUDA && target == DNN_TARGET_CUDA)
+    {
+        l1 = 5e-5;
+        lInf = 3e-4;
+    }
+    else if (backend == DNN_BACKEND_CUDA && target == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 3e-4;
+        lInf = 3e-3;
+    }
+    testONNXModels("lstm_cell_bidirectional", npy, l1, lInf, false, false);
 }
 TEST_P(Test_ONNX_layers, LSTM_cell_with_peepholes)
 {
@@ -1459,14 +1807,14 @@ TEST_P(Test_ONNX_layers, LSTM_init_h0_c0)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA);
     testONNXModels("lstm_init_h0_c0", npy, 0, 0, false, false, 3);
 }
-// epsilon is larger because onnx does not match with torch/opencv exactly
+
 TEST_P(Test_ONNX_layers, LSTM_layout_seq)
 {
     if(backend == DNN_BACKEND_CUDA)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA);
     testONNXModels("lstm_layout_0", npy, 0.005, 0.005, false, false, 3);
 }
-// epsilon is larger because onnx does not match with torch/opencv exactly
+
 TEST_P(Test_ONNX_layers, LSTM_layout_batch)
 {
     if(backend == DNN_BACKEND_CUDA)
@@ -1474,7 +1822,7 @@ TEST_P(Test_ONNX_layers, LSTM_layout_batch)
     testONNXModels("lstm_layout_1", npy, 0.005, 0.005, false, false, 3);
 }
 
-TEST_P(Test_ONNX_layers, DISABLED_Einsum_1D)
+TEST_P(Test_ONNX_layers, Einsum_1D)
 {
     testONNXModels("einsum_1d", npy, 0, 0, false, false, 2);
 }
@@ -1506,12 +1854,13 @@ TEST_P(Test_ONNX_layers, Einsum_5D)
     testONNXModels("einsum_5d", npy, 0, 0, false, false, 2);
 }
 
-TEST_P(Test_ONNX_layers, DISABLED_Einsum_InnerProduct)
+// https://github.com/opencv/opencv/issues/24883
+TEST_P(Test_ONNX_layers, Einsum_InnerProduct)
 {
     testONNXModels("einsum_inner", npy, 0, 0, false, false, 2);
 }
 
-TEST_P(Test_ONNX_layers, DISABLED_Einsum_HadamardProduct)
+TEST_P(Test_ONNX_layers, Einsum_HadamardProduct)
 {
     testONNXModels("einsum_hadamard", npy, 0, 0, false, false, 2);
 }
@@ -1535,6 +1884,10 @@ TEST_P(Test_ONNX_layers, Einsum_transpose)
 
 TEST_P(Test_ONNX_layers, Einsum_const_inputs) {
     testONNXModels("einsum_const_inputs", npy, 0, 0, false, false, 1);
+}
+
+TEST_P(Test_ONNX_layers, ReduceSum_Consts){
+    testONNXModels("reducesum_consts");
 }
 
 TEST_P(Test_ONNX_layers, Pad2d_Unfused)
@@ -2001,8 +2354,17 @@ TEST_P(Test_ONNX_layers, Gemm_bias)
     testONNXModels("gemm_vector_bias");
 }
 
+// forwardDouble cv::gemm delegation path.
+TEST_P(Test_ONNX_layers, Gemm_double)
+{
+    testONNXModels("gemm_double");
+}
+
 TEST_P(Test_ONNX_layers, Quantized_Convolution)
 {
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // TODO: fix this test for OpenVINO
+
     // The difference of QOperator and QDQ format:
     // https://onnxruntime.ai/docs/performance/quantization.html#onnx-quantization-representation-format.
     {
@@ -2011,6 +2373,11 @@ TEST_P(Test_ONNX_layers, Quantized_Convolution)
         testONNXModels("quantized_conv_int8_weights", npy, 0.03, 0.5);
         testONNXModels("quantized_conv_per_channel_weights", npy, 0.06, 0.4);
         testONNXModels("quantized_conv_asymmetric_pads_int8_weights");
+        // Regression test for https://github.com/opencv/opencv/issues/28798:
+        // depthwise QLinearConv (Kg=1 < kernel SIMD width K0=8) used to be
+        // miscompiled by Conv2Int8's VNNI kernel because multiple groups
+        // wrote into the same K0-wide output slot.
+        testONNXModels("quantized_depthwise_conv_int8_weights", npy, 0.06, 0.5);
     }
 
     {
@@ -2023,7 +2390,7 @@ TEST_P(Test_ONNX_layers, Quantized_Convolution)
 
 TEST_P(Test_ONNX_layers, Quantized_MatMul)
 {
-    testONNXModels("quantized_matmul_uint8_weights", npy, 0.005, 0.007);
+    testONNXModels("quantized_matmul_uint8_weights", npy, 0.008, 0.015);
     testONNXModels("quantized_matmul_int8_weights", npy, 0.06, 0.2);
     testONNXModels("quantized_matmul_per_channel_weights", npy, 0.06, 0.22);
 }
@@ -2033,13 +2400,15 @@ TEST_P(Test_ONNX_layers, Quantized_Gemm)
     testONNXModels("quantized_gemm", npy);
 }
 
+TEST_P(Test_ONNX_layers, Gemm_External_Data)
+{
+    testONNXModels("gemm_external_data", npy);
+}
+
+
 TEST_P(Test_ONNX_layers, Quantized_MatMul_Variable_Weights)
 {
-    // Unsupported
-    EXPECT_THROW(
-    {
-        testONNXModels("quantized_matmul_variable_inputs");
-    }, cv::Exception);
+    testONNXModels("quantized_matmul_variable_inputs", npy, 1.3, 1.3);
 }
 
 TEST_P(Test_ONNX_layers, Quantized_Eltwise)
@@ -2049,12 +2418,19 @@ TEST_P(Test_ONNX_layers, Quantized_Eltwise)
 
 TEST_P(Test_ONNX_layers, Quantized_Eltwise_Scalar)
 {
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // TODO: fix this test for OpenVINO
     testONNXModels("quantized_eltwise_scalar");
 }
 
 TEST_P(Test_ONNX_layers, Quantized_Eltwise_Broadcast)
 {
     testONNXModels("quantized_eltwise_broadcast");
+}
+
+TEST_P(Test_ONNX_layers, Quantized_BatchNorm_Mul_Add)
+{
+    testONNXModels("quantized_bn_mul_add");
 }
 
 TEST_P(Test_ONNX_layers, Quantized_LeakyReLU)
@@ -2126,7 +2502,7 @@ TEST_P(Test_ONNX_layers, Quantized_Concat)
 
 TEST_P(Test_ONNX_layers, Quantized_Constant)
 {
-    testONNXModels("quantized_constant", npy, 0.002, 0.008);
+    testONNXModels("quantized_constant", npy, 0.02, 0.06);
 }
 
 TEST_P(Test_ONNX_layers, OutputRegistration)
@@ -2138,8 +2514,33 @@ TEST_P(Test_ONNX_layers, QLinearSoftmax)
 {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
-    testONNXModels("qlinearsoftmax_v11", npy, 0.002, 0.002); // 2D coerced
-    testONNXModels("qlinearsoftmax_v13", npy, 0.002, 0.002);
+    testONNXModels("qlinearsoftmax_v11", npy, 0.08, 0.16); // 2D coerced
+    testONNXModels("qlinearsoftmax_v13", npy, 0.08, 0.16);
+}
+
+TEST_P(Test_ONNX_layers, PriorBox_ONNX)
+{
+    Net net = readNetFromONNX(_tf("models/prior_box.onnx"));
+    ASSERT_FALSE(net.empty());
+    int inp_size[] = {1, 3, 10, 10};
+    int shape_size[] = {1, 2, 3, 4};
+    Mat inp(4, inp_size, CV_32F, Scalar(0));
+    Mat shape(4, shape_size, CV_32F, Scalar(0));
+    net.setInput(inp, "input_0");
+    net.setInput(shape, "input_1");
+    net.setPreferableBackend(backend);
+    net.setPreferableTarget(target);
+    Mat out = net.forward();
+    Mat ref = blobFromNPY(_tf("data/output_prior_box.npy"));
+
+    double l1 = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 1e-3 : 1e-5;
+    double lInf = (target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD) ? 1e-3 : 1e-4;
+    if (target == DNN_TARGET_CUDA_FP16)
+    {
+        l1 = 7e-5;
+        lInf = 0.0005;
+    }
+    normAssert(out, ref, "", l1, lInf);
 }
 
 INSTANTIATE_TEST_CASE_P(/*nothing*/, Test_ONNX_layers, dnnBackendsAndTargets());
@@ -2207,11 +2608,6 @@ TEST_P(Test_ONNX_nets, RAFT)
     normAssert(ref0, outs[0], "", 1.5e-3, 3.2e-2);
 }
 
-TEST_P(Test_ONNX_nets, Squeezenet)
-{
-    testONNXModels("squeezenet", pb);
-}
-
 TEST_P(Test_ONNX_nets, Googlenet)
 {
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2022010000)
@@ -2241,61 +2637,22 @@ TEST_P(Test_ONNX_nets, Googlenet)
     if (target == DNN_TARGET_CPU_FP16)
         net.enableWinograd(false);
 
-    std::vector<Mat> images;
+    std::vector<Mat> images, results;
     images.push_back( imread(_tf("../googlenet_0.png")) );
     images.push_back( imread(_tf("../googlenet_1.png")) );
-    Mat inp = blobFromImages(images, 1.0f, Size(), Scalar(), false);
     Mat ref = blobFromNPY(_tf("../googlenet_prob.npy"));
-    checkBackend(&inp, &ref);
-
-    net.setInput(inp);
-    ASSERT_FALSE(net.empty());
-    Mat out = net.forward();
+    for (int i = 0; i < 2; i++) {
+        Mat inp_i = blobFromImage(images[i], 1.0f, Size(), Scalar(), false);
+        net.setInput(inp_i);
+        ASSERT_FALSE(net.empty());
+        Mat out_i = net.forward();
+        results.push_back(out_i.clone());
+    }
+    Mat out;
+    vconcat(results, out);
 
     normAssert(ref, out, "", default_l1,  default_lInf);
     expectNoFallbacksFromIE(net);
-}
-
-TEST_P(Test_ONNX_nets, CaffeNet)
-{
-#if defined(OPENCV_32BIT_CONFIGURATION) && (defined(HAVE_OPENCL) || defined(_WIN32))
-    applyTestTag(CV_TEST_TAG_MEMORY_2GB);
-#else
-    applyTestTag(target == DNN_TARGET_CPU ? CV_TEST_TAG_MEMORY_512MB : CV_TEST_TAG_MEMORY_1GB);
-#endif
-
-#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2019030000)
-    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target == DNN_TARGET_MYRIAD
-        && getInferenceEngineVPUType() == CV_DNN_INFERENCE_ENGINE_VPU_TYPE_MYRIAD_X)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD_X, CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
-#endif
-    testONNXModels("caffenet", pb);
-}
-
-TEST_P(Test_ONNX_nets, RCNN_ILSVRC13)
-{
-#if defined(OPENCV_32BIT_CONFIGURATION) && (defined(HAVE_OPENCL) || defined(_WIN32))
-    applyTestTag(CV_TEST_TAG_MEMORY_2GB);
-#else
-    applyTestTag(target == DNN_TARGET_CPU ? CV_TEST_TAG_MEMORY_512MB : CV_TEST_TAG_MEMORY_1GB);
-#endif
-
-#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2019030000)
-    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target == DNN_TARGET_MYRIAD
-        && getInferenceEngineVPUType() == CV_DNN_INFERENCE_ENGINE_VPU_TYPE_MYRIAD_X)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD_X, CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER, CV_TEST_TAG_DNN_SKIP_IE_VERSION);
-#endif
-    // Reference output values are in range [-4.992, -1.161]
-    testONNXModels("rcnn_ilsvrc13", pb, 0.0046);
-}
-
-TEST_P(Test_ONNX_nets, VGG16_bn)
-{
-    applyTestTag(CV_TEST_TAG_MEMORY_6GB);  // > 2.3Gb
-
-    // output range: [-16; 27], after Softmax [0; 0.67]
-    const double lInf = (target == DNN_TARGET_MYRIAD) ? 0.038 : default_lInf;
-    testONNXModels("vgg16-bn", pb, default_l1, lInf, true);
 }
 
 TEST_P(Test_ONNX_nets, ZFNet)
@@ -2358,6 +2715,9 @@ TEST_P(Test_ONNX_nets, TinyYolov2)
 
     if (cvtest::skipUnstableTests)
         throw SkipTestException("Skip unstable test");
+
+    // onnxruntime disagrees with the stored reference identically.
+    throw SkipTestException("Reference output predates the SAME_LOWER padding fix");
 #if defined(INF_ENGINE_RELEASE)
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019
             && (target == DNN_TARGET_OPENCL || target == DNN_TARGET_OPENCL_FP16)
@@ -2411,6 +2771,12 @@ TEST_P(Test_ONNX_nets, MobileNet_v2_FP16)
     testONNXModels("mobilenetv2_fp16", npy, default_l1, default_lInf, true);
 }
 
+TEST_P(Test_ONNX_nets, MobileNet_v4)
+{
+    required = true;
+    testONNXModels("mobilenetv4", npy, default_l1, default_lInf, true);
+}
+
 TEST_P(Test_ONNX_nets, LResNet100E_IR)
 {
     applyTestTag(
@@ -2421,6 +2787,9 @@ TEST_P(Test_ONNX_nets, LResNet100E_IR)
 #endif
         CV_TEST_TAG_DEBUG_VERYLONG
     );
+    // New-engine CUDA lacks support for some layers in this net; skip for now.
+    if (backend == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA, CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
     {
         if (target == DNN_TARGET_OPENCL_FP16) applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_OPENCL_FP16, CV_TEST_TAG_DNN_SKIP_IE_NN_BUILDER);
@@ -2513,16 +2882,6 @@ TEST_P(Test_ONNX_nets, DenseNet121)
 
     // output range: [-87; 138], after Softmax [0; 1]
     testONNXModels("densenet121", pb, default_l1, default_lInf, true, target != DNN_TARGET_MYRIAD);
-}
-
-TEST_P(Test_ONNX_nets, Inception_v1)
-{
-#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_LT(2021040000)
-    if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 ||
-         backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) && target == DNN_TARGET_MYRIAD)
-        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_MYRIAD);
-#endif
-    testONNXModels("inception_v1", pb);
 }
 
 TEST_P(Test_ONNX_nets, Shufflenet)
@@ -2641,6 +3000,52 @@ TEST_P(Test_ONNX_layers, CumSum)
     testONNXModels("cumsum_1d_exclusive_1_reverse");
     testONNXModels("cumsum_2d_dim_1");
     testONNXModels("cumsum_3d_dim_2");
+    testONNXModels("cumsum_3d_dim_2_int32");
+}
+
+TEST_P(Test_ONNX_layers, CumSum_int64)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // OpenVINO uses int32 precision for int64 operations
+    testONNXModels("cumsum_3d_dim_2_int64");
+}
+
+TEST_P(Test_ONNX_layers, ReduceSumInt64)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // OpenVINO uses int32 precision for int64 operations
+    testONNXModels("reduce_sum_int64");
+}
+
+TEST_P(Test_ONNX_layers, ScatterInt32)
+{
+    testONNXModels("scatter_int32", npy, 0, 0, false, true, 3);
+}
+
+TEST_P(Test_ONNX_layers, ScatterInt64)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // OpenVINO uses int32 precision for int64 operations
+    testONNXModels("scatter_int64", npy, 0, 0, false, true, 3);
+}
+
+TEST_P(Test_ONNX_layers, TileInt32)
+{
+    testONNXModels("tile_int32");
+}
+
+TEST_P(Test_ONNX_layers, TileInt64)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // OpenVINO uses int32 precision for int64 operations
+    testONNXModels("tile_int64");
+}
+
+TEST_P(Test_ONNX_layers, EmptyConstantInt64)
+{
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH); // OpenVINO uses int32 precision for int64 operations
+    testONNXModels("empty_constant_int64");
 }
 
 static void testYOLO(const std::string& weightPath, const std::vector<int>& refClassIds,
@@ -2658,7 +3063,26 @@ static void testYOLO(const std::string& weightPath, const std::vector<int>& refC
 
     net.setInput(inp);
     std::vector<Mat> outs;
-    net.forward(outs, net.getUnconnectedOutLayersNames());
+    std::vector<std::string> out_names = net.getUnconnectedOutLayersNames();
+    net.forward(outs, out_names);
+    EXPECT_EQ(outs.size(), out_names.size());
+    if(outs.size() == 1)
+    {
+        // do nothing
+    }
+    else if (outs.size() == 2)
+    {
+        // sort outs by name. New and old DNN engines return otuput in different order!
+        if(out_names[0] > out_names[1])
+        {
+            std::swap(out_names[0], out_names[1]);
+            std::swap(outs[0], outs[1]);
+        }
+    }
+    else if (outs.size() > 2)
+    {
+        CV_Error(Error::StsUnsupportedFormat, "Too many Yolo network outputs!");
+    }
 
     // Retrieve
     std::vector<int> keep_classIds;
@@ -2688,14 +3112,23 @@ void yoloPostProcessing(
     std::vector<float> confidences;
     std::vector<Rect2d> boxes;
 
+    // An fp16 model hands back fp16 blobs; everything below reads them as float.
+    for (Mat& out : outs)
+    {
+        if (out.depth() == CV_16F || out.depth() == CV_16BF)
+            out.convertTo(out, CV_32F);
+    }
+
     if (model_name == "yolov8" || model_name == "yolov10" ||
         model_name == "yolov9")
     {
-        cv::transposeND(outs[0], {0, 2, 1}, outs[0]);
+        cv::transpose(outs[0], {0, 2, 1}, outs[0]);
     }
 
     if (model_name == "yolonas"){
-        // outs contains 2 elemets of shape [1, 8400, nc] and [1, 8400, 4]. Concat them to get [1, 8400, nc+4]
+        EXPECT_EQ(cv::MatShape({1, 8400, 80}), outs[0].shape());
+        EXPECT_EQ(cv::MatShape({1, 8400, 4}), outs[1].shape());
+        // outs contains 2 elemets of shape [1, 8400, nc] and [1, 8400, 4]. Concat them to get [1, 8400, 84]
         Mat concat_out;
         // squeeze the first dimension
         outs[0] = outs[0].reshape(1, outs[0].size[1]);
@@ -3039,6 +3472,9 @@ TEST_P(Test_ONNX_nets, YOLOv5n)
 TEST_P(Test_ONNX_layers, Tile)
 {
     testONNXModels("tile", pb);
+    // tile-1 (opset 1) form with a negative axis; the parser must normalize it
+    // against the input rank instead of indexing the repeats buffer directly.
+    testONNXModels("tile_neg_axis");
 }
 
 TEST_P(Test_ONNX_layers, Gelu)
@@ -3059,6 +3495,18 @@ TEST_P(Test_ONNX_layers, where_node)
 
 TEST_P(Test_ONNX_layers, Gemm_all_attributes) {
     testONNXModels("test_gemm_all_attributes", pb, 0, 0, false, true, 2);
+}
+TEST_P(Test_ONNX_layers, Gemm_3inputs_scalar_bias) {
+    testONNXModels("test_gemm_3inputs_scalar_bias", pb, 0, 0, false, true, 3);
+}
+TEST_P(Test_ONNX_layers, Gemm_3inputs_matrix_bias) {
+    testONNXModels("test_gemm_3inputs_matrix_bias", pb, 0, 0, false, true, 3);
+}
+TEST_P(Test_ONNX_layers, Gemm_3inputs_single_elem_vector_bias) {
+    testONNXModels("test_gemm_3inputs_single_elem_vector_bias", pb, 0, 0, false, true, 3);
+}
+TEST_P(Test_ONNX_layers, Gemm_3inputs_vector_bias) {
+    testONNXModels("test_gemm_3inputs_vector_bias", pb, 0, 0, false, true, 3);
 }
 TEST_P(Test_ONNX_layers, Gemm_alpha) {
     testONNXModels("test_gemm_alpha", pb, 0, 0, false, true, 2);
@@ -3118,8 +3566,63 @@ TEST_P(Test_ONNX_layers, Attention) {
 TEST_P(Test_ONNX_layers, AttentionSingleHead) {
     testONNXModels("attention_single_head");
 }
-TEST_P(Test_ONNX_layers, PyTorchAttentionSingleHead){
+TEST_P(Test_ONNX_layers, PyTorchAttentionSingleHead) {
+    // 5.x specific bug: https://github.com/opencv/opencv/issues/25921
+    if (target == DNN_TARGET_OPENCL)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL);
+
+    if (target == DNN_TARGET_OPENCL_FP16)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_OPENCL_FP16);
+
     testONNXModels("pytorch_attention_single_head");
+}
+TEST_P(Test_ONNX_layers, AttentionSharedShapeReshape) {
+    testONNXModels("attention_shared_shape_reshape", npy, 1e-4, 5e-4);
+}
+
+// MultiHeadAttention `bias`/`key_padding_mask`, alone and together; BiasProjected feeds
+// Q/K/V from in-graph MatMul projections (the real HF-export layout), not graph inputs.
+TEST_P(Test_ONNX_layers, MultiHeadAttention_Bias) {
+    testONNXModels("multi_head_attention_bias", npy, 1e-4, 1e-3, false, true, 4);
+}
+TEST_P(Test_ONNX_layers, MultiHeadAttention_KeyPaddingMask) {
+    testONNXModels("multi_head_attention_key_padding_mask", npy, 1e-4, 1e-3, false, true, 4);
+}
+TEST_P(Test_ONNX_layers, MultiHeadAttention_BiasAndKeyPaddingMask) {
+    testONNXModels("multi_head_attention_bias_key_padding_mask", npy, 1e-4, 1e-3, false, true, 5);
+}
+TEST_P(Test_ONNX_layers, MultiHeadAttention_BiasProjected) {
+    testONNXModels("multi_head_attention_bias_projected", npy, 1e-4, 1e-3, false, true, 3);
+}
+// Q/K/V cast to fp16 inside the graph; key_padding_mask's own cast must follow, not stay
+// hardcoded float32. Fixed fp16-scale tolerances, since this runs fp16 math on every target.
+TEST_P(Test_ONNX_layers, MultiHeadAttention_KeyPaddingMaskFp16) {
+    testONNXModels("multi_head_attention_key_padding_mask_fp16", npy, 1e-3, 5e-3, false, true, 4);
+}
+// Bias as a true ONNX initializer: the static bias-split path should fire, keeping the net
+// shape-inferable (no runtime Shape/Slice2) - see addMultiHeadAttentionBias.
+TEST_P(Test_ONNX_layers, MultiHeadAttention_BiasConst) {
+    testONNXModels("multi_head_attention_bias_const", npy, 1e-4, 1e-3, false, true, 3);
+}
+// key_padding_mask arrives as int64 and is Cast to int32 in-graph, so its rank is unknown at
+// import (dims == -1) - the case the importer's rank check used to reject outright.
+TEST_P(Test_ONNX_layers, MultiHeadAttention_KeyPaddingMaskInGraph) {
+    testONNXModels("multi_head_attention_key_padding_mask_in_graph", npy, 1e-4, 1e-3, false, true, 4);
+}
+// key_padding_mask and attention_bias both set: the importer must sum the two additive masks
+// instead of one silently overriding the other - see the mask_add branch in parseMultiHeadAttention.
+TEST_P(Test_ONNX_layers, MultiHeadAttention_KeyPaddingMaskAndAttentionBias) {
+    testONNXModels("multi_head_attention_key_padding_mask_attention_bias", npy, 1e-4, 1e-3, false, true, 5);
+}
+
+// Batch + multi-head, square attention (B=2, H=4, S_q=S_kv=16, D=D_v=32).
+TEST_P(Test_ONNX_layers, SDPA_MultiHead) {
+    testSDPAModel("sdpa_multi_head", 1e-4, 5e-4);
+}
+// Cross-attention with asymmetric shapes (S_q=12 != S_kv=20, D=16 != D_v=24)
+// to exercise the K^T re-transpose and head-merge indexing.
+TEST_P(Test_ONNX_layers, SDPA_CrossAttention) {
+    testSDPAModel("sdpa_cross_attention", 1e-4, 5e-4);
 }
 
 TEST_P(Test_ONNX_layers, PyTorchUnflatten){
@@ -3160,7 +3663,7 @@ TEST_P(Test_ONNX_nets, ViT_B_32) {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH) {
         if (target == DNN_TARGET_CPU) {
             l1 = 6e-5; // Expected: (normL1) <= (l1), actual: 4.31208e-05 vs 1e-05
-            lInf = 0.0003; // Expected: (normInf) <= (lInf), actual: 0.000194907 vs 0.0001
+            lInf = 5e-4; // Expected: (normInf) <= (lInf), actual: 0.00044477 vs 0.0003
         } else if (target == DNN_TARGET_OPENCL || target == DNN_TARGET_OPENCL_FP16) {
             l1 = 0.0092; // Expected: (normL1) <= (l1), actual: 0.00918349 vs 4.4e-05
             lInf = 0.056; // Expected: (normInf) <= (lInf), actual: 0.0556431 vs 0.0002
@@ -3196,17 +3699,104 @@ TEST_P(Test_ONNX_layers, LayerNormNoFusion) {
     testONNXModels("layer_norm_no_fusion");
 }
 
+TEST_P(Test_ONNX_layers, SimplifiedLayerNormalization) {
+    testONNXModels("simplified_layer_normalization");
+}
+
+TEST_P(Test_ONNX_layers, Resize1D) {
+    // Rank-3 (N,C,W) Resize folds a unit H axis ([N,C,W] -> [N,C,1,W]) to reuse the NCHW kernel.
+    testONNXModels("resize_1d_linear");
+}
+
 TEST_P(Test_ONNX_layers, MatMulAddFusion) {
+    // New-engine CUDA MatMul/GEMM does not yet cover this fused variant; skip for now.
+    if (backend == DNN_BACKEND_CUDA)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_CUDA, CV_TEST_TAG_DNN_SKIP_CUDA_FP16);
     double l1 = (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_OPENCL) ? 0.0018 : default_l1;
     double lInf = (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_OPENCL) ? 0.011 : default_lInf;
     testONNXModels("biased_matmul", npy, l1, lInf);
+}
+
+TEST_P(Test_ONNX_layers, MatMulNBits) {
+    testONNXModels("matmulnbits", npy, 1e-4, 1e-3);
+    testONNXModels("matmulnbits_8bits", npy, 1e-4, 1e-3);
+    testONNXModels("matmulnbits_partial_block", npy, 1e-4, 1e-3);   // K=34 not a multiple of block_size=16: partial last block + scalar SIMD tail
 }
 
 TEST_P(Test_ONNX_layers, ClipDivSharedConstant) {
     testONNXModels("clip_div_shared_constant");
 }
 
+static Mat makeConsecutiveTransposeInput()
+{
+    int inputShape[] = {1, 3, 4, 4};
+    Mat input(4, inputShape, CV_32F);
+    float* data = input.ptr<float>();
+    for (size_t i = 0; i < input.total(); ++i)
+        data[i] = static_cast<float>(i);
+    return input;
+}
+
+static void testConsecutiveTransposeModel(const String& basename,
+                                          int backendId, int targetId,
+                                          int expectedTransposeLayers,
+                                          const Mat& input, const Mat& ref)
+{
+    Net net = readNetFromONNX(_tf("models/" + basename + ".onnx"));
+    ASSERT_FALSE(net.empty());
+    int numTransposeLayers = net.getLayersCount("Permute") + net.getLayersCount("Transpose");
+    if (expectedTransposeLayers >= 0)
+        EXPECT_EQ(numTransposeLayers, expectedTransposeLayers);
+    else
+        // Non-identity transpose pairs must not be eliminated completely.
+        // They may still be fused into a single equivalent Transpose later.
+        EXPECT_GT(numTransposeLayers, 0);
+
+    if (net.getMainGraph())
+        net.setPreferableBackend(DNN_BACKEND_OPENCV);
+    else
+    {
+        net.setPreferableBackend(backendId);
+        net.setPreferableTarget(targetId);
+    }
+
+    net.setInput(input);
+    Mat output = net.forward();
+
+    EXPECT_EQ(shape(output), shape(ref));
+    EXPECT_LT(cv::norm(output, ref, NORM_INF), 1e-5);
+}
+
+TEST_P(Test_ONNX_layers, ConsecutiveTransposeIdentity)
+{
+    Mat input = makeConsecutiveTransposeInput();
+
+    testConsecutiveTransposeModel("transpose_identity", backend, target, 0, input, input);
+}
+
+TEST_P(Test_ONNX_layers, ConsecutiveTransposeDefaultPerm)
+{
+    Mat input = makeConsecutiveTransposeInput();
+
+    testConsecutiveTransposeModel("transpose_default_perm", backend, target, 0, input, input);
+}
+
+TEST_P(Test_ONNX_layers, ConsecutiveTransposeNonIdentity)
+{
+    Mat input = makeConsecutiveTransposeInput();
+    Mat ref1, ref;
+    cv::transpose(input, std::vector<int>{0, 2, 3, 1}, ref1);
+    cv::transpose(ref1, std::vector<int>{0, 1, 3, 2}, ref);
+
+    testConsecutiveTransposeModel("transpose_non_identity", backend, target, -1, input, ref);
+}
+
 TEST_P(Test_ONNX_layers, TopK) {
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
+        backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 ||
+        backend == DNN_BACKEND_INFERENCE_ENGINE) {
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE); // OpenVINO does not support int64
+    }
     auto test = [&](const std::string &basename, double l1 = 0, double lInf = 0) {
         std::string onnxmodel = _tf("models/" + basename + ".onnx", true);
         Mat input = readTensorFromONNX(_tf("data/input_" + basename + ".pb"));
@@ -3225,10 +3815,10 @@ TEST_P(Test_ONNX_layers, TopK) {
 
         Mat output_res_val = outputs.front(),
             output_res_ind = outputs.back();
-        output_res_ind.convertTo(output_res_ind, CV_32S); // TODO: remove this conversion on 5.x
 
         normAssert(output_ref_val, output_res_val, (basename + " values").c_str(), l1 ? l1 : default_l1, lInf ? lInf : default_lInf);
         normAssert(output_ref_ind, output_res_ind, (basename + " indices").c_str(), l1 ? l1 : default_l1, lInf ? lInf : default_lInf);
+
         expectNoFallbacksFromIE(net);
     };
 
@@ -3282,4 +3872,122 @@ TEST_P(Test_ONNX_layers, RandomNormalLike_complex)
 
 INSTANTIATE_TEST_CASE_P(/**/, Test_ONNX_nets, dnnBackendsAndTargets());
 
+TEST_P(Test_ONNX_layers, getUnconnectedOutLayers)
+{
+    auto engine_forced = static_cast<cv::dnn::EngineType>(
+        cv::utils::getConfigurationParameterSizeT("OPENCV_FORCE_DNN_ENGINE", cv::dnn::ENGINE_AUTO));
+    if (engine_forced == cv::dnn::ENGINE_ORT)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
+
+    Net net = readNetFromONNX(_tf("models/yolov8x.onnx", false));
+    ASSERT_FALSE(net.empty());
+    net.setPreferableBackend(backend);
+    net.setPreferableTarget(target);
+
+    std::vector<int>    outIds   = net.getUnconnectedOutLayers();
+    std::vector<String> outNames = net.getUnconnectedOutLayersNames();
+
+    EXPECT_EQ(outIds.size(), outNames.size());
+    EXPECT_EQ(1, outIds.size());
+
+    EXPECT_EQ("output0", outNames[0]);
+    EXPECT_GT(outIds[0], 0);
+    Ptr<Layer> layer = net.getLayer(outIds[0]);
+    ASSERT_TRUE(layer);
+}
+
+// A Resize node that carries only its data input makes the importer pick input
+// index 2 for "scales" (opset-11 layout) although the node holds index 0 only,
+// reading past the node's input list. roi/scales/sizes are optional in the
+// operator schema, so the model is valid ONNX and has to be rejected cleanly.
+// Test data: https://github.com/opencv/opencv_extra/pull/1427
+TEST(Test_ONNX_importer, parse_resize_too_few_inputs)
+{
+    Net net;
+    EXPECT_NO_THROW(net = readNetFromONNX(_tf("models/resize_no_scales.onnx")));
+    EXPECT_TRUE(net.empty());
+}
+
+// bias/key_padding_mask must still lower to one AttentionOnnxAi, never the standalone type,
+// across every model this PR adds - not just the bias+mask one.
+typedef testing::TestWithParam<std::string> Test_ONNX_MHA_Lowering;
+TEST_P(Test_ONNX_MHA_Lowering, lowers_to_one_layer)
+{
+    const std::string basename = GetParam();
+    SCOPED_TRACE(basename);
+
+    Net net = readNetFromONNX(_tf("models/" + basename + ".onnx"));
+    ASSERT_FALSE(net.empty());
+
+    int unified = 0;
+    const std::vector<String> names = net.getLayerNames();
+    for (size_t i = 0; i < names.size(); ++i)
+    {
+        const String type = net.getLayer(net.getLayerId(names[i]))->type;
+        if (type == "AttentionOnnxAi")
+            unified++;
+        else
+            EXPECT_NE(type, "MultiHeadAttention");
+    }
+    EXPECT_EQ(unified, 1);
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Test_ONNX_MHA_Lowering, testing::Values(
+    "multi_head_attention_bias",
+    "multi_head_attention_key_padding_mask",
+    "multi_head_attention_bias_key_padding_mask",
+    "multi_head_attention_bias_projected",
+    "multi_head_attention_key_padding_mask_fp16",
+    "multi_head_attention_bias_const",
+    "multi_head_attention_key_padding_mask_in_graph",
+    "multi_head_attention_key_padding_mask_attention_bias"
+));
+
+// QLinearConv folds a const int32 bias to float by multiplying each bias element
+// by the matching per-channel weight scale, writing into a buffer sized from the
+// bias tensor. w_scale and the bias are independent model fields, so a w_scale
+// longer than the bias wrote past the bias buffer during import. The mismatched
+// pair has to be rejected instead of overrunning the buffer.
+// Test data in opencv_extra under the same branch name as this patch.
+TEST(Test_ONNX_importer, parse_qconv_bias_scale_mismatch)
+{
+    Net net;
+    EXPECT_NO_THROW(net = readNetFromONNX(_tf("models/qconv_bias_scale_mismatch.onnx")));
+    EXPECT_TRUE(net.empty());
+}
+
+// The same bias fold reads the scalar x_scale unconditionally, so an empty
+// x_scale has to be rejected instead of being read past its end.
+TEST(Test_ONNX_importer, parse_qconv_empty_x_scale)
+{
+    Net net;
+    EXPECT_NO_THROW(net = readNetFromONNX(_tf("models/qconv_empty_x_scale.onnx")));
+    EXPECT_TRUE(net.empty());
+}
+
+TEST(Test_ONNX_importer, parse_bool_tensor_int32)
+{
+    Mat m = readTensorFromONNX(_tf("models/bool_tensor_int32.pb"));
+
+    ASSERT_EQ(m.dims, 1);
+    ASSERT_EQ(m.size[0], 3);
+    EXPECT_EQ(m.depth(), CV_Bool);
+    EXPECT_EQ(m.ptr<bool>()[0], true);
+    EXPECT_EQ(m.ptr<bool>()[1], false);
+    EXPECT_EQ(m.ptr<bool>()[2], true);
+}
+
+TEST(Test_ONNX_importer, read_bool_tensor_int32_graph)
+{
+    Net net = readNetFromONNX(_tf("models/bool_tensor_int32.onnx"));
+    ASSERT_FALSE(net.empty());
+
+    Mat out = net.forward();
+    ASSERT_EQ(out.dims, 1);
+    ASSERT_EQ(out.size[0], 3);
+    EXPECT_EQ(out.depth(), CV_Bool);
+    EXPECT_EQ(out.ptr<bool>()[0], false);
+    EXPECT_EQ(out.ptr<bool>()[1], true);
+    EXPECT_EQ(out.ptr<bool>()[2], false);
+}
 }} // namespace

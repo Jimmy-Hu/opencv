@@ -40,7 +40,7 @@
 //M*/
 
 #include "precomp.hpp"
-#include "opencv2/imgproc/detail/gcgraph.hpp"
+#include "opencv2/geometry/detail/gcgraph.hpp"
 #include <limits>
 
 using namespace cv;
@@ -557,6 +557,9 @@ void cv::grabCut( InputArray _img, InputOutputArray _mask, Rect rect,
         CV_Error( cv::Error::StsBadArg, "image is empty" );
     if( img.type() != CV_8UC3 )
         CV_Error( cv::Error::StsBadArg, "image must have CV_8UC3 type" );
+
+    CV_Check(mode, mode == GC_INIT_WITH_RECT || mode == GC_INIT_WITH_MASK ||
+                   mode == GC_EVAL || mode == GC_EVAL_FREEZE_MODEL, "Unknown mode");
 
     GMM bgdGMM( bgdModel ), fgdGMM( fgdModel );
     Mat compIdxs( img.size(), CV_32SC1 );

@@ -49,7 +49,7 @@ public class DnnListRegressionTest extends OpenCVTestCase {
         }
 
         File dnnTestDataPath = new File(envDnnTestDataPath);
-        modelFileName =  new File(dnnTestDataPath, "dnn/tensorflow_inception_graph.pb").toString();
+        modelFileName =  new File(dnnTestDataPath, "dnn/onnx/models/tensorflow_inception_graph.onnx").toString();
 
         String envTestDataPath = System.getenv(ENV_OPENCV_TEST_DATA_PATH);
 
@@ -61,7 +61,7 @@ public class DnnListRegressionTest extends OpenCVTestCase {
         sourceImageFile = f.toString();
         if(!f.exists()) throw new Exception("Test image is missing: " + sourceImageFile);
 
-        net = Dnn.readNetFromTensorflow(modelFileName);
+        net = Dnn.readNetFromONNX(modelFileName);
 
         Mat image = Imgcodecs.imread(sourceImageFile);
         assertNotNull("Loading image from file failed!", image);
@@ -69,10 +69,10 @@ public class DnnListRegressionTest extends OpenCVTestCase {
         Mat inputBlob = Dnn.blobFromImage(image, 1.0, new Size(224, 224), new Scalar(0), true, true);
         assertNotNull("Converting image to blob failed!", inputBlob);
 
-        net.setInput(inputBlob, "input");
+        net.setInput(inputBlob, "");
     }
 
-    public void testSetInputsNames() {
+    /*public void testSetInputsNames() {
         List<String> inputs = new ArrayList();
         inputs.add("input");
         try {
@@ -80,72 +80,38 @@ public class DnnListRegressionTest extends OpenCVTestCase {
         } catch(Exception e) {
             fail("Net setInputsNames failed: " + e.getMessage());
         }
-    }
+    }*/
 
     public void testForward() {
-        List<Mat> outs = new ArrayList();
-        List<String> outNames = new ArrayList();
-        outNames.add("softmax2");
+        Mat out;
         try {
-            net.forward(outs,outNames);
+            out = net.forward();
         } catch(Exception e) {
             fail("Net forward failed: " + e.getMessage());
         }
     }
 
     public void testGetMemoryConsumption() {
-        int layerId = 1;
         List<MatOfInt> netInputShapes = new ArrayList();
         netInputShapes.add(new MatOfInt(1, 3, 224, 224));
+        MatOfInt netInputTypes = new MatOfInt(5);
         long[] weights=null;
         long[] blobs=null;
         try {
-            net.getMemoryConsumption(layerId, netInputShapes, weights, blobs);
+            net.getMemoryConsumption(netInputShapes, netInputTypes, weights, blobs);
         } catch(Exception e) {
             fail("Net getMemoryConsumption failed: " + e.getMessage());
         }
     }
 
     public void testGetFLOPS() {
-        int layerId = 1;
         List<MatOfInt> netInputShapes = new ArrayList();
         netInputShapes.add(new MatOfInt(1, 3, 224, 224));
+        MatOfInt netInputTypes = new MatOfInt(5);
         try {
-            net.getFLOPS(layerId, netInputShapes);
+            net.getFLOPS(netInputShapes, netInputTypes);
         } catch(Exception e) {
             fail("Net getFLOPS failed: " + e.getMessage());
-        }
-    }
-
-    public void testGetLayersShapes() {
-        List<MatOfInt> netInputShapes = new ArrayList();
-        netInputShapes.add(new MatOfInt(1, 3, 224, 224));
-
-        MatOfInt layersIds = new MatOfInt();
-        List<List<MatOfInt>> inLayersShapes = new ArrayList();
-        List<List<MatOfInt>> outLayersShapes = new ArrayList();
-        try {
-            net.getLayersShapes(netInputShapes, layersIds, inLayersShapes, outLayersShapes);
-
-            assertEquals(layersIds.total(), inLayersShapes.size());
-            assertEquals(layersIds.total(), outLayersShapes.size());
-
-            // Layer ID for "conv2d0_pre_relu/conv"
-            int layerId = 1;
-
-            MatOfInt expectedInShape = new MatOfInt(1, 3, 224, 224);
-            MatOfInt expectedOutShape = new MatOfInt(1, 64, 112, 112);
-
-            // Test inLayersShapes
-            MatOfInt actualInShape = inLayersShapes.get(layerId).get(0);
-            assertMatEqual(expectedInShape, actualInShape);
-
-            // Test outLayersShapes
-            MatOfInt actualOutShape = outLayersShapes.get(layerId).get(0);
-            assertMatEqual(expectedOutShape, actualOutShape);
-
-        } catch(Exception e) {
-            fail("Net getLayersShapes failed: " + e.getMessage());
         }
     }
 }

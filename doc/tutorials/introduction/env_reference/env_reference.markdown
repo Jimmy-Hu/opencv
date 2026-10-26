@@ -118,7 +118,6 @@ Links:
 
 
 ## backends
-OPENCV_LEGACY_WAITKEY
 Some modules have multiple available backends, following variables allow choosing specific backend or changing default priorities in which backends will be probed (e.g. when opening a video file).
 
 | name | type | default | description |
@@ -222,6 +221,7 @@ Some external dependencies can be detached into a dynamic library, which will be
 | OPENCV_DNN_BACKEND_DEFAULT | num | 3 (OpenCV) | set default DNN backend, see dnn.hpp for backends enumeration |
 | OPENCV_DNN_NETWORK_DUMP | num | 0 | level of information dumps, 0 - no dumps (default file name `${dump_base_name}.dot`) |
 | OPENCV_DNN_DISABLE_MEMORY_OPTIMIZATIONS | bool | false |  |
+| OPENCV_DNN_CUDA_ALLOW_TF32 | bool | true | allow cuDNN to use TF32 Tensor Core math for FP32 convolutions on the CUDA target (compute capability 8.0 and newer); faster, but with a 10-bit mantissa; set to false for exact FP32 results |
 | OPENCV_DNN_CHECK_NAN_INF | bool | false | check for NaNs in layer outputs |
 | OPENCV_DNN_CHECK_NAN_INF_DUMP | bool | false | print layer data when NaN check has failed |
 | OPENCV_DNN_CHECK_NAN_INF_RAISE_ERROR | bool | false | also raise exception when NaN check has failed |
@@ -303,31 +303,10 @@ Some external dependencies can be detached into a dynamic library, which will be
 | OPENCV_TEST_CAMERA_%d_FPS | num | | fps to set for N-th camera (0-based index) (waitAny_V4L test) |
 
 
-## gapi
-| name | type | default | description |
-|------|------|---------|-------------|
-| ⭐ GRAPH_DUMP_PATH | file path | | dump graph (dot format) |
-| PIPELINE_MODELS_PATH | dir path | | pipeline_modeling_tool sample application uses this var |
-| OPENCV_GAPI_INFERENCE_ENGINE_CORE_LIFETIME_WORKAROUND | bool | true (Windows, Apple), false (others) | similar to OPENCV_DNN_INFERENCE_ENGINE_CORE_LIFETIME_WORKAROUND |
-
-### gapi tests/samples
-| name | type | default | description |
-|------|------|---------|-------------|
-| PLAIDML_DEVICE | string | | specific to PlaidML backend test |
-| PLAIDML_TARGET | string | | specific to PlaidML backend test |
-| OPENCV_GAPI_ONNX_MODEL_PATH | dir path | | search location for ONNX models test |
-| OPENCV_TEST_FREETYPE_FONT_PATH | file path | | location of TrueType font for one of tests |
-
-### Links:
-* https://github.com/opencv/opencv/wiki/Using-G-API-with-OpenVINO-Toolkit
-* https://github.com/opencv/opencv/wiki/Using-G-API-with-MS-ONNX-Runtime
-
-
 ## highgui
 
 | name | type | default | description |
 |------|------|---------|-------------|
-| OPENCV_LEGACY_WAITKEY | bool | false | switch `waitKey` return result (default behavior: `return code & 0xff` (or -1), legacy behavior: `return code`) |
 | $XDG_RUNTIME_DIR | | | Wayland backend specific - create shared memory-mapped file for interprocess communication (named `opencv-shared-??????`) |
 | OPENCV_HIGHGUI_FB_MODE | string | `FB` | Selects output mode for the framebuffer backend (`FB` - regular frambuffer, `EMU` - emulation, perform internal checks but does nothing, `XVFB` - compatible with _xvfb_ virtual frambuffer) |
 | OPENCV_HIGHGUI_FB_DEVICE | file path | | Path to frambuffer device to use (will be checked first) |
@@ -350,9 +329,6 @@ Some external dependencies can be detached into a dynamic library, which will be
 | OPENCV_IO_MAX_IMAGE_WIDTH | num | 1 << 20, limit input image size to avoid large memory allocations | |
 | OPENCV_IO_MAX_IMAGE_HEIGHT | num | 1 << 20 | |
 | OPENCV_IO_MAX_IMAGE_PIXELS | num | 1 << 30 | |
-| OPENCV_IO_ENABLE_OPENEXR | bool | true (set build option OPENCV_IO_FORCE_OPENEXR or use external OpenEXR), false (otherwise) | enable OpenEXR backend |
 | OPENCV_IO_ENABLE_JASPER | bool | true (set build option OPENCV_IO_FORCE_JASPER), false (otherwise) | enable Jasper backend |
 
-### Note
-* OpenEXR support in OpenCV is optional. Source builds may include a bundled 3rdparty OpenEXR 2.3.0, but runtime support must be explicitly enabled via `OPENCV_IO_ENABLE_OPENEXR`. Users can also build OpenCV against a system-installed OpenEXR library.
-* Support is disabled by default due to historical security considerations with malformed EXR files in older OpenEXR versions. Upgrading to OpenEXR 3.x is not a drop-in change and requires API and ABI adaptations.
+@note OPENCV_IO_ENABLE_OPENEXR is deprecated because bundled OpenEXR library had been removed.

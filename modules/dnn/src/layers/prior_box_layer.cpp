@@ -192,8 +192,31 @@ public:
         }
     }
 
-    PriorBoxLayerImpl(const LayerParams &params)
+    static LayerParams normalizeONNXParams(const LayerParams& params)
     {
+        LayerParams p = params;
+        auto remap = [&](const std::string& from, const std::string& to) {
+            if (p.has(from) && !p.has(to))
+                p.set(to, p.get(from));
+        };
+        remap("variances",     "variance");
+        remap("min_sizes",     "min_size");
+        remap("max_sizes",     "max_size");
+        remap("aspect_ratios", "aspect_ratio");
+
+        if (p.has("steps") && !p.has("step_h") && !p.has("step_w")) {
+            DictValue steps = p.get("steps");
+            if (steps.size() == 2) {
+                p.set("step_h", steps.get<float>(0));
+                p.set("step_w", steps.get<float>(1));
+            }
+        }
+        return p;
+    }
+
+    PriorBoxLayerImpl(const LayerParams &params_)
+    {
+        const LayerParams params = normalizeONNXParams(params_);
         setParamsFrom(params);
         _flip = getParameter<bool>(params, "flip", 0, false, true);
         _clip = getParameter<bool>(params, "clip", 0, false, true);
@@ -404,7 +427,7 @@ public:
         // set the variance.
         {
             ocl::Kernel kernel("set_variance", ocl::dnn::prior_box_oclsrc, opts);
-            int offset = total(shape(outputs[0]), 2);
+            int offset = (int)total(shape(outputs[0]), 2);
             size_t nthreads = _layerHeight * _layerWidth * _numPriors;
             kernel.set(0, (int)nthreads);
             kernel.set(1, (int)offset);
@@ -436,7 +459,9 @@ public:
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
 
-        CV_Assert(inputs.size() == 2);
+        // PriorBox uses layer parameters and inputs[0]/inputs[1] shapes; tensor data is never read.
+        // Extra inputs (e.g., in ssd_vgg16.onnx) are ignored, so require >= 2 inputs instead of exactly 2.
+        CV_Assert(inputs.size() >= 2);
 
         int _layerWidth = inputs[0].size[3];
         int _layerHeight = inputs[0].size[2];
@@ -505,7 +530,9 @@ public:
 #ifdef HAVE_DNN_NGRAPH
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
-        CV_Assert(nodes.size() == 2);
+        // PriorBox uses layer parameters and inputs[0]/inputs[1] shapes; tensor data is never read.
+        // Extra inputs (e.g., in ssd_vgg16.onnx) are ignored, so require >= 2 inputs instead of exactly 2.
+        CV_Assert(nodes.size() >= 2);
         auto layer = nodes[0].dynamicCast<InfEngineNgraphNode>()->node;
         auto image = nodes[1].dynamicCast<InfEngineNgraphNode>()->node;
         auto layer_shape = std::make_shared<ov::op::v3::ShapeOf>(layer);
@@ -580,10 +607,12 @@ public:
         auto image_shape = image_wrapper->getShape();
 
         PriorBoxConfiguration config;
-        config.feature_map_width = feature_map_shape.rbegin()[0];
-        config.feature_map_height = feature_map_shape.rbegin()[1];
-        config.image_width = image_shape.rbegin()[0];
-        config.image_height = image_shape.rbegin()[1];
+        int fm_dims = feature_map_shape.dims;
+        int im_dims = image_shape.dims;
+        config.feature_map_width = feature_map_shape.p[fm_dims-1];
+        config.feature_map_height = feature_map_shape.p[fm_dims-2];
+        config.image_width = image_shape[im_dims-1];
+        config.image_height = image_shape[im_dims-2];
 
         config.num_priors = _numPriors;
         config.box_widths = _boxWidths;

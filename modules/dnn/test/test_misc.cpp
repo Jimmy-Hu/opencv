@@ -10,6 +10,7 @@
 #include <opencv2/core/ocl.hpp>
 #include <opencv2/core/opencl/ocl_defs.hpp>
 #include <opencv2/dnn/layer.details.hpp>  // CV_DNN_REGISTER_LAYER_CLASS
+#include <opencv2/dnn/shape_utils.hpp>
 
 namespace opencv_test { namespace {
 
@@ -76,6 +77,30 @@ TEST(blobRectToImageRect, DNN_PMODE_LETTERBOX)
     int left = (inputSize.width - rw) / 2;
     Rect rImg = Rect((rBlob.x - left) / resizeFactor, (rBlob.y - top) / resizeFactor, rBlob.width / resizeFactor, rBlob.height / resizeFactor);
     ASSERT_EQ(rImg, rOri);
+}
+
+TEST(blobRectToImageRect, no_resize)
+{
+    Size imgSize(64, 48);
+    Mat img(imgSize, CV_8UC1), img32f;
+    randu(img, 0, 256);
+    img.convertTo(img32f, CV_32F);
+    Rect rBlob(10, 20, 30, 15);
+    const ImagePaddingMode modes[] = { DNN_PMODE_NULL, DNN_PMODE_CROP_CENTER, DNN_PMODE_LETTERBOX };
+    for (ImagePaddingMode mode : modes)
+    {
+        // Blob size equal to the image size, or left empty: no resize, crop or padding is applied
+        for (const Size& size : { imgSize, Size() })
+        {
+            SCOPED_TRACE(cv::format("paddingmode=%d size=%dx%d", (int)mode, size.width, size.height));
+            Image2BlobParams paramNet;
+            paramNet.size = size;
+            paramNet.paddingmode = mode;
+            Mat blob = blobFromImageWithParams(img, paramNet);
+            ASSERT_EQ(0, cvtest::norm(Mat(imgSize, CV_32F, blob.ptr<float>()), img32f, NORM_INF));
+            EXPECT_EQ(rBlob, paramNet.blobRectToImageRect(rBlob, imgSize));
+        }
+    }
 }
 
 
@@ -244,28 +269,16 @@ TEST(blobFromImagesWithParams_4ch, multi_image)
 
 TEST(readNet, Regression)
 {
-    Net net = readNet(findDataFile("dnn/squeezenet_v1.1.prototxt"),
-                      findDataFile("dnn/squeezenet_v1.1.caffemodel", false));
+    Net net = readNet(findDataFile("dnn/onnx/models/squeezenet.onnx", false));
     EXPECT_FALSE(net.empty());
-    net = readNet(findDataFile("dnn/opencv_face_detector.caffemodel", false),
-                  findDataFile("dnn/opencv_face_detector.prototxt"));
-    EXPECT_FALSE(net.empty());
-    net = readNet(findDataFile("dnn/openface_nn4.small2.v1.t7", false));
-    EXPECT_FALSE(net.empty());
-    net = readNet(findDataFile("dnn/tiny-yolo-voc.cfg"),
-                  findDataFile("dnn/tiny-yolo-voc.weights", false));
-    EXPECT_FALSE(net.empty());
-    net = readNet(findDataFile("dnn/ssd_mobilenet_v1_coco.pbtxt"),
-                  findDataFile("dnn/ssd_mobilenet_v1_coco.pb", false));
+    net = readNet(findDataFile("dnn/onnx/models/ssd_mobilenet_v1_coco.onnx", false));
     EXPECT_FALSE(net.empty());
 }
 
 TEST(readNet, do_not_call_setInput)  // https://github.com/opencv/opencv/issues/16618
 {
     // 1. load network
-    const string proto = findDataFile("dnn/squeezenet_v1.1.prototxt");
-    const string model = findDataFile("dnn/squeezenet_v1.1.caffemodel", false);
-    Net net = readNetFromCaffe(proto, model);
+    Net net = readNet(findDataFile("dnn/onnx/models/squeezenet.onnx", false));
 
     // 2. mistake: no inputs are specified through .setInput()
 
@@ -332,10 +345,7 @@ TEST_P(dump, Regression)
 {
     const int backend  = get<0>(GetParam());
     const int target   = get<1>(GetParam());
-    Net net = readNet(findDataFile("dnn/squeezenet_v1.1.prototxt"),
-                      findDataFile("dnn/squeezenet_v1.1.caffemodel", false));
-
-    ASSERT_EQ(net.getLayerInputs(net.getLayerId("fire2/concat")).size(), 2);
+    Net net = readNet(findDataFile("dnn/onnx/models/squeezenet.onnx", false));
 
     int size[] = {1, 3, 227, 227};
     Mat input = cv::Mat::ones(4, size, CV_32F);
@@ -456,7 +466,7 @@ TEST_P(setInput, normalization)
 INSTANTIATE_TEST_CASE_P(/**/, setInput, Combine(
   Values(1.0f, 1.0 / 127.5),
   Values(Vec3f(), Vec3f(50, 50, 50), Vec3f(10, 50, 140)),
-  Values(CV_32F, CV_8U),
+  Values(CV_32F),
   dnnBackendsAndTargets()
 ));
 
@@ -583,20 +593,17 @@ INSTANTIATE_TEST_CASE_P(/**/, DeprecatedForward, dnnBackendsAndTargets());
 
 TEST(Net, forwardAndRetrieve)
 {
-    std::string prototxt =
-        "input: \"data\"\n"
-        "layer {\n"
-        "  name: \"testLayer\"\n"
-        "  type: \"Slice\"\n"
-        "  bottom: \"data\"\n"
-        "  top: \"firstCopy\"\n"
-        "  top: \"secondCopy\"\n"
-        "  slice_param {\n"
-        "    axis: 0\n"
-        "    slice_point: 2\n"
-        "  }\n"
-        "}";
-    Net net = readNetFromCaffe(&prototxt[0], prototxt.size());
+    LayerParams lpSlice;
+    lpSlice.name = "testLayer";
+    lpSlice.type = "Slice";
+    lpSlice.set("axis", 0);
+    Mat slicePoint = Mat_<int>({1, 1}, {2});
+    lpSlice.set("slice_point", DictValue::arrayInt<int*>((int*)slicePoint.data, 1));
+
+    Net net;
+    int sliceId = net.addLayer(lpSlice.name, lpSlice.type, lpSlice);
+    net.connect(0, 0, sliceId, 0);
+
     net.setPreferableBackend(DNN_BACKEND_OPENCV);
 
     Mat inp(4, 5, CV_32F);
@@ -607,13 +614,71 @@ TEST(Net, forwardAndRetrieve)
     outNames.push_back("testLayer");
     std::vector<std::vector<Mat> > outBlobs;
 
-    net.forward(outBlobs, outNames);
+    if (net.getMainGraph())
+    {
+        // Issue: https://github.com/opencv/opencv/issues/26349
+        outBlobs.push_back({});
+        net.forward(outBlobs[0]);
+    }
+    else
+        net.forward(outBlobs, outNames);
 
     EXPECT_EQ(outBlobs.size(), 1);
     EXPECT_EQ(outBlobs[0].size(), 2);
     normAssert(outBlobs[0][0], inp.rowRange(0, 2), "first part");
     normAssert(outBlobs[0][1], inp.rowRange(2, 4), "second part");
 }
+
+static void testForwardOutputsArePrivate(EngineType engine)
+{
+    Net net = readNetFromONNX(findDataFile("dnn/onnx/models/top_k.onnx"), engine);
+    Mat inp = readTensorFromONNX(findDataFile("dnn/onnx/data/input_top_k.pb"));
+    const std::vector<String> names = {"values", "indices"};
+
+    net.setInput(inp);
+    std::vector<Mat> first, ref;
+    net.forward(first, names);
+    for (const Mat& m : first) ref.push_back(m.clone());
+
+    // a later forward() must not overwrite earlier results
+    Mat inp2;
+    inp.convertTo(inp2, -1, -1.0);
+    net.setInput(inp2);
+    std::vector<Mat> second;
+    net.forward(second, names);
+    EXPECT_GT(cvtest::norm(ref[0], second[0], NORM_INF), 0);
+    for (size_t i = 0; i < ref.size(); i++)
+        normAssert(ref[i], first[i]);
+
+    // a preallocated buffer of matching size and type is filled in place
+    std::vector<Mat> prealloc(1, ref[0].clone());
+    const void* data0 = prealloc[0].data;
+    net.forward(prealloc, std::vector<String>(1, names[0]));
+    EXPECT_EQ(data0, (const void*)prealloc[0].data);
+    normAssert(second[0], prealloc[0]);
+
+    // the same output requested twice gets two buffers
+    std::vector<Mat> dup;
+    net.forward(dup, std::vector<String>(2, names[0]));
+    ASSERT_EQ(dup.size(), 2u);
+    EXPECT_NE((const void*)dup[0].data, (const void*)dup[1].data);
+    normAssert(dup[0], dup[1]);
+}
+
+typedef testing::TestWithParam<EngineType> Net_ForwardOutputsArePrivate;
+TEST_P(Net_ForwardOutputsArePrivate, Accuracy)
+{
+    testForwardOutputsArePrivate(GetParam());
+}
+static std::vector<EngineType> forwardOutputsEngines()
+{
+    std::vector<EngineType> engines = {ENGINE_OPENCV};
+#ifdef HAVE_ONNXRUNTIME
+    engines.push_back(ENGINE_ORT);
+#endif
+    return engines;
+}
+INSTANTIATE_TEST_CASE_P(/**/, Net_ForwardOutputsArePrivate, testing::ValuesIn(forwardOutputsEngines()));
 
 #ifdef HAVE_INF_ENGINE
 static const std::chrono::milliseconds async_timeout(10000);
@@ -840,7 +905,7 @@ TEST_P(Async, create_layer_pipeline_set_and_forward_all)
 }
 
 INSTANTIATE_TEST_CASE_P(/**/, Async, Combine(
-    Values(CV_32F, CV_8U),
+    Values(CV_32F),
     dnnBackendsAndTargetsIE()
 ));
 
@@ -1064,9 +1129,17 @@ TEST_P(Test_two_inputs, basic)
 }
 
 INSTANTIATE_TEST_CASE_P(/*nothing*/, Test_two_inputs, Combine(
-    Values(CV_32F, CV_8U),
-    Values(CV_32F, CV_8U),
+    Values(CV_32F),
+    Values(CV_32F),
     dnnBackendsAndTargets()
 ));
+
+TEST(Net, ShapeUtils_total_no_int32_overflow)
+{
+    cv::MatShape shape = cv::dnn::shape(1920, 1478656);
+
+    size_t t = cv::dnn::total(shape);
+    EXPECT_EQ(t, 2839019520llu);
+}
 
 }} // namespace

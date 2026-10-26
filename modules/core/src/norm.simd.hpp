@@ -3,6 +3,7 @@
 // of this distribution and at http://opencv.org/license.html
 //
 // Copyright (C) 2025, SpaceMIT Inc., all rights reserved.
+// Copyright (C) 2026, Advanced Micro Devices, Inc., all rights reserved.
 // Third party copyrights are property of their respective owners.
 
 #include "precomp.hpp"
@@ -13,6 +14,18 @@ using NormFunc = int (*)(const uchar*, const uchar*, uchar*, int, int);
 using NormDiffFunc = int (*)(const uchar*, const uchar*, const uchar*, uchar*, int, int);
 
 CV_CPU_OPTIMIZATION_NAMESPACE_BEGIN
+
+template<typename T, typename RT, int (*fn)(const T*, const uchar*, RT*, int, int)>
+static int normWrap(const uchar* src1, const uchar* src2, uchar* res, int len, int cn)
+{
+    return fn((const T*)src1, src2, (RT*)res, len, cn);
+}
+
+template<typename T, typename RT, int (*fn)(const T*, const T*, const uchar*, RT*, int, int)>
+static int normDiffWrap(const uchar* src1, const uchar* src2, const uchar* src3, uchar* res, int len, int cn)
+{
+    return fn((const T*)src1, (const T*)src2, src3, (RT*)res, len, cn);
+}
 
 NormFunc getNormFunc(int normType, int depth);
 NormDiffFunc getNormDiffFunc(int normType, int depth);
@@ -46,7 +59,7 @@ struct NormL2_SIMD {
     inline ST operator() (const T* src, int n) const {
         ST s = 0;
         for (int i = 0; i < n; i++) {
-            ST v = src[i];
+            ST v = (ST)src[i];
             s += v * v;
         }
         return s;
@@ -58,7 +71,8 @@ struct NormDiffInf_SIMD {
     inline ST operator() (const T* src1, const T* src2, int n) const {
         ST s = 0;
         for (int i = 0; i < n; i++) {
-            s = std::max(s, (ST)std::abs(src1[i] - src2[i]));
+            ST v = (ST)cv_absdiff(src1[i], src2[i]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -69,7 +83,8 @@ struct NormDiffL1_SIMD {
     inline ST operator() (const T* src1, const T* src2, int n) const {
         ST s = 0;
         for (int i = 0; i < n; i++) {
-            s += std::abs(src1[i] - src2[i]);
+            ST v = (ST)cv_absdiff(src1[i], src2[i]);
+            s += v;
         }
         return s;
     }
@@ -189,7 +204,7 @@ struct NormInf_SIMD<int, int> {
         r0 = v_max(r0, v_max(r1, v_max(r2, r3)));
         s = std::max(s, saturate_cast<int>(v_reduce_max(r0)));
         for (; j < n; j++) {
-            s = std::max(s, cv_abs(src[j]));
+            s = std::max(s, std::abs(src[j]));
         }
         return s;
     }
@@ -384,7 +399,8 @@ struct NormDiffInf_SIMD<uchar, int> {
         }
         s = (int)v_reduce_max(v_max(v_max(v_max(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s = std::max(s, (int)std::abs(src1[j] - src2[j]));
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -415,7 +431,8 @@ struct NormDiffInf_SIMD<schar, int> {
         }
         s = (int)v_reduce_max(v_max(v_max(v_max(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s = std::max(s, (int)std::abs(src1[j] - src2[j]));
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -446,7 +463,8 @@ struct NormDiffInf_SIMD<ushort, int> {
         }
         s = (int)v_reduce_max(v_max(v_max(v_max(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s = std::max(s, (int)std::abs(src1[j] - src2[j]));
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -477,38 +495,40 @@ struct NormDiffInf_SIMD<short, int> {
         }
         s = (int)v_reduce_max(v_max(v_max(v_max(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s = std::max(s, (int)std::abs(src1[j] - src2[j]));
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
 };
 
 template<>
-struct NormDiffInf_SIMD<int, int> {
-    int operator() (const int* src1, const int* src2, int n) const {
+struct NormDiffInf_SIMD<int, unsigned> {
+    unsigned operator() (const int* src1, const int* src2, int n) const {
         int j = 0;
-        int s = 0;
+        unsigned s = 0;
         v_uint32 r0 = vx_setzero_u32(), r1 = vx_setzero_u32();
         v_uint32 r2 = vx_setzero_u32(), r3 = vx_setzero_u32();
         for (; j <= n - 4 * VTraits<v_int32>::vlanes(); j += 4 * VTraits<v_int32>::vlanes()) {
             v_int32 v01 = vx_load(src1 + j), v02 = vx_load(src2 + j);
-            r0 = v_max(r0, v_abs(v_sub(v01, v02)));
+            r0 = v_max(r0, v_absdiff(v01, v02));
 
             v_int32 v11 = vx_load(src1 + j + VTraits<v_int32>::vlanes()),
                     v12 = vx_load(src2 + j + VTraits<v_int32>::vlanes());
-            r1 = v_max(r1, v_abs(v_sub(v11, v12)));
+            r1 = v_max(r1, v_absdiff(v11, v12));
 
             v_int32 v21 = vx_load(src1 + j + 2 * VTraits<v_int32>::vlanes()),
                     v22 = vx_load(src2 + j + 2 * VTraits<v_int32>::vlanes());
-            r2 = v_max(r2, v_abs(v_sub(v21, v22)));
+            r2 = v_max(r2, v_absdiff(v21, v22));
 
             v_int32 v31 = vx_load(src1 + j + 3 * VTraits<v_int32>::vlanes()),
                     v32 = vx_load(src2 + j + 3 * VTraits<v_int32>::vlanes());
-            r3 = v_max(r3, v_abs(v_sub(v31, v32)));
+            r3 = v_max(r3, v_absdiff(v31, v32));
         }
         s = (int)v_reduce_max(v_max(v_max(v_max(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s = std::max(s, (int)std::abs(src1[j] - src2[j]));
+            unsigned v = (unsigned)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -530,7 +550,8 @@ struct NormDiffInf_SIMD<float, float> {
         }
         s = v_reduce_max(v_max(r0, r1));
         for (; j < n; j++) {
-            s = std::max(s, (float)std::abs(src1[j] - src2[j]));
+            float v = (float)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -553,7 +574,8 @@ struct NormDiffL1_SIMD<uchar, int> {
         }
         s += v_reduce_sum(v_add(r0, r1));
         for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s += v;
         }
         return s;
     }
@@ -576,7 +598,8 @@ struct NormDiffL1_SIMD<schar, int> {
         }
         s += v_reduce_sum(v_add(r0, r1));
         for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s += v;
         }
         return s;
     }
@@ -615,7 +638,8 @@ struct NormDiffL1_SIMD<ushort, int> {
         }
         s += (int)v_reduce_sum(v_add(v_add(v_add(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s += v;
         }
         return s;
     }
@@ -654,7 +678,8 @@ struct NormDiffL1_SIMD<short, int> {
         }
         s += (int)v_reduce_sum(v_add(v_add(v_add(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            int v = (int)cv_absdiff(src1[j], src2[j]);
+            s += v;
         }
         return s;
     }
@@ -749,9 +774,11 @@ struct NormL1_SIMD<int, double> {
         v_float64 r00 = vx_setzero_f64(), r01 = vx_setzero_f64();
         v_float64 r10 = vx_setzero_f64(), r11 = vx_setzero_f64();
         for (; j <= n - 2 * VTraits<v_int32>::vlanes(); j += 2 * VTraits<v_int32>::vlanes()) {
-            v_float32 v0 = v_abs(v_cvt_f32(vx_load(src + j))), v1 = v_abs(v_cvt_f32(vx_load(src + j + VTraits<v_int32>::vlanes())));
-            r00 = v_add(r00, v_cvt_f64(v0)); r01 = v_add(r01, v_cvt_f64_high(v0));
-            r10 = v_add(r10, v_cvt_f64(v1)); r11 = v_add(r11, v_cvt_f64_high(v1));
+            // Widen to double before taking the magnitude: exact over the whole int32 range,
+            // INT_MIN included, which a float intermediate would not be above 2^24.
+            v_int32 i0 = vx_load(src + j), i1 = vx_load(src + j + VTraits<v_int32>::vlanes());
+            r00 = v_add(r00, v_abs(v_cvt_f64(i0))); r01 = v_add(r01, v_abs(v_cvt_f64_high(i0)));
+            r10 = v_add(r10, v_abs(v_cvt_f64(i1))); r11 = v_add(r11, v_abs(v_cvt_f64_high(i1)));
         }
         s += v_reduce_sum(v_add(v_add(v_add(r00, r01), r10), r11));
         for (; j < n; j++) {
@@ -946,32 +973,11 @@ struct NormDiffInf_SIMD<double, double> {
         double t[VTraits<v_float64>::max_nlanes];
         vx_store(t, v_max(r0, r1));
         for (int i = 0; i < VTraits<v_float64>::vlanes(); i++) {
-            s = std::max(s, std::abs(t[i]));
+            s = std::max(s, t[i]);
         }
         for (; j < n; j++) {
-            s = std::max(s, (double)std::abs(src1[j] - src2[j]));
-        }
-        return s;
-    }
-};
-
-template<>
-struct NormDiffL1_SIMD<int, double> {
-    double operator() (const int* src1, const int* src2, int n) const {
-        int j = 0;
-        double s = 0.f;
-        v_float64 r0 = vx_setzero_f64(), r1 = vx_setzero_f64();
-        for (; j <= n - VTraits<v_int32>::vlanes(); j += VTraits<v_int32>::vlanes()) {
-            v_int32 v01 = vx_load(src1 + j), v02 = vx_load(src2 + j);
-            v_uint32 v0 = v_abs(v_sub(v01, v02));
-            v_uint64 ev0, ev1;
-            v_expand(v0, ev0, ev1);
-            r0 = v_add(r0, v_cvt_f64(v_reinterpret_as_s64(ev0)));
-            r1 = v_add(r1, v_cvt_f64(v_reinterpret_as_s64(ev1)));
-        }
-        s += v_reduce_sum(v_add(r0, r1));
-        for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            double v = (double)cv_absdiff(src1[j], src2[j]);
+            s = std::max(s, v);
         }
         return s;
     }
@@ -996,7 +1002,8 @@ struct NormDiffL1_SIMD<float, double> {
         }
         s += v_reduce_sum(v_add(v_add(v_add(r0, r1), r2), r3));
         for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            double v = (double)cv_absdiff(src1[j], src2[j]);
+            s += v;
         }
         return s;
     }
@@ -1018,7 +1025,8 @@ struct NormDiffL1_SIMD<double, double> {
         }
         s += v_reduce_sum(v_add(r0, r1));
         for (; j < n; j++) {
-            s += std::abs(src1[j] - src2[j]);
+            double v = (double)cv_absdiff(src1[j], src2[j]);
+            s += v;
         }
         return s;
     }
@@ -1183,7 +1191,7 @@ struct MaskedNormInf_SIMD {
                 if (mask[i]) {
                     const T* elem = src + i * cn;
                     int k = 0;
-                #if CV_ENABLE_UNROLLED
+                #if CV_ENABLE_UNROLLED && !CV_SIMD_SCALABLE
                     for (; k <= cn - 4; k += 4) {
                         s = std::max(s, (ST)cv_abs(elem[k]));
                         s = std::max(s, (ST)cv_abs(elem[k + 1]));
@@ -1217,7 +1225,7 @@ struct MaskedNormL1_SIMD {
                 if (mask[i]) {
                     const T* elem = src + i * cn;
                     int k = 0;
-                #if CV_ENABLE_UNROLLED
+                #if CV_ENABLE_UNROLLED && !CV_SIMD_SCALABLE
                     for (; k <= cn - 4; k += 4) {
                         s += (ST)cv_abs(elem[k]);
                         s += (ST)cv_abs(elem[k + 1]);
@@ -1241,7 +1249,7 @@ struct MaskedNormL2_SIMD {
         ST s = 0;
         if (cn == 1) {
             int i = 0;
-        #if CV_ENABLE_UNROLLED
+        #if CV_ENABLE_UNROLLED && !CV_SIMD_SCALABLE
             for (; i <= len - 4; i += 4) {
                 if (mask[i])     { T v0 = src[i];     s += (ST)v0 * v0; }
                 if (mask[i + 1]) { T v1 = src[i + 1]; s += (ST)v1 * v1; }
@@ -1261,7 +1269,7 @@ struct MaskedNormL2_SIMD {
                 if (mask[i]) {
                     const T* elem = src + i * cn;
                     int k = 0;
-                #if CV_ENABLE_UNROLLED
+                #if CV_ENABLE_UNROLLED && !CV_SIMD_SCALABLE
                     for (; k <= cn - 4; k += 4) {
                         T v0 = elem[k];     s += (ST)v0 * v0;
                         T v1 = elem[k + 1]; s += (ST)v1 * v1;
@@ -1276,9 +1284,21 @@ struct MaskedNormL2_SIMD {
                 }
             }
         }
+
         return s;
     }
 };
+
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+static inline v_uint8  v_normmask_u8 (const uchar* m) { return v_gt(vx_load(m),          vx_setzero_u8());  }
+static inline v_uint16 v_normmask_u16(const uchar* m) { return v_gt(vx_load_expand(m),   vx_setzero_u16()); }
+static inline v_uint32 v_normmask_u32(const uchar* m) { return v_gt(vx_load_expand_q(m), vx_setzero_u32()); }
+static inline void v_normmask_u64(const uchar* m, v_uint64& m0, v_uint64& m1) {
+    v_uint64 e0, e1;
+    v_expand(v_normmask_u32(m), e0, e1);
+    m0 = v_or(e0, v_shl<32>(e0));
+    m1 = v_or(e1, v_shl<32>(e1));
+}
 
 template <>
 struct MaskedNormInf_SIMD<float, float> {
@@ -1336,15 +1356,26 @@ struct MaskedNormL1_SIMD<float, double> {
         if (cn == 1) {
             int i = 0;
             const int vstep = VTraits<v_float32>::vlanes();
-            v_float64 acc = vx_setzero_f64();
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            v_float64 acc2 = vx_setzero_f64(), acc3 = vx_setzero_f64();
 
-            for (; i <= len - vstep; i += vstep) {
-                v_uint32 cmp = v_gt(vx_load_expand_q(mask + i), vx_setzero_u32());
-                v_float32 s  = v_reinterpret_as_f32(v_and(v_reinterpret_as_u32(v_abs(vx_load(src + i))), cmp));
-                acc = v_add(acc, v_cvt_f64(s));
-                acc = v_add(acc, v_cvt_f64_high(s));
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_float32 s0 = v_and(v_abs(vx_load(src + i)),
+                                     v_reinterpret_as_f32(v_normmask_u32(mask + i)));
+                v_float32 s1 = v_and(v_abs(vx_load(src + i + vstep)),
+                                     v_reinterpret_as_f32(v_normmask_u32(mask + i + vstep)));
+                acc0 = v_add(acc0, v_cvt_f64(s0));
+                acc1 = v_add(acc1, v_cvt_f64_high(s0));
+                acc2 = v_add(acc2, v_cvt_f64(s1));
+                acc3 = v_add(acc3, v_cvt_f64_high(s1));
             }
-            result = v_reduce_sum(acc);
+            for (; i <= len - vstep; i += vstep) {
+                v_float32 s = v_and(v_abs(vx_load(src + i)),
+                                    v_reinterpret_as_f32(v_normmask_u32(mask + i)));
+                acc0 = v_add(acc0, v_cvt_f64(s));
+                acc1 = v_add(acc1, v_cvt_f64_high(s));
+            }
+            result = v_reduce_sum(v_add(v_add(acc0, acc1), v_add(acc2, acc3)));
 
             for (; i < len; i++) {
                 if (mask[i])
@@ -1462,21 +1493,38 @@ struct MaskedNormInf_SIMD<uchar, int> {
                     result = std::max(result, (int)src[i]);
             }
         }
+        else if (cn == 4 && len >= VTraits<v_uint8>::vlanes()) {
+            const int vstep = VTraits<v_uint8>::vlanes();
+            v_uint8 acc = vx_setzero_u8();
+            int i = 0;
+            for (;;) {
+                if (i > len - vstep)
+                    i = len - vstep; // back-step (max is idempotent)
+                v_uint8 c0, c1, c2, c3;
+                v_load_deinterleave(src + i * 4, c0, c1, c2, c3);
+                v_uint8 pmax = v_max(v_max(c0, c1), v_max(c2, c3));
+                v_uint8 m = v_gt(vx_load(mask + i), vx_setzero_u8());
+                acc = v_max(acc, v_and(pmax, m));
+                if (i >= len - vstep)
+                    break;
+                i += vstep;
+            }
+            result = (int)v_reduce_max(acc);
+        }
+        else if (cn == 4) {
+            for (int i = 0; i < len; i++) {
+                if (mask[i]) {
+                    const uchar* elem = src + i * 4;
+                    result = std::max(result, (int)std::max(std::max(elem[0], elem[1]),
+                                                            std::max(elem[2], elem[3])));
+                }
+            }
+        }
         else {
             for (int i = 0; i < len; i++) {
                 if (mask[i]) {
                     const uchar* elem = src + i * cn;
-                    int k = 0;
-                    const int vstep = VTraits<v_uint8>::vlanes();
-                    v_uint8 acc = vx_setzero_u8();
-
-                    for (; k <= cn - vstep; k += vstep) {
-                        acc = v_max(acc, vx_load(elem + k));
-                    }
-
-                    result = std::max(result, (int)v_reduce_max(acc));
-
-                    for (; k < cn; k++)
+                    for (int k = 0; k < cn; k++)
                         result = std::max(result, (int)elem[k]);
                 }
             }
@@ -1489,40 +1537,46 @@ template <>
 struct MaskedNormL1_SIMD<uchar, int> {
     inline int operator()(const uchar* src, const uchar* mask, int len, int cn) const {
         int result = 0;
+        const int vstep = VTraits<v_uint8>::vlanes();
+        const v_uint8 one = vx_setall_u8(1);
         if (cn == 1) {
             int i = 0;
-            const int vstep = VTraits<v_uint8>::vlanes() / 4;
             v_uint32 acc = vx_setzero_u32();
             for (; i <= len - vstep; i += vstep) {
-                v_uint32 m   = vx_load_expand_q(mask + i);
-                v_uint32 s = vx_load_expand_q(src + i);
-                v_uint32 sel = v_and(s, v_gt(m, vx_setzero_u32()));
-                acc = v_add(acc, sel);
+                v_uint8 s = v_and(vx_load(src + i), v_normmask_u8(mask + i));
+                acc = v_dotprod_expand_fast(s, one, acc);
             }
-
             result = (int)v_reduce_sum(acc);
-
             for (; i < len; i++) {
                 if (mask[i])
                     result += src[i];
+            }
+        }
+        else if (cn == 4) {
+            int i = 0;
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint8 c0, c1, c2, c3;
+                v_load_deinterleave(src + i * 4, c0, c1, c2, c3);
+                v_uint8 m = v_normmask_u8(mask + i);
+                acc = v_dotprod_expand_fast(v_and(c0, m), one, acc);
+                acc = v_dotprod_expand_fast(v_and(c1, m), one, acc);
+                acc = v_dotprod_expand_fast(v_and(c2, m), one, acc);
+                acc = v_dotprod_expand_fast(v_and(c3, m), one, acc);
+            }
+            result = (int)v_reduce_sum(acc);
+            for (; i < len; i++) {
+                if (mask[i]) {
+                    const uchar* elem = src + i * 4;
+                    result += elem[0] + elem[1] + elem[2] + elem[3];
+                }
             }
         }
         else {
             for (int i = 0; i < len; i++) {
                 if (mask[i]) {
                     const uchar* elem = src + i * cn;
-                    int k = 0;
-                    const int vstep = VTraits<v_uint8>::vlanes() / 4;
-                    v_uint32 acc = vx_setzero_u32();
-
-                    for (; k <= cn - vstep; k += vstep) {
-                        v_uint32 s = vx_load_expand_q(elem + k);
-                        acc = v_add(acc, s);
-                    }
-
-                    result += (int)v_reduce_sum(acc);
-
-                    for (; k < cn; k++)
+                    for (int k = 0; k < cn; k++)
                         result += elem[k];
                 }
             }
@@ -1696,10 +1750,414 @@ struct MaskedNormL2_SIMD<ushort, double> {
     }
 };
 
+template <>
+struct MaskedNormInf_SIMD<schar, int> {
+    inline int operator()(const schar* src, const uchar* mask, int len, int cn) const {
+        int result = 0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int8>::vlanes();
+            int i = 0;
+            v_uint8 acc = vx_setzero_u8();
+            for (; i <= len - vstep; i += vstep)
+                acc = v_max(acc, v_and(v_abs(vx_load(src + i)), v_normmask_u8(mask + i)));
+            result = (int)v_reduce_max(acc);
+            for (; i < len; i++)
+                if (mask[i]) result = std::max(result, cv_abs(src[i]));
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const schar* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result = std::max(result, cv_abs(elem[k]));
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL1_SIMD<schar, int> {
+    inline int operator()(const schar* src, const uchar* mask, int len, int cn) const {
+        int result = 0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int8>::vlanes();
+            const v_uint8 one = vx_setall_u8(1);
+            int i = 0;
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep)
+                acc = v_dotprod_expand_fast(v_and(v_abs(vx_load(src + i)), v_normmask_u8(mask + i)), one, acc);
+            result = (int)v_reduce_sum(acc);
+            for (; i < len; i++)
+                if (mask[i]) result += cv_abs(src[i]);
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const schar* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result += cv_abs(elem[k]);
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL2_SIMD<schar, int> {
+    inline int operator()(const schar* src, const uchar* mask, int len, int cn) const {
+        int result = 0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int8>::vlanes();
+            int i = 0;
+            v_int32 acc = vx_setzero_s32();
+            for (; i <= len - vstep; i += vstep) {
+                v_int8 s = v_and(vx_load(src + i), v_reinterpret_as_s8(v_normmask_u8(mask + i)));
+                acc = v_dotprod_expand_fast(s, s, acc);
+            }
+            result = (int)v_reduce_sum(acc);
+            for (; i < len; i++)
+                if (mask[i]) { int v = src[i]; result += v * v; }
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const schar* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++) { int v = elem[k]; result += v * v; }
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL2_SIMD<uchar, int> {
+    inline int operator()(const uchar* src, const uchar* mask, int len, int cn) const {
+        int result = 0;
+        const int vstep = VTraits<v_uint8>::vlanes();
+        if (cn == 1) {
+            int i = 0;
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint8 s = v_and(vx_load(src + i), v_normmask_u8(mask + i));
+                acc = v_dotprod_expand_fast(s, s, acc);
+            }
+            result = (int)v_reduce_sum(acc);
+            for (; i < len; i++)
+                if (mask[i]) { int v = src[i]; result += v * v; }
+        }
+        else if (cn == 4) {
+            int i = 0;
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint8 c0, c1, c2, c3;
+                v_load_deinterleave(src + i * 4, c0, c1, c2, c3);
+                v_uint8 m = v_normmask_u8(mask + i);
+                c0 = v_and(c0, m); c1 = v_and(c1, m);
+                c2 = v_and(c2, m); c3 = v_and(c3, m);
+                acc = v_dotprod_expand_fast(c0, c0, acc);
+                acc = v_dotprod_expand_fast(c1, c1, acc);
+                acc = v_dotprod_expand_fast(c2, c2, acc);
+                acc = v_dotprod_expand_fast(c3, c3, acc);
+            }
+            result = (int)v_reduce_sum(acc);
+            for (; i < len; i++)
+                if (mask[i]) {
+                    const uchar* elem = src + i * 4;
+                    for (int k = 0; k < 4; k++) { int v = elem[k]; result += v * v; }
+                }
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const uchar* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++) { int v = elem[k]; result += v * v; }
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormInf_SIMD<short, int> {
+    inline int operator()(const short* src, const uchar* mask, int len, int cn) const {
+        int result = 0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int16>::vlanes();
+            int i = 0;
+            v_uint16 acc = vx_setzero_u16();
+            for (; i <= len - vstep; i += vstep)
+                acc = v_max(acc, v_and(v_abs(vx_load(src + i)), v_normmask_u16(mask + i)));
+            result = (int)v_reduce_max(acc);
+            for (; i < len; i++)
+                if (mask[i]) result = std::max(result, cv_abs(src[i]));
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const short* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result = std::max(result, cv_abs(elem[k]));
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL1_SIMD<short, int> {
+    inline int operator()(const short* src, const uchar* mask, int len, int cn) const {
+        int result = 0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int16>::vlanes();
+            int i = 0;
+            v_uint32 acc0 = vx_setzero_u32(), acc1 = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint16 s = v_and(v_abs(vx_load(src + i)), v_normmask_u16(mask + i));
+                v_uint32 lo, hi;
+                v_expand(s, lo, hi);
+                acc0 = v_add(acc0, lo);
+                acc1 = v_add(acc1, hi);
+            }
+            result = (int)v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++)
+                if (mask[i]) result += cv_abs(src[i]);
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const short* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result += cv_abs(elem[k]);
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL2_SIMD<short, double> {
+    inline double operator()(const short* src, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int16>::vlanes();
+            int i = 0;
+            v_uint64 acc = vx_setzero_u64();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint16 s = v_and(v_abs(vx_load(src + i)), v_normmask_u16(mask + i));
+                acc = v_add(acc, v_dotprod_expand_fast(s, s));
+            }
+            result = (double)v_reduce_sum(acc);
+            for (; i < len; i++)
+                if (mask[i]) { double v = src[i]; result += v * v; }
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const short* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++) { double v = elem[k]; result += v * v; }
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormInf_SIMD<int, unsigned> {
+    inline unsigned operator()(const int* src, const uchar* mask, int len, int cn) const {
+        unsigned result = 0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int32>::vlanes();
+            int i = 0;
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep)
+                acc = v_max(acc, v_and(v_abs(vx_load(src + i)), v_normmask_u32(mask + i)));
+            result = v_reduce_max(acc);
+            for (; i < len; i++)
+                if (mask[i]) result = std::max(result, cv_abs(src[i]));
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const int* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result = std::max(result, cv_abs(elem[k]));
+                }
+        }
+        return result;
+    }
+};
+
+#if CV_SIMD_64F || CV_SIMD_SCALABLE_64F
+
+template <>
+struct MaskedNormL1_SIMD<int, double> {
+    inline double operator()(const int* src, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int32>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - vstep; i += vstep) {
+                // Mask the value, then widen and take the magnitude in double. v_abs() does give
+                // |INT_MIN| as an unsigned 2147483648, but reinterpreting that back as int32 turns
+                // it negative again, and the widening then carries the sign into the accumulator.
+                v_int32 s = v_reinterpret_as_s32(v_and(v_reinterpret_as_u32(vx_load(src + i)),
+                                                       v_normmask_u32(mask + i)));
+                acc0 = v_add(acc0, v_abs(v_cvt_f64(s)));
+                acc1 = v_add(acc1, v_abs(v_cvt_f64_high(s)));
+            }
+            result = v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++)
+                if (mask[i]) result += cv_abs(src[i]);
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const int* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result += cv_abs(elem[k]);
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL2_SIMD<int, double> {
+    inline double operator()(const int* src, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_int32>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint32 s = v_and(v_abs(vx_load(src + i)), v_normmask_u32(mask + i));
+                v_uint64 e0, e1;
+                v_expand(s, e0, e1);
+                v_float64 f0 = v_cvt_f64(v_reinterpret_as_s64(e0));
+                v_float64 f1 = v_cvt_f64(v_reinterpret_as_s64(e1));
+                acc0 = v_fma(f0, f0, acc0);
+                acc1 = v_fma(f1, f1, acc1);
+            }
+            result = v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++)
+                if (mask[i]) { double v = src[i]; result += v * v; }
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const int* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++) { double v = elem[k]; result += v * v; }
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormInf_SIMD<double, double> {
+    inline double operator()(const double* src, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_float64>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_uint64 m0, m1;
+                v_normmask_u64(mask + i, m0, m1);
+                acc0 = v_max(acc0, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(v_abs(vx_load(src + i))), m0)));
+                acc1 = v_max(acc1, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(v_abs(vx_load(src + i + vstep))), m1)));
+            }
+            double t[VTraits<v_float64>::max_nlanes];
+            vx_store(t, v_max(acc0, acc1));
+            for (int k = 0; k < vstep; k++)
+                result = std::max(result, t[k]);
+            for (; i < len; i++)
+                if (mask[i]) result = std::max(result, cv_abs(src[i]));
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const double* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result = std::max(result, cv_abs(elem[k]));
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL1_SIMD<double, double> {
+    inline double operator()(const double* src, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_float64>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_uint64 m0, m1;
+                v_normmask_u64(mask + i, m0, m1);
+                acc0 = v_add(acc0, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(v_abs(vx_load(src + i))), m0)));
+                acc1 = v_add(acc1, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(v_abs(vx_load(src + i + vstep))), m1)));
+            }
+            result = v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++)
+                if (mask[i]) result += cv_abs(src[i]);
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const double* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++)
+                        result += cv_abs(elem[k]);
+                }
+        }
+        return result;
+    }
+};
+
+template <>
+struct MaskedNormL2_SIMD<double, double> {
+    inline double operator()(const double* src, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_float64>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_uint64 m0, m1;
+                v_normmask_u64(mask + i, m0, m1);
+                v_float64 s0 = v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(vx_load(src + i)), m0));
+                v_float64 s1 = v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(vx_load(src + i + vstep)), m1));
+                acc0 = v_fma(s0, s0, acc0);
+                acc1 = v_fma(s1, s1, acc1);
+            }
+            result = v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++)
+                if (mask[i]) { double v = src[i]; result += v * v; }
+        }
+        else {
+            for (int i = 0; i < len; i++)
+                if (mask[i]) {
+                    const double* elem = src + i * cn;
+                    for (int k = 0; k < cn; k++) { double v = elem[k]; result += v * v; }
+                }
+        }
+        return result;
+    }
+};
+
+#endif // CV_SIMD_64F || CV_SIMD_SCALABLE_64F
+#endif // CV_SIMD || CV_SIMD_SCALABLE
+
 template<typename T, typename ST> int
-normInf_(const T* src, const uchar* mask, ST* _result, int len, int cn) {
+normInf_(const T* src, const uchar* mask, ST* _result, int len, int cn)
+{
     ST result = *_result;
-    if( !mask ) {
+    if( !mask )
+    {
         NormInf_SIMD<T, ST> op;
         result = std::max(result, op(src, len*cn));
     } else {
@@ -1711,9 +2169,11 @@ normInf_(const T* src, const uchar* mask, ST* _result, int len, int cn) {
 }
 
 template<typename T, typename ST> int
-normL1_(const T* src, const uchar* mask, ST* _result, int len, int cn) {
+normL1_(const T* src, const uchar* mask, ST* _result, int len, int cn)
+{
     ST result = *_result;
-    if( !mask ) {
+    if( !mask )
+    {
         NormL1_SIMD<T, ST> op;
         result += op(src, len*cn);
     } else {
@@ -1725,18 +2185,528 @@ normL1_(const T* src, const uchar* mask, ST* _result, int len, int cn) {
 }
 
 template<typename T, typename ST> int
-normL2_(const T* src, const uchar* mask, ST* _result, int len, int cn) {
+normL2_(const T* src, const uchar* mask, ST* _result, int len, int cn)
+{
     ST result = *_result;
-    if( !mask ) {
+    if( !mask )
+    {
         NormL2_SIMD<T, ST> op;
         result += op(src, len*cn);
-    } else {
+    }
+    else
+    {
         MaskedNormL2_SIMD<T, ST> op;
         result += op(src, mask, len, cn);
     }
     *_result = result;
     return 0;
 }
+
+static int
+normInf_Bool(const uchar* src, const uchar* mask, int* _result, int len, int cn)
+{
+    int result = *_result;
+    if( !mask )
+    {
+        for ( int i = 0; i < len*cn; i++ ) {
+            result = std::max(result, (int)(src[i] != 0));
+            if (result != 0)
+                break;
+        }
+    }
+    else
+    {
+        for( int i = 0; i < len; i++, src += cn )
+            if( mask[i] )
+            {
+                for( int k = 0; k < cn; k++ )
+                    result = std::max(result, (int)(src[k] != 0));
+                if (result != 0)
+                    break;
+            }
+    }
+    *_result = result;
+    return 0;
+}
+
+static int
+normL1_Bool(const uchar* src, const uchar* mask, int* _result, int len, int cn)
+{
+    int result = *_result;
+    if( !mask )
+    {
+        for ( int i = 0; i < len*cn; i++ )
+            result += (int)(src[i] != 0);
+    }
+    else
+    {
+        for( int i = 0; i < len; i++, src += cn )
+            if( mask[i] )
+            {
+                for( int k = 0; k < cn; k++ )
+                    result += (int)(src[k] != 0);
+            }
+    }
+    *_result = result;
+    return 0;
+}
+
+static int
+normL2_Bool(const uchar* src, const uchar* mask, int* _result, int len, int cn)
+{
+    return normL1_Bool(src, mask, _result, len, cn);
+}
+
+// ====================================================================
+// Masked norm-diff kernels.
+// Scalar base templates (safe for every depth) plus SIMD cn==1
+// specializations for the concrete (T, ST) pairs dispatched by
+// CV_DEF_NORM_ALL. The masked normDiff*_ functions below select them.
+// ====================================================================
+template <typename T, typename ST>
+struct MaskedNormDiffInf_SIMD {
+    inline ST operator()(const T* s1, const T* s2, const uchar* mask, int len, int cn) const {
+        ST result = 0;
+        for (int i = 0; i < len; i++) if (mask[i]) {
+            const T* e1 = s1 + i*cn; const T* e2 = s2 + i*cn;
+            for (int k = 0; k < cn; k++)
+                result = std::max(result, (ST)cv_absdiff(e1[k], e2[k]));
+        }
+        return result;
+    }
+};
+template <typename T, typename ST>
+struct MaskedNormDiffL1_SIMD {
+    inline ST operator()(const T* s1, const T* s2, const uchar* mask, int len, int cn) const {
+        ST result = 0;
+        for (int i = 0; i < len; i++) if (mask[i]) {
+            const T* e1 = s1 + i*cn; const T* e2 = s2 + i*cn;
+            for (int k = 0; k < cn; k++)
+                result += (ST)cv_absdiff(e1[k], e2[k]);
+        }
+        return result;
+    }
+};
+template <typename T, typename ST>
+struct MaskedNormDiffL2_SIMD {
+    inline ST operator()(const T* s1, const T* s2, const uchar* mask, int len, int cn) const {
+        ST result = 0;
+        for (int i = 0; i < len; i++) if (mask[i]) {
+            const T* e1 = s1 + i*cn; const T* e2 = s2 + i*cn;
+            for (int k = 0; k < cn; k++) { ST v = (ST)e1[k] - (ST)e2[k]; result += v*v; }
+        }
+        return result;
+    }
+};
+
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+// AND a per-lane diff vector with the (expanded) mask>0 predicate.
+inline v_uint8  v_diffmask(const v_uint8&  d, const uchar* m) { return v_and(d, v_gt(vx_load(m),          vx_setzero_u8())); }
+inline v_uint16 v_diffmask(const v_uint16& d, const uchar* m) { return v_and(d, v_gt(vx_load_expand(m),   vx_setzero_u16())); }
+inline v_uint32 v_diffmask(const v_uint32& d, const uchar* m) { return v_and(d, v_gt(vx_load_expand_q(m), vx_setzero_u32())); }
+inline v_float32 v_diffmask(const v_float32& d, const uchar* m) {
+    v_uint32 cm = v_gt(vx_load_expand_q(m), vx_setzero_u32());
+    return v_reinterpret_as_f32(v_and(v_reinterpret_as_u32(d), cm));
+}
+
+// Shared scalar cn>1 fallbacks (match the base templates' cv_absdiff semantics).
+template<typename T, typename RT>
+static inline RT maskedNormDiffInfTail(const T* s1, const T* s2, const uchar* mask, int len, int cn, RT result) {
+    for (int i = 0; i < len; i++) if (mask[i]) {
+        const T* e1 = s1 + i*cn; const T* e2 = s2 + i*cn;
+        for (int k = 0; k < cn; k++) result = std::max(result, (RT)cv_absdiff(e1[k], e2[k]));
+    }
+    return result;
+}
+template<typename T, typename RT>
+static inline RT maskedNormDiffL1Tail(const T* s1, const T* s2, const uchar* mask, int len, int cn, RT result) {
+    for (int i = 0; i < len; i++) if (mask[i]) {
+        const T* e1 = s1 + i*cn; const T* e2 = s2 + i*cn;
+        for (int k = 0; k < cn; k++) result += (RT)cv_absdiff(e1[k], e2[k]);
+    }
+    return result;
+}
+template<typename T, typename RT>
+static inline RT maskedNormDiffL2Tail(const T* s1, const T* s2, const uchar* mask, int len, int cn, RT result) {
+    for (int i = 0; i < len; i++) if (mask[i]) {
+        const T* e1 = s1 + i*cn; const T* e2 = s2 + i*cn;
+        for (int k = 0; k < cn; k++) { RT v = (RT)e1[k] - (RT)e2[k]; result += v*v; }
+    }
+    return result;
+}
+
+// Inf (cn==1): reduce_max of masked |a-b|. Shared across SIMD-capable depths.
+template<typename T, typename ST>
+static inline ST maskedNormDiffInfCn1(const T* s1, const T* s2, const uchar* mask, int len) {
+    const int vstep = VTraits<decltype(vx_load(s1))>::vlanes();
+    ST result = 0;
+    int i = 0;
+    if (len >= vstep) {
+        auto acc = v_diffmask(v_absdiff(vx_load(s1), vx_load(s2)), mask);
+        for (i = vstep; i <= len - vstep; i += vstep)
+            acc = v_max(acc, v_diffmask(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), mask + i));
+        result = (ST)v_reduce_max(acc);
+    }
+    for (; i < len; i++) if (mask[i]) result = std::max(result, (ST)cv_absdiff(s1[i], s2[i]));
+    return result;
+}
+
+// Shared 8-bit cn==1 masked L1/L2 kernels (uchar/schar): v_absdiff yields v_uint8 for both.
+template<typename T>
+static inline int maskedNormDiffL1_8(const T* s1, const T* s2, const uchar* mask, int len) {
+    int i = 0; const int vstep = VTraits<v_uint8>::vlanes();
+    const v_uint8 one = vx_setall_u8(1);
+    v_uint32 acc = vx_setzero_u32();
+    for (; i <= len - vstep; i += vstep) {
+        v_uint8 m  = v_gt(vx_load(mask + i), vx_setzero_u8());
+        v_uint8 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+        acc = v_dotprod_expand_fast(ad, one, acc);
+    }
+    int result = (int)v_reduce_sum(acc);
+    for (; i < len; i++) if (mask[i]) result += (int)cv_absdiff(s1[i], s2[i]);
+    return result;
+}
+template<typename T>
+static inline int maskedNormDiffL2_8(const T* s1, const T* s2, const uchar* mask, int len) {
+    int i = 0; const int vstep = VTraits<v_uint8>::vlanes();
+    v_uint32 acc = vx_setzero_u32();
+    for (; i <= len - vstep; i += vstep) {
+        v_uint8 m  = v_gt(vx_load(mask + i), vx_setzero_u8());
+        v_uint8 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+        acc = v_dotprod_expand_fast(ad, ad, acc);
+    }
+    int result = (int)v_reduce_sum(acc);
+    for (; i < len; i++) if (mask[i]) { int v = (int)s1[i] - (int)s2[i]; result += v*v; }
+    return result;
+}
+
+// Shared 16-bit cn==1 masked L1 kernel (ushort/short): v_absdiff yields v_uint16 for both.
+template<typename T>
+static inline int maskedNormDiffL1_16(const T* s1, const T* s2, const uchar* mask, int len) {
+    int i = 0; const int vstep = VTraits<v_uint16>::vlanes();
+    v_uint32 acc = vx_setzero_u32();
+    for (; i <= len - vstep; i += vstep) {
+        v_uint16 m  = v_gt(vx_load_expand(mask + i), vx_setzero_u16());
+        v_uint16 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+        v_uint32 lo, hi; v_expand(ad, lo, hi);
+        acc = v_add(acc, v_add(lo, hi));
+    }
+    int result = (int)v_reduce_sum(acc);
+    for (; i < len; i++) if (mask[i]) result += (int)cv_absdiff(s1[i], s2[i]);
+    return result;
+}
+
+template<> struct MaskedNormDiffInf_SIMD<uchar, int> {
+    int operator()(const uchar* s1, const uchar* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffInfCn1<uchar, int>(s1, s2, mask, len);
+        if (cn == 4 && len >= VTraits<v_uint8>::vlanes()) {
+            const int vstep = VTraits<v_uint8>::vlanes();
+            v_uint8 acc = vx_setzero_u8();
+            int i = 0;
+            for (;;) {
+                if (i > len - vstep) i = len - vstep; // back-step (max is idempotent)
+                v_uint8 a0,a1,a2,a3,b0,b1,b2,b3;
+                v_load_deinterleave(s1 + i*4, a0,a1,a2,a3);
+                v_load_deinterleave(s2 + i*4, b0,b1,b2,b3);
+                v_uint8 ad = v_max(v_max(v_absdiff(a0,b0), v_absdiff(a1,b1)),
+                                   v_max(v_absdiff(a2,b2), v_absdiff(a3,b3)));
+                v_uint8 m = v_gt(vx_load(mask + i), vx_setzero_u8());
+                acc = v_max(acc, v_and(ad, m));
+                if (i >= len - vstep) break;
+                i += vstep;
+            }
+            return (int)v_reduce_max(acc);
+        }
+        return maskedNormDiffInfTail<uchar, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffInf_SIMD<schar, int> {
+    int operator()(const schar* s1, const schar* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffInfCn1<schar, int>(s1, s2, mask, len);
+        return maskedNormDiffInfTail<schar, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffInf_SIMD<ushort, int> {
+    int operator()(const ushort* s1, const ushort* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffInfCn1<ushort, int>(s1, s2, mask, len);
+        return maskedNormDiffInfTail<ushort, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffInf_SIMD<short, int> {
+    int operator()(const short* s1, const short* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffInfCn1<short, int>(s1, s2, mask, len);
+        return maskedNormDiffInfTail<short, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffInf_SIMD<int, unsigned> {
+    unsigned operator()(const int* s1, const int* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffInfCn1<int, unsigned>(s1, s2, mask, len);
+        return maskedNormDiffInfTail<int, unsigned>(s1, s2, mask, len, cn, 0u);
+    }
+};
+template<> struct MaskedNormDiffInf_SIMD<float, float> {
+    float operator()(const float* s1, const float* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffInfCn1<float, float>(s1, s2, mask, len);
+        return maskedNormDiffInfTail<float, float>(s1, s2, mask, len, cn, 0.0f);
+    }
+};
+
+template<> struct MaskedNormDiffL1_SIMD<uchar, int> {
+    int operator()(const uchar* s1, const uchar* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffL1_8(s1, s2, mask, len);
+        if (cn == 4) {
+            int i = 0; const int vstep = VTraits<v_uint8>::vlanes();
+            const v_uint8 one = vx_setall_u8(1);
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint8 a0,a1,a2,a3,b0,b1,b2,b3;
+                v_load_deinterleave(s1 + i*4, a0,a1,a2,a3);
+                v_load_deinterleave(s2 + i*4, b0,b1,b2,b3);
+                v_uint8 m = v_gt(vx_load(mask + i), vx_setzero_u8());
+                acc = v_dotprod_expand_fast(v_and(v_absdiff(a0,b0), m), one, acc);
+                acc = v_dotprod_expand_fast(v_and(v_absdiff(a1,b1), m), one, acc);
+                acc = v_dotprod_expand_fast(v_and(v_absdiff(a2,b2), m), one, acc);
+                acc = v_dotprod_expand_fast(v_and(v_absdiff(a3,b3), m), one, acc);
+            }
+            int result = (int)v_reduce_sum(acc);
+            for (; i < len; i++) if (mask[i]) {
+                const uchar* e1 = s1 + i*4; const uchar* e2 = s2 + i*4;
+                for (int k = 0; k < 4; k++) result += (int)cv_absdiff(e1[k], e2[k]);
+            }
+            return result;
+        }
+        return maskedNormDiffL1Tail<uchar, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffL1_SIMD<schar, int> {
+    int operator()(const schar* s1, const schar* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffL1_8(s1, s2, mask, len);
+        return maskedNormDiffL1Tail<schar, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffL1_SIMD<ushort, int> {
+    int operator()(const ushort* s1, const ushort* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffL1_16(s1, s2, mask, len);
+        return maskedNormDiffL1Tail<ushort, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffL1_SIMD<short, int> {
+    int operator()(const short* s1, const short* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffL1_16(s1, s2, mask, len);
+        return maskedNormDiffL1Tail<short, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+
+template<> struct MaskedNormDiffL2_SIMD<uchar, int> {
+    int operator()(const uchar* s1, const uchar* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffL2_8(s1, s2, mask, len);
+        if (cn == 4) {
+            int i = 0; const int vstep = VTraits<v_uint8>::vlanes();
+            v_uint32 acc = vx_setzero_u32();
+            for (; i <= len - vstep; i += vstep) {
+                v_uint8 a0,a1,a2,a3,b0,b1,b2,b3;
+                v_load_deinterleave(s1 + i*4, a0,a1,a2,a3);
+                v_load_deinterleave(s2 + i*4, b0,b1,b2,b3);
+                v_uint8 m = v_gt(vx_load(mask + i), vx_setzero_u8());
+                v_uint8 d0 = v_and(v_absdiff(a0,b0), m), d1 = v_and(v_absdiff(a1,b1), m);
+                v_uint8 d2 = v_and(v_absdiff(a2,b2), m), d3 = v_and(v_absdiff(a3,b3), m);
+                acc = v_dotprod_expand_fast(d0, d0, acc);
+                acc = v_dotprod_expand_fast(d1, d1, acc);
+                acc = v_dotprod_expand_fast(d2, d2, acc);
+                acc = v_dotprod_expand_fast(d3, d3, acc);
+            }
+            int result = (int)v_reduce_sum(acc);
+            for (; i < len; i++) if (mask[i]) {
+                const uchar* e1 = s1 + i*4; const uchar* e2 = s2 + i*4;
+                for (int k = 0; k < 4; k++) { int v = (int)e1[k] - (int)e2[k]; result += v*v; }
+            }
+            return result;
+        }
+        return maskedNormDiffL2Tail<uchar, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+template<> struct MaskedNormDiffL2_SIMD<schar, int> {
+    int operator()(const schar* s1, const schar* s2, const uchar* mask, int len, int cn) const {
+        if (cn == 1) return maskedNormDiffL2_8(s1, s2, mask, len);
+        return maskedNormDiffL2Tail<schar, int>(s1, s2, mask, len, cn, 0);
+    }
+};
+
+#if CV_SIMD_64F
+// Depths whose L1/L2 accumulate in double.
+template<> struct MaskedNormDiffL1_SIMD<int, double> {
+    double operator()(const int* s1, const int* s2, const uchar* mask, int len, int cn) const {
+        if (cn != 1) return maskedNormDiffL1Tail<int, double>(s1, s2, mask, len, cn, 0.0);
+        int i = 0; const int vstep = VTraits<v_int32>::vlanes();
+        v_float64 acc = vx_setzero_f64();
+        for (; i <= len - vstep; i += vstep) {
+            v_uint32 m  = v_gt(vx_load_expand_q(mask + i), vx_setzero_u32());
+            v_uint32 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+            v_uint64 e0, e1; v_expand(ad, e0, e1);
+            acc = v_add(acc, v_cvt_f64(v_reinterpret_as_s64(e0)));
+            acc = v_add(acc, v_cvt_f64(v_reinterpret_as_s64(e1)));
+        }
+        double result = v_reduce_sum(acc);
+        for (; i < len; i++) if (mask[i]) result += (double)cv_absdiff(s1[i], s2[i]);
+        return result;
+    }
+};
+template<> struct MaskedNormDiffL1_SIMD<float, double> {
+    double operator()(const float* s1, const float* s2, const uchar* mask, int len, int cn) const {
+        if (cn != 1) return maskedNormDiffL1Tail<float, double>(s1, s2, mask, len, cn, 0.0);
+        int i = 0; const int vstep = VTraits<v_float32>::vlanes();
+        v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+        for (; i <= len - vstep; i += vstep) {
+            v_float32 m  = v_reinterpret_as_f32(v_gt(vx_load_expand_q(mask + i), vx_setzero_u32()));
+            v_float32 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+            acc0 = v_add(acc0, v_cvt_f64(ad));
+            acc1 = v_add(acc1, v_cvt_f64_high(ad));
+        }
+        double result = v_reduce_sum(v_add(acc0, acc1));
+        for (; i < len; i++) if (mask[i]) result += (double)cv_absdiff(s1[i], s2[i]);
+        return result;
+    }
+};
+
+template<typename T>
+static inline double maskedNormDiffL2_16(const T* s1, const T* s2, const uchar* mask, int len, int cn) {
+    if (cn != 1) return maskedNormDiffL2Tail<T, double>(s1, s2, mask, len, cn, 0.0);
+    int i = 0; const int vstep = VTraits<v_uint16>::vlanes();
+    v_float64 acc = vx_setzero_f64();
+    for (; i <= len - vstep; i += vstep) {
+        v_uint16 m  = v_gt(vx_load_expand(mask + i), vx_setzero_u16());
+        v_uint16 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+        v_uint64 u = v_dotprod_expand_fast(ad, ad);
+        acc = v_add(acc, v_cvt_f64(v_reinterpret_as_s64(u)));
+    }
+    double result = v_reduce_sum(acc);
+    for (; i < len; i++) if (mask[i]) { double v = (double)s1[i] - (double)s2[i]; result += v*v; }
+    return result;
+}
+template<> struct MaskedNormDiffL2_SIMD<ushort, double> {
+    double operator()(const ushort* s1, const ushort* s2, const uchar* mask, int len, int cn) const
+    { return maskedNormDiffL2_16(s1, s2, mask, len, cn); } };
+template<> struct MaskedNormDiffL2_SIMD<short, double> {
+    double operator()(const short* s1, const short* s2, const uchar* mask, int len, int cn) const
+    { return maskedNormDiffL2_16(s1, s2, mask, len, cn); } };
+
+template<> struct MaskedNormDiffL2_SIMD<int, double> {
+    double operator()(const int* s1, const int* s2, const uchar* mask, int len, int cn) const {
+        if (cn != 1) return maskedNormDiffL2Tail<int, double>(s1, s2, mask, len, cn, 0.0);
+        int i = 0; const int vstep = VTraits<v_int32>::vlanes();
+        v_float64 r0 = vx_setzero_f64(), r1 = vx_setzero_f64();
+        for (; i <= len - vstep; i += vstep) {
+            v_uint32 m  = v_gt(vx_load_expand_q(mask + i), vx_setzero_u32());
+            v_uint32 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+            v_uint64 e0, e1; v_expand(ad, e0, e1);
+            v_float64 f0 = v_cvt_f64(v_reinterpret_as_s64(e0)), f1 = v_cvt_f64(v_reinterpret_as_s64(e1));
+            r0 = v_fma(f0, f0, r0); r1 = v_fma(f1, f1, r1);
+        }
+        double result = v_reduce_sum(v_add(r0, r1));
+        for (; i < len; i++) if (mask[i]) { double v = (double)s1[i] - (double)s2[i]; result += v*v; }
+        return result;
+    }
+};
+template<> struct MaskedNormDiffL2_SIMD<float, double> {
+    double operator()(const float* s1, const float* s2, const uchar* mask, int len, int cn) const {
+        if (cn != 1) return maskedNormDiffL2Tail<float, double>(s1, s2, mask, len, cn, 0.0);
+        int i = 0; const int vstep = VTraits<v_float32>::vlanes();
+        v_float64 r0 = vx_setzero_f64(), r1 = vx_setzero_f64();
+        for (; i <= len - vstep; i += vstep) {
+            v_float32 m  = v_reinterpret_as_f32(v_gt(vx_load_expand_q(mask + i), vx_setzero_u32()));
+            v_float32 ad = v_and(v_absdiff(vx_load(s1 + i), vx_load(s2 + i)), m);
+            v_float64 f0 = v_cvt_f64(ad), f1 = v_cvt_f64_high(ad);
+            r0 = v_fma(f0, f0, r0); r1 = v_fma(f1, f1, r1);
+        }
+        double result = v_reduce_sum(v_add(r0, r1));
+        for (; i < len; i++) if (mask[i]) { double v = (double)s1[i] - (double)s2[i]; result += v*v; }
+        return result;
+    }
+};
+template<>
+struct MaskedNormDiffInf_SIMD<double, double> {
+    inline double operator()(const double* s1, const double* s2, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        int i = 0;
+#if CV_SIMD_64F || CV_SIMD_SCALABLE_64F
+        if (cn == 1) {
+            const int vstep = VTraits<v_float64>::vlanes();
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_uint64 m0, m1;
+                v_normmask_u64(mask + i, m0, m1);
+                v_float64 d0 = v_absdiff(vx_load(s1 + i), vx_load(s2 + i));
+                v_float64 d1 = v_absdiff(vx_load(s1 + i + vstep), vx_load(s2 + i + vstep));
+                acc0 = v_max(acc0, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(d0), m0)));
+                acc1 = v_max(acc1, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(d1), m1)));
+            }
+            double t[VTraits<v_float64>::max_nlanes];
+            vx_store(t, v_max(acc0, acc1));
+            for (int k = 0; k < vstep; k++)
+                result = std::max(result, t[k]);
+        }
+#endif
+        for (; i < len; i++) if (mask[i]) {
+            const double* e1 = s1 + i*cn; const double* e2 = s2 + i*cn;
+            for (int k = 0; k < cn; k++) result = std::max(result, std::abs(e1[k] - e2[k]));
+        }
+        return result;
+    }
+};
+
+template<>
+struct MaskedNormDiffL1_SIMD<double, double> {
+    double operator()(const double* s1, const double* s2, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_float64>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_uint64 m0, m1;
+                v_normmask_u64(mask + i, m0, m1);
+                v_float64 d0 = v_absdiff(vx_load(s1 + i), vx_load(s2 + i));
+                v_float64 d1 = v_absdiff(vx_load(s1 + i + vstep), vx_load(s2 + i + vstep));
+                acc0 = v_add(acc0, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(d0), m0)));
+                acc1 = v_add(acc1, v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(d1), m1)));
+            }
+            result = v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++) if (mask[i]) result += std::abs(s1[i] - s2[i]);
+        } else {
+            result = maskedNormDiffL1Tail<double, double>(s1, s2, mask, len, cn, 0.0);
+        }
+        return result;
+    }
+};
+
+template<>
+struct MaskedNormDiffL2_SIMD<double, double> {
+    double operator()(const double* s1, const double* s2, const uchar* mask, int len, int cn) const {
+        double result = 0.0;
+        if (cn == 1) {
+            const int vstep = VTraits<v_float64>::vlanes();
+            int i = 0;
+            v_float64 acc0 = vx_setzero_f64(), acc1 = vx_setzero_f64();
+            for (; i <= len - 2*vstep; i += 2*vstep) {
+                v_uint64 m0, m1;
+                v_normmask_u64(mask + i, m0, m1);
+                v_float64 d0 = v_sub(vx_load(s1 + i), vx_load(s2 + i));
+                v_float64 d1 = v_sub(vx_load(s1 + i + vstep), vx_load(s2 + i + vstep));
+                d0 = v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(d0), m0));
+                d1 = v_reinterpret_as_f64(v_and(v_reinterpret_as_u64(d1), m1));
+                acc0 = v_fma(d0, d0, acc0);
+                acc1 = v_fma(d1, d1, acc1);
+            }
+            result = v_reduce_sum(v_add(acc0, acc1));
+            for (; i < len; i++) if (mask[i]) { double v = s1[i] - s2[i]; result += v*v; }
+        } else {
+            result = maskedNormDiffL2Tail<double, double>(s1, s2, mask, len, cn, 0.0);
+        }
+        return result;
+    }
+};
+#endif // CV_SIMD_64F
+#endif // CV_SIMD
 
 template<typename T, typename ST> int
 normDiffInf_(const T* src1, const T* src2, const uchar* mask, ST* _result, int len, int cn) {
@@ -1745,13 +2715,8 @@ normDiffInf_(const T* src1, const T* src2, const uchar* mask, ST* _result, int l
         NormDiffInf_SIMD<T, ST> op;
         result = std::max(result, op(src1, src2, len*cn));
     } else {
-        for( int i = 0; i < len; i++, src1 += cn, src2 += cn ) {
-            if( mask[i] ) {
-                for( int k = 0; k < cn; k++ ) {
-                    result = std::max(result, (ST)std::abs(src1[k] - src2[k]));
-                }
-            }
-        }
+        MaskedNormDiffInf_SIMD<T, ST> op;
+        result = std::max(result, op(src1, src2, mask, len, cn));
     }
     *_result = result;
     return 0;
@@ -1763,15 +2728,9 @@ normDiffL1_(const T* src1, const T* src2, const uchar* mask, ST* _result, int le
     if( !mask ) {
         NormDiffL1_SIMD<T, ST> op;
         result += op(src1, src2, len*cn);
-    }
-    else {
-        for( int i = 0; i < len; i++, src1 += cn, src2 += cn ) {
-            if( mask[i] ) {
-                for( int k = 0; k < cn; k++ ) {
-                    result += std::abs(src1[k] - src2[k]);
-                }
-            }
-        }
+    } else {
+        MaskedNormDiffL1_SIMD<T, ST> op;
+        result += op(src1, src2, mask, len, cn);
     }
     *_result = result;
     return 0;
@@ -1784,17 +2743,66 @@ normDiffL2_(const T* src1, const T* src2, const uchar* mask, ST* _result, int le
         NormDiffL2_SIMD<T, ST> op;
         result += op(src1, src2, len*cn);
     } else {
-        for( int i = 0; i < len; i++, src1 += cn, src2 += cn ) {
-            if( mask[i] ) {
-                for( int k = 0; k < cn; k++ ) {
-                    ST v = (ST)src1[k] - (ST)src2[k];
-                    result += v*v;
-                }
-            }
-        }
+        MaskedNormDiffL2_SIMD<T, ST> op;
+        result += op(src1, src2, mask, len, cn);
     }
     *_result = result;
     return 0;
+}
+
+static int
+normDiffInf_Bool(const uchar* src1, const uchar* src2, const uchar* mask, int* _result, int len, int cn)
+{
+    int result = *_result;
+    if( !mask )
+    {
+        for( int i = 0; i < len*cn; i++ ) {
+            result = std::max(result, (int)((src1[i] != 0) != (src2[i] != 0)));
+            if (result != 0)
+                break;
+        }
+    }
+    else
+    {
+        for( int i = 0; i < len; i++, src1 += cn, src2 += cn )
+            if( mask[i] )
+            {
+                for( int k = 0; k < cn; k++ )
+                    result = std::max(result, (int)((src1[k] != 0) != (src2[k] != 0)));
+                if (result != 0)
+                    break;
+            }
+    }
+    *_result = result;
+    return 0;
+}
+
+static int
+normDiffL1_Bool(const uchar* src1, const uchar* src2, const uchar* mask, int* _result, int len, int cn)
+{
+    int result = *_result;
+    if( !mask )
+    {
+        for( int i = 0; i < len*cn; i++ )
+            result += (int)((src1[i] != 0) != (src2[i] != 0));
+    }
+    else
+    {
+        for( int i = 0; i < len; i++, src1 += cn, src2 += cn )
+            if( mask[i] )
+            {
+                for( int k = 0; k < cn; k++ )
+                    result += (int)((src1[k] != 0) != (src2[k] != 0));
+            }
+    }
+    *_result = result;
+    return 0;
+}
+
+static int
+normDiffL2_Bool(const uchar* src1, const uchar* src2, const uchar* mask, int* _result, int len, int cn)
+{
+    return normDiffL1_Bool(src1, src2, mask, _result, len, cn);
 }
 
 #define CV_DEF_NORM_FUNC(L, suffix, type, ntype) \
@@ -1813,9 +2821,14 @@ CV_DEF_NORM_ALL(8u, uchar, int, int, int)
 CV_DEF_NORM_ALL(8s, schar, int, int, int)
 CV_DEF_NORM_ALL(16u, ushort, int, int, double)
 CV_DEF_NORM_ALL(16s, short, int, int, double)
-CV_DEF_NORM_ALL(32s, int, int, double, double)
+CV_DEF_NORM_ALL(32u, unsigned, unsigned, double, double)
+CV_DEF_NORM_ALL(32s, int, unsigned, double, double)
 CV_DEF_NORM_ALL(32f, float, float, double, double)
 CV_DEF_NORM_ALL(64f, double, double, double, double)
+CV_DEF_NORM_ALL(64u, uint64, uint64, double, double)
+CV_DEF_NORM_ALL(64s, int64, uint64, double, double)
+CV_DEF_NORM_ALL(16f, hfloat, float, float, float)
+CV_DEF_NORM_ALL(16bf, bfloat, float, float, float)
 
 NormFunc getNormFunc(int normType, int depth)
 {
@@ -1824,16 +2837,52 @@ NormFunc getNormFunc(int normType, int depth)
     static NormFunc normTab[3][CV_DEPTH_MAX] =
     {
         {
-            (NormFunc)GET_OPTIMIZED(normInf_8u), (NormFunc)GET_OPTIMIZED(normInf_8s), (NormFunc)GET_OPTIMIZED(normInf_16u), (NormFunc)GET_OPTIMIZED(normInf_16s),
-            (NormFunc)GET_OPTIMIZED(normInf_32s), (NormFunc)GET_OPTIMIZED(normInf_32f), (NormFunc)normInf_64f, 0
+            normWrap<uchar, int, normInf_8u>,
+            normWrap<schar, int, normInf_8s>,
+            normWrap<ushort, int, normInf_16u>,
+            normWrap<short, int, normInf_16s>,
+            normWrap<int, unsigned, normInf_32s>,
+            normWrap<float, float, normInf_32f>,
+            normWrap<double, double, normInf_64f>,
+            normWrap<hfloat, float, normInf_16f>,
+            normWrap<bfloat, float, normInf_16bf>,
+            normWrap<uchar, int, normInf_Bool>,
+            normWrap<uint64, uint64, normInf_64u>,
+            normWrap<int64, uint64, normInf_64s>,
+            normWrap<unsigned, unsigned, normInf_32u>,
+            0
         },
         {
-            (NormFunc)GET_OPTIMIZED(normL1_8u), (NormFunc)GET_OPTIMIZED(normL1_8s), (NormFunc)GET_OPTIMIZED(normL1_16u), (NormFunc)GET_OPTIMIZED(normL1_16s),
-            (NormFunc)GET_OPTIMIZED(normL1_32s), (NormFunc)GET_OPTIMIZED(normL1_32f), (NormFunc)normL1_64f, 0
+            normWrap<uchar, int, normL1_8u>,
+            normWrap<schar, int, normL1_8s>,
+            normWrap<ushort, int, normL1_16u>,
+            normWrap<short, int, normL1_16s>,
+            normWrap<int, double, normL1_32s>,
+            normWrap<float, double, normL1_32f>,
+            normWrap<double, double, normL1_64f>,
+            normWrap<hfloat, float, normL1_16f>,
+            normWrap<bfloat, float, normL1_16bf>,
+            normWrap<uchar, int, normL1_Bool>,
+            normWrap<uint64, double, normL1_64u>,
+            normWrap<int64, double, normL1_64s>,
+            normWrap<unsigned, double, normL1_32u>,
+            0
         },
         {
-            (NormFunc)GET_OPTIMIZED(normL2_8u), (NormFunc)GET_OPTIMIZED(normL2_8s), (NormFunc)GET_OPTIMIZED(normL2_16u), (NormFunc)GET_OPTIMIZED(normL2_16s),
-            (NormFunc)GET_OPTIMIZED(normL2_32s), (NormFunc)GET_OPTIMIZED(normL2_32f), (NormFunc)normL2_64f, 0
+            normWrap<uchar, int, normL2_8u>,
+            normWrap<schar, int, normL2_8s>,
+            normWrap<ushort, double, normL2_16u>,
+            normWrap<short, double, normL2_16s>,
+            normWrap<int, double, normL2_32s>,
+            normWrap<float, double, normL2_32f>,
+            normWrap<double, double, normL2_64f>,
+            normWrap<hfloat, float, normL2_16f>,
+            normWrap<bfloat, float, normL2_16bf>,
+            normWrap<uchar, int, normL2_Bool>,
+            normWrap<uint64, double, normL2_64u>,
+            normWrap<int64, double, normL2_64s>,
+            normWrap<unsigned, double, normL2_32u>,
+            0
         }
     };
 
@@ -1847,23 +2896,53 @@ NormDiffFunc getNormDiffFunc(int normType, int depth)
     static NormDiffFunc normDiffTab[3][CV_DEPTH_MAX] =
     {
         {
-            (NormDiffFunc)GET_OPTIMIZED(normDiffInf_8u), (NormDiffFunc)normDiffInf_8s,
-            (NormDiffFunc)normDiffInf_16u, (NormDiffFunc)normDiffInf_16s,
-            (NormDiffFunc)normDiffInf_32s, (NormDiffFunc)GET_OPTIMIZED(normDiffInf_32f),
-            (NormDiffFunc)normDiffInf_64f, 0
+            normDiffWrap<uchar, int, normDiffInf_8u>,
+            normDiffWrap<schar, int, normDiffInf_8s>,
+            normDiffWrap<ushort, int, normDiffInf_16u>,
+            normDiffWrap<short, int, normDiffInf_16s>,
+            normDiffWrap<int, unsigned, normDiffInf_32s>,
+            normDiffWrap<float, float, normDiffInf_32f>,
+            normDiffWrap<double, double, normDiffInf_64f>,
+            normDiffWrap<hfloat, float, normDiffInf_16f>,
+            normDiffWrap<bfloat, float, normDiffInf_16bf>,
+            normDiffWrap<uchar, int, normDiffInf_Bool>,
+            normDiffWrap<uint64, uint64, normDiffInf_64u>,
+            normDiffWrap<int64, uint64, normDiffInf_64s>,
+            normDiffWrap<unsigned, unsigned, normDiffInf_32u>,
+            0
         },
         {
-            (NormDiffFunc)GET_OPTIMIZED(normDiffL1_8u), (NormDiffFunc)normDiffL1_8s,
-            (NormDiffFunc)normDiffL1_16u, (NormDiffFunc)normDiffL1_16s,
-            (NormDiffFunc)normDiffL1_32s, (NormDiffFunc)GET_OPTIMIZED(normDiffL1_32f),
-            (NormDiffFunc)normDiffL1_64f, 0
+            normDiffWrap<uchar, int, normDiffL1_8u>,
+            normDiffWrap<schar, int, normDiffL1_8s>,
+            normDiffWrap<ushort, int, normDiffL1_16u>,
+            normDiffWrap<short, int, normDiffL1_16s>,
+            normDiffWrap<int, double, normDiffL1_32s>,
+            normDiffWrap<float, double, normDiffL1_32f>,
+            normDiffWrap<double, double, normDiffL1_64f>,
+            normDiffWrap<hfloat, float, normDiffL1_16f>,
+            normDiffWrap<bfloat, float, normDiffL1_16bf>,
+            normDiffWrap<uchar, int, normDiffL1_Bool>,
+            normDiffWrap<uint64, double, normDiffL1_64u>,
+            normDiffWrap<int64, double, normDiffL1_64s>,
+            normDiffWrap<unsigned, double, normDiffL1_32u>,
+            0
         },
         {
-            (NormDiffFunc)GET_OPTIMIZED(normDiffL2_8u), (NormDiffFunc)normDiffL2_8s,
-            (NormDiffFunc)normDiffL2_16u, (NormDiffFunc)normDiffL2_16s,
-            (NormDiffFunc)normDiffL2_32s, (NormDiffFunc)GET_OPTIMIZED(normDiffL2_32f),
-            (NormDiffFunc)normDiffL2_64f, 0
-        }
+            normDiffWrap<uchar, int, normDiffL2_8u>,
+            normDiffWrap<schar, int, normDiffL2_8s>,
+            normDiffWrap<ushort, double, normDiffL2_16u>,
+            normDiffWrap<short, double, normDiffL2_16s>,
+            normDiffWrap<int, double, normDiffL2_32s>,
+            normDiffWrap<float, double, normDiffL2_32f>,
+            normDiffWrap<double, double, normDiffL2_64f>,
+            normDiffWrap<hfloat, float, normDiffL2_16f>,
+            normDiffWrap<bfloat, float, normDiffL2_16bf>,
+            normDiffWrap<uchar, int, normDiffL2_Bool>,
+            normDiffWrap<uint64, double, normDiffL2_64u>,
+            normDiffWrap<int64, double, normDiffL2_64s>,
+            normDiffWrap<unsigned, double, normDiffL2_32u>,
+            0
+        },
     };
     if (normType >= 3 || normType < 0) return nullptr;
 

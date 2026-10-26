@@ -41,6 +41,7 @@
 
 #include "precomp.hpp"
 #include <vector>
+#include <cmath>
 
 /////////////////////////////////////////////////////////////////////////////////////////
 // Default LSD parameters
@@ -184,7 +185,7 @@ public:
  * @param _density_th   Minimal density of aligned region points in rectangle.
  * @param _n_bins       Number of bins in pseudo-ordering of gradient modulus.
  */
-    LineSegmentDetectorImpl(int _refine = LSD_REFINE_STD, double _scale = 0.8,
+    LineSegmentDetectorImpl(LineSegmentDetectorModes _refine = LSD_REFINE_STD, double _scale = 0.8,
         double _sigma_scale = 0.6, double _quant = 2.0, double _ang_th = 22.5,
         double _log_eps = 0, double _density_th = 0.7, int _n_bins = 1024);
 
@@ -248,7 +249,7 @@ private:
     bool n_needed;
 
     const double SCALE;
-    const int doRefine;
+    const LineSegmentDetectorModes doRefine;
     const double SIGMA_SCALE;
     const double QUANT;
     const double ANG_TH;
@@ -394,7 +395,7 @@ public:
 /////////////////////////////////////////////////////////////////////////////////////////
 
 CV_EXPORTS Ptr<LineSegmentDetector> createLineSegmentDetector(
-        int _refine, double _scale, double _sigma_scale, double _quant, double _ang_th,
+        LineSegmentDetectorModes _refine, double _scale, double _sigma_scale, double _quant, double _ang_th,
         double _log_eps, double _density_th, int _n_bins)
 {
     return makePtr<LineSegmentDetectorImpl>(
@@ -404,7 +405,7 @@ CV_EXPORTS Ptr<LineSegmentDetector> createLineSegmentDetector(
 
 /////////////////////////////////////////////////////////////////////////////////////////
 
-LineSegmentDetectorImpl::LineSegmentDetectorImpl(int _refine, double _scale, double _sigma_scale, double _quant,
+LineSegmentDetectorImpl::LineSegmentDetectorImpl(LineSegmentDetectorModes _refine, double _scale, double _sigma_scale, double _quant,
         double _ang_th, double _log_eps, double _density_th, int _n_bins)
         : img_width(0), img_height(0), LOG_NT(0), w_needed(false), p_needed(false), n_needed(false),
           SCALE(_scale), doRefine(_refine), SIGMA_SCALE(_sigma_scale), QUANT(_quant),
@@ -450,7 +451,7 @@ void LineSegmentDetectorImpl::flsd(std::vector<Vec4f>& lines,
     // Angle tolerance
     const double prec = CV_PI * ANG_TH / 180;
     const double p = ANG_TH / 180;
-    const double rho = QUANT / sin(prec);    // gradient magnitude threshold
+    const double rho = QUANT / std::sin(prec);    // gradient magnitude threshold
 
     if(SCALE != 1)
     {
@@ -642,8 +643,8 @@ void LineSegmentDetectorImpl::region_grow(const Point2i& s, std::vector<RegionPo
                     reg.push_back(region_point);
 
                     // Update region's angle
-                    sumdx += cos(float(angle));
-                    sumdy += sin(float(angle));
+                    sumdx += std::cos(float(angle));
+                    sumdy += std::sin(float(angle));
                     // reg_angle is used in the isAligned, so it needs to be updates?
                     reg_angle = fastAtan2(sumdy, sumdx) * DEG_TO_RADS;
                 }
@@ -674,8 +675,8 @@ void LineSegmentDetectorImpl::region2rect(const std::vector<RegionPoint>& reg,
     double theta = get_theta(reg, x, y, reg_angle, prec);
 
     // Find length and width
-    double dx = cos(theta);
-    double dy = sin(theta);
+    double dx = std::cos(theta);
+    double dy = std::sin(theta);
     double l_min = 0, l_max = 0, w_min = 0, w_max = 0;
 
     for(size_t i = 0; i < reg.size(); ++i)

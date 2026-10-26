@@ -253,6 +253,17 @@ void getConvPoolPaddings(const std::vector<int>& inp, const std::vector<size_t>&
     }
 }
 
+void expandGlobalPoolingParams(std::vector<size_t>& pads_begin, std::vector<size_t>& pads_end,
+                               std::vector<size_t>& strides, size_t nspatial)
+{
+    if (pads_begin.size() < nspatial)
+        pads_begin.insert(pads_begin.begin(), nspatial - pads_begin.size(), 0);
+    if (pads_end.size() < nspatial)
+        pads_end.insert(pads_end.begin(), nspatial - pads_end.size(), 0);
+    if (strides.size() < nspatial)
+        strides.insert(strides.begin(), nspatial - strides.size(), 1);
+}
+
 double getWeightScale(const Mat& weightsMat)
 {
     double realMin, realMax;
@@ -262,6 +273,189 @@ double getWeightScale(const Mat& weightsMat)
     realMax = std::max(realMax, 0.0);
 
     return (realMax == realMin) ? 1.0 : std::max(-realMin, realMax)/127;
+}
+
+void tensorToIntVec(const Mat& tensor, std::vector<int>& vec)
+{
+    if (tensor.empty()) {
+        vec.clear();
+    } else {
+        int type = tensor.type();
+        CV_Assert(type == CV_32S || type == CV_64S);
+        // Accept tensors of any dimensionality; treat them as a flat vector.
+        CV_Assert(tensor.isContinuous());
+        int size = (int)tensor.total();
+        vec.resize(size);
+        if (type == CV_32S) {
+            const int* p = tensor.ptr<int>();
+            for (int i = 0; i < size; i++)
+                vec[i] = p[i];
+        } else {
+            const int64_t* p = tensor.ptr<int64_t>();
+            for (int i = 0; i < size; i++)
+                vec[i] = saturate_cast<int>(p[i]);
+        }
+    }
+}
+
+void tensorToFloatVec(const Mat& tensor, std::vector<float>& vec)
+{
+    if (tensor.empty()) {
+        vec.clear();
+    } else {
+        int type = tensor.type();
+        MatShape shape = tensor.shape();
+        CV_Assert(type == CV_32F || type == CV_16F);
+        // Accept tensors of any dimensionality; treat them as a flat vector.
+        CV_Assert(tensor.isContinuous());
+        int size = (int)shape.total();
+        vec.resize(size);
+        if (type == CV_32F) {
+            const float* p = tensor.ptr<float>();
+            for (int i = 0; i < size; i++)
+                vec[i] = p[i];
+        } else {
+            const hfloat* p = tensor.ptr<hfloat>();
+            for (int i = 0; i < size; i++)
+                vec[i] = (float)p[i];
+        }
+    }
+}
+
+void reshapeAndCopyFirst(InputArrayOfArrays inputs,
+                         OutputArrayOfArrays outputs,
+                         const MatShape& shape)
+{
+    int inpKind = inputs.kind(), outKind = outputs.kind();
+    CV_Assert(inpKind == outKind);
+    CV_Assert(inpKind == _InputArray::STD_VECTOR_MAT ||
+              inpKind == _InputArray::STD_VECTOR_UMAT);
+    int inpType = inputs.type(0);
+    MatShape inpShape = inputs.shape(0);
+    const size_t inpTotal = inpShape.total();
+    const size_t outTotal = shape.total();
+
+    if (inpKind == _InputArray::STD_VECTOR_MAT) {
+        std::vector<Mat>& outref = outputs.getMatVecRef();
+        outref.resize(1);
+        outref[0].fit(shape, inpType);
+        CV_Assert(outref[0].isContinuous());
+        if (inpTotal == 0 && outTotal == 0)
+            return;
+        CV_Assert(inputs.isContinuous(0));
+        Mat inp = inputs.getMat(0);
+        Mat inp_ = inp.reshape(0, shape);
+        if (inp_.data != outref[0].data) {
+            // Parallel memcpy for large buffers to avoid single-thread bottleneck
+            // on reshape-style layers that don't get in-place-allocated.
+            CV_Assert(inp_.isContinuous());
+            CV_Assert(outref[0].isContinuous());
+            size_t bytes = inpTotal * inp_.elemSize();
+            const size_t CHUNK_BYTES = 64 * 1024;
+            if (bytes > 2 * CHUNK_BYTES) {
+                const uchar* src = inp_.data;
+                uchar* dst = outref[0].data;
+                int nChunks = (int)((bytes + CHUNK_BYTES - 1) / CHUNK_BYTES);
+                parallel_for_(Range(0, nChunks), [&](const Range& r) {
+                    for (int i = r.start; i < r.end; i++) {
+                        size_t off = (size_t)i * CHUNK_BYTES;
+                        size_t len = std::min(CHUNK_BYTES, bytes - off);
+                        memcpy(dst + off, src + off, len);
+                    }
+                });
+            } else {
+                inp_.copyTo(outref[0]);
+            }
+        }
+    }
+    else {
+        std::vector<UMat>& outref = outputs.getUMatVecRef();
+        outref.resize(1);
+        outref[0].fit(shape, inpType);
+        CV_Assert(outref[0].isContinuous());
+        if (inpTotal == 0 && outTotal == 0)
+            return;
+        CV_Assert(inputs.isContinuous(0));
+        UMat inp = inputs.getUMat(0);
+        UMat inp_ = inp.reshape(0, shape);
+        inp_.copyTo(outref[0]);
+    }
+}
+
+MatShape tensorToShape(const Mat& shapeTensor)
+{
+    std::vector<int> shapeSpecVec;
+    tensorToIntVec(shapeTensor, shapeSpecVec);
+    return MatShape(shapeSpecVec);
+}
+
+void tensorToScalar(const Mat& tensor, int type, void* value)
+{
+    CV_Assert(tensor.total() == 1);
+    int type0 = tensor.type();
+    int depth = CV_MAT_DEPTH(type), cn = CV_MAT_CN(type);
+    CV_Assert(cn == 1);
+    double v = 0;
+    int64_t iv = 0;
+    bool isflt = type0 == CV_32F || type0 == CV_64F || type0 == CV_16F || type0 == CV_16BF;
+
+    if (type0 == CV_8U)
+        iv = *tensor.ptr<uint8_t>();
+    else if (type0 == CV_8S)
+        iv = *tensor.ptr<uint8_t>();
+    else if (type0 == CV_16U)
+        iv = *tensor.ptr<uint8_t>();
+    else if (type0 == CV_16S)
+        iv = *tensor.ptr<int16_t>();
+    else if (type0 == CV_32U)
+        iv = *tensor.ptr<uint32_t>();
+    else if (type0 == CV_32S)
+        iv = *tensor.ptr<int32_t>();
+    else if (type0 == CV_64S)
+        iv = *tensor.ptr<int64_t>();
+    else if (type0 == CV_32F)
+        v = *tensor.ptr<float>();
+    else if (type0 == CV_64F)
+        v = *tensor.ptr<double>();
+    else if (type0 == CV_16F)
+        v = (float)*tensor.ptr<hfloat>();
+    else if (type0 == CV_16BF)
+        v = (float)*tensor.ptr<bfloat>();
+    else if (type0 == CV_Bool)
+        iv = *tensor.ptr<uint8_t>() != 0;
+    else {
+        CV_Error_(Error::StsNotImplemented, ("type %s is not supported", typeToString(type0).c_str()));
+    }
+
+    if (depth == CV_8U)
+        *reinterpret_cast<uint8_t*>(value) = isflt ? saturate_cast<uint8_t>(v) : saturate_cast<uint8_t>(iv);
+    else if (depth == CV_8S)
+        *reinterpret_cast<int8_t*>(value) = isflt ? saturate_cast<int8_t>(v) : saturate_cast<int8_t>(iv);
+    else if (depth == CV_16U)
+        *reinterpret_cast<uint16_t*>(value) = isflt ? saturate_cast<uint16_t>(v) : saturate_cast<uint16_t>(iv);
+    else if (depth == CV_16S)
+        *reinterpret_cast<int16_t*>(value) = isflt ? saturate_cast<int16_t>(v) : saturate_cast<int16_t>(iv);
+    else if (depth == CV_32U)
+        *reinterpret_cast<uint32_t*>(value) = isflt ? saturate_cast<uint32_t>(v) : saturate_cast<uint32_t>(iv);
+    else if (depth == CV_32S)
+        *reinterpret_cast<int32_t*>(value) = isflt ? saturate_cast<int32_t>(v) : saturate_cast<int32_t>(iv);
+    else if (depth == CV_64U)
+        *reinterpret_cast<uint64_t*>(value) = isflt ? saturate_cast<uint64_t>(v) : saturate_cast<uint64_t>(iv);
+    else if (depth == CV_64S)
+        *reinterpret_cast<int64_t*>(value) = isflt ? saturate_cast<int64_t>(v) : iv;
+    else if (depth == CV_32F)
+        *reinterpret_cast<float*>(value) = isflt ? (float)v : saturate_cast<float>(iv);
+    else if (depth == CV_64F)
+        *reinterpret_cast<double*>(value) = isflt ? v : saturate_cast<double>(iv);
+    else if (depth == CV_16F)
+        *reinterpret_cast<hfloat*>(value) = isflt ? saturate_cast<hfloat>(v) : saturate_cast<hfloat>(iv);
+    else if (depth == CV_16BF)
+        *reinterpret_cast<bfloat*>(value) = isflt ? saturate_cast<bfloat>(v) : saturate_cast<bfloat>(iv);
+    else if (depth == CV_Bool)
+        *reinterpret_cast<uint8_t*>(value) = isflt ? (uint8_t)(v != 0) : (uint8_t)(iv != 0);
+    else {
+        CV_Error_(Error::StsNotImplemented, ("type %s is not supported", typeToString(depth).c_str()));
+    }
 }
 
 }

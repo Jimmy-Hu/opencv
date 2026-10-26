@@ -70,14 +70,21 @@ namespace cv
         char braces[5];
 
         void (FormattedImpl::*valueToStr)();
+        void valueToStrBool() { snprintf(buf, sizeof(buf), "%d", (int)mtx.ptr<uchar>(row, col)[cn] != 0); }
         void valueToStr8u()  { snprintf(buf, sizeof(buf), "%3d", (int)mtx.ptr<uchar>(row, col)[cn]); }
         void valueToStr8s()  { snprintf(buf, sizeof(buf), "%3d", (int)mtx.ptr<schar>(row, col)[cn]); }
         void valueToStr16u() { snprintf(buf, sizeof(buf), "%d", (int)mtx.ptr<ushort>(row, col)[cn]); }
         void valueToStr16s() { snprintf(buf, sizeof(buf), "%d", (int)mtx.ptr<short>(row, col)[cn]); }
+        void valueToStr32u() { snprintf(buf, sizeof(buf), "%u", mtx.ptr<unsigned>(row, col)[cn]); }
         void valueToStr32s() { snprintf(buf, sizeof(buf), "%d", mtx.ptr<int>(row, col)[cn]); }
         void valueToStr32f() { snprintf(buf, sizeof(buf), floatFormat, mtx.ptr<float>(row, col)[cn]); }
         void valueToStr64f() { snprintf(buf, sizeof(buf), floatFormat, mtx.ptr<double>(row, col)[cn]); }
+        void valueToStr64u() { snprintf(buf, sizeof(buf), "%llu", (unsigned long long)mtx.ptr<uint64_t>(row, col)[cn]); }
+        void valueToStr64s() { snprintf(buf, sizeof(buf), "%lld", (long long)mtx.ptr<int64_t>(row, col)[cn]); }
         void valueToStr16f() { snprintf(buf, sizeof(buf), floatFormat, (float)mtx.ptr<hfloat>(row, col)[cn]); }
+        void valueToStr16bf() { snprintf(buf, sizeof(buf), floatFormat, (float)mtx.ptr<bfloat>(row, col)[cn]); }
+        void valueToStr8f()   { snprintf(buf, sizeof(buf), floatFormat, (float)mtx.ptr<fp8_t>(row, col)[cn]); }
+        void valueToStr8fnuz() { snprintf(buf, sizeof(buf), floatFormat, (float)mtx.ptr<fp8a_t>(row, col)[cn]); }
         void valueToStrOther() { buf[0] = 0; }
 
     public:
@@ -111,13 +118,21 @@ namespace cv
             {
                 case CV_8U:  valueToStr = &FormattedImpl::valueToStr8u; break;
                 case CV_8S:  valueToStr = &FormattedImpl::valueToStr8s; break;
+                case CV_Bool: valueToStr = &FormattedImpl::valueToStrBool; break;
                 case CV_16U: valueToStr = &FormattedImpl::valueToStr16u; break;
                 case CV_16S: valueToStr = &FormattedImpl::valueToStr16s; break;
+                case CV_32U: valueToStr = &FormattedImpl::valueToStr32u; break;
                 case CV_32S: valueToStr = &FormattedImpl::valueToStr32s; break;
                 case CV_32F: valueToStr = &FormattedImpl::valueToStr32f; break;
                 case CV_64F: valueToStr = &FormattedImpl::valueToStr64f; break;
-                default:     CV_Assert(mtx.depth() == CV_16F);
-                             valueToStr = &FormattedImpl::valueToStr16f;
+                case CV_64U: valueToStr = &FormattedImpl::valueToStr64u; break;
+                case CV_64S: valueToStr = &FormattedImpl::valueToStr64s; break;
+                case CV_16F: valueToStr = &FormattedImpl::valueToStr16f; break;
+                case CV_16BF: valueToStr = &FormattedImpl::valueToStr16bf; break;
+                case CV_8F_E4M3FN:   valueToStr = &FormattedImpl::valueToStr8f; break;
+                case CV_8F_E4M3FNUZ: valueToStr = &FormattedImpl::valueToStr8fnuz; break;
+                default:
+                    CV_Error_(Error::StsError, ("unsupported matrix type %d\n", mtx.depth()));
             }
         }
 
@@ -331,9 +346,11 @@ namespace cv
 
         Ptr<Formatted> format(const Mat& mtx) const CV_OVERRIDE
         {
-            static const char* numpyTypes[] =
+            static const char* numpyTypes[CV_DEPTH_MAX] =
             {
-                "uint8", "int8", "uint16", "int16", "int32", "float32", "float64", "float16"
+                "uint8", "int8", "uint16", "int16", "int32", "float32", "float64",
+                "float16", "bfloat16", "bool", "uint64", "int64", "uint32",
+                "float8_e4m3fn", "float8_e4m3fnuz"
             };
             char braces[5] = {'[', ']', ',', '[', ']'};
             if (mtx.cols == 1)
@@ -391,4 +408,202 @@ namespace cv
         }
         return makePtr<DefaultFormatter>();
     }
+
+    template<typename _Tp> struct Fmt
+    {
+        typedef int temp_type;
+        static const char* fmt() { return "%d"; }
+    };
+
+    template<> struct Fmt<uint32_t>
+    {
+        typedef unsigned temp_type;
+        static const char* fmt() { return "%u"; }
+    };
+
+    template<> struct Fmt<int64_t>
+    {
+        typedef long long temp_type;
+        static const char* fmt() { return "%lld"; }
+    };
+
+    template<> struct Fmt<uint64_t>
+    {
+        typedef unsigned long long temp_type;
+        static const char* fmt() { return "%llu"; }
+    };
+
+    template<> struct Fmt<float>
+    {
+        typedef float temp_type;
+        static const char* fmt() { return "%.5g"; }
+    };
+
+    template<> struct Fmt<double>
+    {
+        typedef double temp_type;
+        static const char* fmt() { return "%.5g"; }
+    };
+
+    template<> struct Fmt<hfloat>
+    {
+        typedef float temp_type;
+        static const char* fmt() { return "%.5g"; }
+    };
+
+    template<> struct Fmt<bfloat>
+    {
+        typedef float temp_type;
+        static const char* fmt() { return "%.4g"; }
+    };
+
+    template<> struct Fmt<fp8_t>
+    {
+        typedef float temp_type;
+        static const char* fmt() { return "%.4g"; }
+    };
+
+    template<> struct Fmt<fp8a_t>
+    {
+        typedef float temp_type;
+        static const char* fmt() { return "%.4g"; }
+    };
+
+    template <typename _Tp>
+    static void pprintRow(std::ostream& strm, const _Tp* ptr, int n, size_t ofs, int edge)
+    {
+        char buf[128];
+        const char* fmt = Fmt<_Tp>::fmt();
+        int i, ndump = edge > 0 ? std::min(n, edge*2+1) : n;
+        if (edge == 0)
+            edge = ndump;
+        for (i = 0; i < ndump; i++) {
+            int j = n == ndump || i < edge ? i : i == edge ? -1 : n-edge*2-1+i;
+            if (i > 0)
+                strm << ", ";
+            if (j >= 0) {
+                snprintf(buf, sizeof(buf), fmt, (typename Fmt<_Tp>::temp_type)ptr[ofs + j]);
+                strm << buf;
+            } else
+                strm << "... ";
+        }
+    }
+
+    static void pprintSlice(std::ostream& strm, const Mat& tensor,
+                            const size_t* step, int d,
+                            size_t ofs, int edge)
+    {
+        MatShape shape = tensor.shape();
+        int ndims = shape.dims;
+        int n = d >= ndims ? 1 : shape[d];
+        if (d >= ndims - 1) {
+            int typ = tensor.depth();
+            void* data = tensor.data;
+            CV_Assert(data);
+            n *= tensor.channels();
+            if (typ == CV_8U)
+                pprintRow(strm, (const uint8_t*)data, n, ofs, edge);
+            else if (typ == CV_8S)
+                pprintRow(strm, (const int8_t*)data, n, ofs, edge);
+            else if (typ == CV_16U)
+                pprintRow(strm, (const uint16_t*)data, n, ofs, edge);
+            else if (typ == CV_16S)
+                pprintRow(strm, (const int16_t*)data, n, ofs, edge);
+            else if (typ == CV_32U)
+                pprintRow(strm, (const unsigned*)data, n, ofs, edge);
+            else if (typ == CV_32S)
+                pprintRow(strm, (const int*)data, n, ofs, edge);
+            else if (typ == CV_64U)
+                pprintRow(strm, (const uint64_t*)data, n, ofs, edge);
+            else if (typ == CV_64S)
+                pprintRow(strm, (const int64_t*)data, n, ofs, edge);
+            else if (typ == CV_32F)
+                pprintRow(strm, (const float*)data, n, ofs, edge);
+            else if (typ == CV_64F)
+                pprintRow(strm, (const double*)data, n, ofs, edge);
+            else if (typ == CV_16F)
+                pprintRow(strm, (const hfloat*)data, n, ofs, edge);
+            else if (typ == CV_16BF)
+                pprintRow(strm, (const bfloat*)data, n, ofs, edge);
+            else if (typ == CV_Bool)
+                pprintRow(strm, (const bool*)data, n, ofs, edge);
+            else if (typ == CV_8F_E4M3FN)
+                pprintRow(strm, (const fp8_t*)data, n, ofs, edge);
+            else if (typ == CV_8F_E4M3FNUZ)
+                pprintRow(strm, (const fp8a_t*)data, n, ofs, edge);
+            else {
+                CV_Error(Error::StsNotImplemented, "unsupported type");
+            }
+        } else {
+            int i, ndump = edge > 0 ? std::min(n, edge*2+1) : n;
+            bool dots = false;
+            for (i = 0; i < ndump; i++) {
+                if (i > 0 && !dots) {
+                    int nempty_lines = ndims - 2 - d;
+                    for (int k = 0; k < nempty_lines; k++)
+                        strm << "\n";
+                }
+                if (i > 0)
+                    strm << "\n";
+                int j = n == ndump || i < edge ? i :
+                        i == edge ? -1 :
+                        n - edge*2 - 1 + i;
+                dots = j < 0;
+                if (!dots)
+                    pprintSlice(strm, tensor, step, d+1, ofs + j*step[d], edge);
+                else
+                    strm << "...";
+            }
+        }
+    }
+
+    std::ostream& pprint(std::ostream& strm, InputArray array,
+                         int /*indent*/, int edge_,
+                         int wholeTensorThreshold,
+                         char parens)
+    {
+        char oparen = parens;
+        char cparen = parens == '(' ? ')' :
+                      parens == '[' ? ']' :
+                      parens == '{' ? '}' :
+                      parens == '<' ? '>' :
+                      parens;
+        int edge = edge_ > 0 ? edge_ : 3;
+        wholeTensorThreshold = wholeTensorThreshold > 0 ? wholeTensorThreshold : 100;
+
+        Mat tensor = array.getMat();
+        if (!tensor.isContinuous()) {
+            // [TODO] print non-continous arrays without copy
+            Mat temp;
+            tensor.copyTo(temp);
+            tensor = temp;
+        }
+
+        MatShape shape = tensor.shape();
+        size_t sz_all = tensor.total();
+
+        if (parens)
+            strm << oparen;
+        if (sz_all == 0) {
+            if (!parens)
+                strm << "<empty>";
+        } else {
+            if (sz_all <= (size_t)wholeTensorThreshold)
+                edge = 0;
+
+            int ndims = shape.dims;
+            int cn = tensor.channels();
+            size_t step[MatShape::MAX_DIMS];
+            step[std::max(ndims-1, 0)] = 1;
+            for (int i = ndims-2; i >= 0; i--) {
+                step[i] = step[i+1]*shape[i+1]*cn;
+                cn = 1;
+            }
+            pprintSlice(strm, tensor, step, 0, 0, edge);
+        }
+        if (parens)
+            strm << cparen;
+        return strm;
+    }
+
 } // cv

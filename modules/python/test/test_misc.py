@@ -136,11 +136,6 @@ class Bindings(NewOpenCVTests):
         bm.getPreFilterCap()  # from StereoBM
         bm.getBlockSize()  # from SteroMatcher
 
-        boost = cv.ml.Boost_create()
-        boost.getBoostType()  # from ml::Boost
-        boost.getMaxDepth()  # from ml::DTrees
-        boost.isClassifier()  # from ml::StatModel
-
     def test_raiseGeneralException(self):
         with self.assertRaises((cv.error,),
                             msg='C++ exception is not propagated to Python in the right way') as cm:
@@ -239,6 +234,7 @@ class Bindings(NewOpenCVTests):
             cv.CV_16UC2: [cv.CV_16U, 2, cv.CV_16UC],
             cv.CV_32SC1: [cv.CV_32S, 1, cv.CV_32SC],
             cv.CV_16FC3: [cv.CV_16F, 3, cv.CV_16FC],
+            cv.CV_BoolC1: [cv.CV_Bool, 1, cv.CV_BoolC],
         }
         for ref, (depth, channels, func) in data.items():
             self.assertEqual(ref, cv.CV_MAKETYPE(depth, channels))
@@ -282,6 +278,22 @@ class Arguments(NewOpenCVTests):
         a = np.zeros((2,3,4,5), dtype='f')
         res7 = cv.utils.dumpInputArray(a)
         self.assertEqual(res7, "InputArray: empty()=false kind=0x00010000 flags=0x01010000 total(-1)=120 dims(-1)=4 size(-1)=[2 3 4 5] type(-1)=CV_32FC1")
+        a = np.array([0, 1, 0, 1], dtype=bool)
+        res8 = cv.utils.dumpInputArray(a)
+        self.assertEqual(res8, "InputArray: empty()=false kind=0x00010000 flags=0x01010000 total(-1)=4 dims(-1)=1 size(-1)=4x1 type(-1)=CV_BoolC1")
+        a = np.array(3.14, dtype=np.float32)
+        res9 = cv.utils.dumpInputArray(a)
+        self.assertEqual(res9, "InputArray: empty()=false kind=0x00010000 flags=0x01010000 total(-1)=1 dims(-1)=0 size(-1)=1x1 type(-1)=CV_32FC1")
+
+    def test_InputArray_int64(self):
+        """int64 is narrowed to CV_32S for backward compatibility, but only losslessly."""
+        int32_min, int32_max = np.iinfo(np.int32).min, np.iinfo(np.int32).max
+        for values in ([[1, 2], [3, 4]], [int32_min, int32_max]):
+            a = np.array(values, dtype=np.int64)
+            self.assertIn("type(-1)=CV_32SC1", cv.utils.dumpInputArray(a))
+        for values in ([[1, 2], [3, 1 << 40]], [int32_min - 1], [int32_max + 1]):
+            a = np.array(values, dtype=np.int64)
+            self.assertIn("type(-1)=CV_64SC1", cv.utils.dumpInputArray(a))
 
     def test_InputArrayOfArrays(self):
         res1 = cv.utils.dumpInputArrayOfArrays(None)
@@ -305,6 +317,11 @@ class Arguments(NewOpenCVTests):
         #a = np.zeros((2,3,4,5), dtype='f')
         #res6 = cv.utils.dumpInputArray([a, b])
         #self.assertEqual(res6, "InputArrayOfArrays: empty()=false kind=0x00050000 flags=0x01050000 total(-1)=2 dims(-1)=1 size(-1)=2x1 type(0)=CV_32FC1 dims(0)=4 size(0)=[2 3 4 5]")
+
+    def test_InputOutputArray(self):
+        a = np.zeros((2, 3), dtype=np.int32)
+        res, _ = cv.utils.dumpInputOutputArray(a)
+        self.assertIn('type(-1)=CV_32SC1', res)
 
     def test_unsupported_numpy_data_types_string_description(self):
         for dtype in (object, str, np.complex128):
@@ -344,7 +361,7 @@ class Arguments(NewOpenCVTests):
 
     def test_parse_to_bool_not_convertible(self):
         for not_convertible in (1.2, np.float32(2.3), 's', 'str', (1, 2), [1, 2], complex(1, 1),
-                                complex(imag=2), complex(1.1), np.array([1, 0], dtype=bool)):
+                                complex(imag=2), complex(1.1)):
             with self.assertRaises((TypeError, OverflowError),
                                    msg=get_no_exception_msg(not_convertible)):
                 _ = cv.utils.dumpBool(not_convertible)
@@ -819,16 +836,6 @@ class Arguments(NewOpenCVTests):
         for flag in (True, False):
             self.assertEqual(flag, cv.utils.nested.testEchoBooleanFunction(flag),
                              msg="Function in nested module returns wrong result")
-
-    def test_class_from_submodule_has_global_alias(self):
-        self.assertTrue(hasattr(cv.ml, "Boost"),
-                        msg="Class is not registered in the submodule")
-        self.assertTrue(hasattr(cv, "ml_Boost"),
-                        msg="Class from submodule doesn't have alias in the "
-                        "global module")
-        self.assertEqual(cv.ml.Boost, cv.ml_Boost,
-                         msg="Classes from submodules and global module don't refer "
-                         "to the same type")
 
     def test_inner_class_has_global_alias(self):
         self.assertTrue(hasattr(cv.SimpleBlobDetector, "Params"),

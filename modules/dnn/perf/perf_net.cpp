@@ -9,6 +9,7 @@
 #include "opencv2/core/ocl.hpp"
 
 #include "opencv2/dnn/shape_utils.hpp"
+#include <opencv2/core/utils/configuration.private.hpp>
 
 #include "../test/test_common.hpp"
 
@@ -21,6 +22,7 @@ public:
     dnn::Target target;
 
     dnn::Net net;
+    std::string pinnedInput;
 
     DNNTestNetwork()
     {
@@ -28,19 +30,14 @@ public:
         target = (dnn::Target)(int)get<1>(GetParam());
     }
 
-    void processNet(std::string weights, std::string proto, std::string halide_scheduler,
+    void processNet(std::string weights, std::string proto,
                     const std::vector<std::tuple<Mat, std::string>>& inputs, const std::string& outputLayer = ""){
         weights = findDataFile(weights, false);
         if (!proto.empty())
             proto = findDataFile(proto);
-        if (backend == DNN_BACKEND_HALIDE)
-        {
-            if (halide_scheduler == "disabled")
-                throw cvtest::SkipTestException("Halide test is disabled");
-            if (!halide_scheduler.empty())
-                halide_scheduler = findDataFile(std::string("dnn/halide_scheduler_") + (target == DNN_TARGET_OPENCL ? "opencl_" : "") + halide_scheduler, true);
-        }
         net = readNet(weights, proto);
+        if (!pinnedInput.empty())
+            net.setInputShape(pinnedInput, shape(std::get<0>(inputs[0])));
         // Set multiple inputs
         for(auto &inp: inputs){
             net.setInput(std::get<0>(inp), std::get<1>(inp));
@@ -48,23 +45,31 @@ public:
 
         net.setPreferableBackend(backend);
         net.setPreferableTarget(target);
-        if (backend == DNN_BACKEND_HALIDE)
-        {
-            net.setHalideScheduler(halide_scheduler);
-        }
 
         // Calculate multiple inputs memory consumption
         std::vector<MatShape> netMatShapes;
         for(auto &inp: inputs){
             netMatShapes.push_back(shape(std::get<0>(inp)));
         }
-        size_t weightsMemory = 0, blobsMemory = 0;
-        net.getMemoryConsumption(netMatShapes, weightsMemory, blobsMemory);
-        int64 flops = net.getFLOPS(netMatShapes);
-        CV_Assert(flops > 0);
+
+        bool fp16 = false;
+#ifdef HAVE_OPENCL
+        fp16 = ocl::Device::getDefault().isExtensionSupported("cl_khr_fp16");
+#endif
+        std::vector<cv::dnn::MatType> netMatTypes;
+        for (auto& inp : inputs) {
+            cv::dnn::MatType t = std::get<0>(inp).depth();
+            if (t == CV_32F && fp16 && target == DNN_TARGET_OPENCL_FP16)
+                t = CV_16F;
+            netMatTypes.push_back(t);
+        }
 
         net.forward(outputLayer); // warmup
 
+        size_t weightsMemory = 0, blobsMemory = 0;
+        net.getMemoryConsumption(netMatShapes, netMatTypes, weightsMemory, blobsMemory);
+        int64 flops = net.getFLOPS(netMatShapes, netMatTypes);
+        CV_Assert(flops > 0);
         std::cout << "Memory consumption:" << std::endl;
         std::cout << "    Weights(parameters): " << divUp(weightsMemory, 1u<<20) << " Mb" << std::endl;
         std::cout << "    Blobs: " << divUp(blobsMemory, 1u<<20) << " Mb" << std::endl;
@@ -77,148 +82,132 @@ public:
         SANITY_CHECK_NOTHING();
     }
 
-    void processNet(std::string weights, std::string proto, std::string halide_scheduler,
+    void processNet(std::string weights, std::string proto,
                     Mat &input, const std::string& outputLayer = "")
     {
-        processNet(weights, proto, halide_scheduler, {std::make_tuple(input, "")}, outputLayer);
+        processNet(weights, proto, {std::make_tuple(input, "")}, outputLayer);
     }
 
-    void processNet(std::string weights, std::string proto, std::string halide_scheduler,
+    void processNet(std::string weights, std::string proto,
                     Size inpSize, const std::string& outputLayer = "")
     {
         Mat input_data(inpSize, CV_32FC3);
         randu(input_data, 0.0f, 1.0f);
         Mat input = blobFromImage(input_data, 1.0, Size(), Scalar(), false);
-        processNet(weights, proto, halide_scheduler, input, outputLayer);
+        processNet(weights, proto, input, outputLayer);
     }
 };
 
 PERF_TEST_P_(DNNTestNetwork, AlexNet)
 {
-    processNet("dnn/bvlc_alexnet.caffemodel", "dnn/bvlc_alexnet.prototxt",
-            "alexnet.yml", cv::Size(227, 227));
+    processNet("dnn/onnx/models/alexnet.onnx", "", cv::Size(227, 227));
 }
 
 PERF_TEST_P_(DNNTestNetwork, GoogLeNet)
 {
-    processNet("dnn/bvlc_googlenet.caffemodel", "dnn/bvlc_googlenet.prototxt",
-            "", cv::Size(224, 224));
+    processNet("dnn/onnx/models/googlenet.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, ResNet_50)
 {
-    processNet("dnn/ResNet-50-model.caffemodel", "dnn/ResNet-50-deploy.prototxt",
-            "resnet_50.yml", cv::Size(224, 224));
+    processNet("dnn/onnx/models/resnet50v1.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, ResNet_18_v1_ONNX)
+{
+    processNet("dnn/onnx/models/resnet18v1.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, ResNet_50_v1_ONNX)
+{
+    processNet("dnn/onnx/models/resnet50v1.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, MobileNetv2_ONNX)
+{
+    processNet("dnn/onnx/models/mobilenetv2.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, ResNet50_QDQ_ONNX)
+{
+    processNet("dnn/onnx/models/resnet50-v1-12-qdq.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, SqueezeNet_v1_1)
 {
-    processNet("dnn/squeezenet_v1.1.caffemodel", "dnn/squeezenet_v1.1.prototxt",
-            "squeezenet_v1_1.yml", cv::Size(227, 227));
+    processNet("dnn/onnx/models/squeezenet.onnx", "", cv::Size(227, 227));
 }
 
 PERF_TEST_P_(DNNTestNetwork, Inception_5h)
 {
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019) throw SkipTestException("");
-    processNet("dnn/tensorflow_inception_graph.pb", "",
-            "inception_5h.yml",
-            cv::Size(224, 224), "softmax2");
-}
-
-PERF_TEST_P_(DNNTestNetwork, ENet)
-{
-    if ((backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target != DNN_TARGET_CPU) ||
-        (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_OPENCL_FP16))
-        throw SkipTestException("");
-#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_GE(2021010000)
-    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
-        throw SkipTestException("");
-#endif
-    processNet("dnn/Enet-model-best.net", "", "enet.yml",
-            cv::Size(512, 256));
+    processNet("dnn/onnx/models/tensorflow_inception_graph.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, SSD)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    processNet("dnn/VGG_ILSVRC2016_SSD_300x300_iter_440000.caffemodel", "dnn/ssd_vgg16.prototxt", "disabled",
-            cv::Size(300, 300));
+    processNet("dnn/onnx/models/ssd_vgg16.onnx", "", cv::Size(300, 300));
 }
 
-PERF_TEST_P_(DNNTestNetwork, OpenFace)
+PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_v1_ONNX)
 {
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-#if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2018050000)
-    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && (target == DNN_TARGET_MYRIAD || target == DNN_TARGET_HDDL))
-        throw SkipTestException("");
-#endif
-    processNet("dnn/openface_nn4.small2.v1.t7", "", "",
-            cv::Size(96, 96));
-}
+    // Dynamic-shape preprocessing in this model needs the new engine; OpenVINO uses the classic one.
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH)
+        applyTestTag(CV_TEST_TAG_DNN_SKIP_IE_NGRAPH);
 
-PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_Caffe)
-{
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/MobileNetSSD_deploy_19e3ec3.caffemodel", "dnn/MobileNetSSD_deploy_19e3ec3.prototxt", "",
-            cv::Size(300, 300));
+    // This model expects a uint8 NHWC image as input.
+    Mat image(cv::Size(300, 300), CV_8UC3);
+    randu(image, 0, 255);
+    int imsize[] = {1, image.rows, image.cols, 3};
+    Mat input(4, imsize, CV_8U, image.data);
+    processNet("dnn/onnx/models/ssd_mobilenet_v1_12.onnx", "", input);
 }
 
 PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_v1_TensorFlow)
 {
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/ssd_mobilenet_v1_coco_2017_11_17.pb", "ssd_mobilenet_v1_coco_2017_11_17.pbtxt", "",
-            cv::Size(300, 300));
+    // image_tensor input is NHWC uint8
+    Mat img(cv::Size(300, 300), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 300, 300, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/ssd_mobilenet_v1_coco.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, MobileNet_SSD_v2_TensorFlow)
 {
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/ssd_mobilenet_v2_coco_2018_03_29.pb", "ssd_mobilenet_v2_coco_2018_03_29.pbtxt", "",
-            cv::Size(300, 300));
+    Mat img(cv::Size(300, 300), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 300, 300, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/ssd_mobilenet_v2_coco_2018_03_29.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, DenseNet_121)
 {
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/DenseNet_121.caffemodel", "dnn/DenseNet_121.prototxt", "",
-               cv::Size(224, 224));
+    processNet("dnn/onnx/models/densenet121.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, OpenPose_pose_mpi_faster_4_stages)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    if (backend == DNN_BACKEND_HALIDE ||
-        (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && (target == DNN_TARGET_MYRIAD || target == DNN_TARGET_HDDL)))
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && (target == DNN_TARGET_MYRIAD || target == DNN_TARGET_HDDL))
         throw SkipTestException("");
-    // The same .caffemodel but modified .prototxt
     // See https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/src/openpose/pose/poseParameters.cpp
-    processNet("dnn/openpose_pose_mpi.caffemodel", "dnn/openpose_pose_mpi_faster_4_stages.prototxt", "",
-               cv::Size(368, 368));
-}
-
-PERF_TEST_P_(DNNTestNetwork, opencv_face_detector)
-{
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/opencv_face_detector.caffemodel", "dnn/opencv_face_detector.prototxt", "",
-               cv::Size(300, 300));
+    processNet("dnn/onnx/models/openpose_pose_mpi.onnx", "", cv::Size(368, 368));
 }
 
 PERF_TEST_P_(DNNTestNetwork, Inception_v2_SSD_TensorFlow)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/ssd_inception_v2_coco_2017_11_17.pb", "ssd_inception_v2_coco_2017_11_17.pbtxt", "",
-            cv::Size(300, 300));
+    Mat img(cv::Size(300, 300), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 300, 300, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/ssd_inception_v2_coco_2017_11_17.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOv3)
@@ -227,8 +216,6 @@ PERF_TEST_P_(DNNTestNetwork, YOLOv3)
         CV_TEST_TAG_MEMORY_2GB,
         CV_TEST_TAG_DEBUG_VERYLONG
     );
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2020040000)  // nGraph compilation failure
     if (backend == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH && target == DNN_TARGET_OPENCL)
         throw SkipTestException("Test is disabled in OpenVINO 2020.4");
@@ -241,8 +228,9 @@ PERF_TEST_P_(DNNTestNetwork, YOLOv3)
 #endif
 
     Mat sample = imread(findDataFile("dnn/dog416.png"));
+    cv::resize(sample, sample, Size(416, 416));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(), Scalar(), true);
-    processNet("dnn/yolov3.weights", "dnn/yolov3.cfg", "", inp);
+    processNet("dnn/yolov3-converted.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOv4)
@@ -251,8 +239,6 @@ PERF_TEST_P_(DNNTestNetwork, YOLOv4)
         CV_TEST_TAG_MEMORY_2GB,
         CV_TEST_TAG_DEBUG_VERYLONG
     );
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
     if (target == DNN_TARGET_MYRIAD)  // not enough resources
         throw SkipTestException("");
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_EQ(2020040000)  // nGraph compilation failure
@@ -262,28 +248,27 @@ PERF_TEST_P_(DNNTestNetwork, YOLOv4)
         throw SkipTestException("Test is disabled in OpenVINO 2020.4");
 #endif
     Mat sample = imread(findDataFile("dnn/dog416.png"));
+    cv::resize(sample, sample, Size(608, 608));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(), Scalar(), true);
-    processNet("dnn/yolov4.weights", "dnn/yolov4.cfg", "", inp);
+    processNet("dnn/yolov4.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOv4_tiny)
 {
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
 #if defined(INF_ENGINE_RELEASE) && INF_ENGINE_VER_MAJOR_GE(2021010000)  // nGraph compilation failure
     if (target == DNN_TARGET_MYRIAD)
         throw SkipTestException("");
 #endif
     Mat sample = imread(findDataFile("dnn/dog416.png"));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(), Scalar(), true);
-    processNet("dnn/yolov4-tiny-2020-12.weights", "dnn/yolov4-tiny-2020-12.cfg", "", inp);
+    processNet("dnn/yolov4-tiny.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOv5) {
     applyTestTag(CV_TEST_TAG_MEMORY_512MB);
     Mat sample = imread(findDataFile("dnn/dog416.png"));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(640, 640), Scalar(), true);
-    processNet("dnn/yolov5n.onnx", "", "", inp);
+    processNet("dnn/yolov5n.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOv8)
@@ -295,7 +280,7 @@ PERF_TEST_P_(DNNTestNetwork, YOLOv8)
 
     Mat sample = imread(findDataFile("dnn/dog416.png"));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(640, 640), Scalar(), true);
-    processNet("dnn/yolov8n.onnx", "", "", inp);
+    processNet("dnn/yolov8n.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, YOLOX) {
@@ -305,25 +290,21 @@ PERF_TEST_P_(DNNTestNetwork, YOLOX) {
     );
     Mat sample = imread(findDataFile("dnn/dog416.png"));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(640, 640), Scalar(), true);
-    processNet("dnn/yolox_s.onnx", "", "", inp);
+    processNet("dnn/yolox_s.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, EAST_text_detection)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/frozen_east_text_detection.pb", "", "", cv::Size(320, 320));
+    processNet("dnn/onnx/models/east_text_detection.onnx", "", cv::Size(320, 320));
 }
 
 PERF_TEST_P_(DNNTestNetwork, FastNeuralStyle_eccv16)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    if (backend == DNN_BACKEND_HALIDE)
-        throw SkipTestException("");
-    processNet("dnn/fast_neural_style_eccv16_starry_night.t7", "", "", cv::Size(320, 240));
+    processNet("dnn/mosaic-9.onnx", "", cv::Size(224, 224));
 }
 
 PERF_TEST_P_(DNNTestNetwork, Inception_v2_Faster_RCNN)
@@ -342,78 +323,91 @@ PERF_TEST_P_(DNNTestNetwork, Inception_v2_Faster_RCNN)
     if (target == DNN_TARGET_MYRIAD)
         throw SkipTestException("Test is disabled in OpenVINO 2021.1+ / MYRIAD");
 #endif
-    if (backend == DNN_BACKEND_HALIDE ||
-        (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target != DNN_TARGET_CPU) ||
-        (backend == DNN_BACKEND_OPENCV && target == DNN_TARGET_OPENCL_FP16))
+    if (backend == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019 && target != DNN_TARGET_CPU)
         throw SkipTestException("");
-    processNet("dnn/faster_rcnn_inception_v2_coco_2018_01_28.pb",
-               "dnn/faster_rcnn_inception_v2_coco_2018_01_28.pbtxt", "",
-               cv::Size(800, 600));
+    // image_tensor input is NHWC uint8
+    Mat img = imread(findDataFile("dnn/dog416.png"));
+    cv::resize(img, img, Size(800, 600));
+    cvtColor(img, img, COLOR_BGR2RGB);
+    int s[] = {1, 600, 800, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/faster_rcnn_inception_v2_coco_2018_01_28.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, EfficientDet)
 {
-    if (backend == DNN_BACKEND_HALIDE || target != DNN_TARGET_CPU)
+    if (target != DNN_TARGET_CPU)
         throw SkipTestException("");
-    Mat sample = imread(findDataFile("dnn/dog416.png"));
-    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(512, 512), Scalar(), true);
-    processNet("dnn/efficientdet-d0.pb", "dnn/efficientdet-d0.pbtxt", "", inp);
+    // image_arrays input is NHWC uint8
+    Mat img(cv::Size(512, 512), CV_8UC3);
+    randu(img, 0, 255);
+    int s[] = {1, 512, 512, 3};
+    Mat inp(4, s, CV_8U, img.data);
+    processNet("dnn/onnx/models/efficientdet-d0.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, EfficientNet)
 {
     Mat sample = imread(findDataFile("dnn/dog416.png"));
     Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(), true);
-    transposeND(inp, {0, 2, 3, 1}, inp);
-    processNet("dnn/efficientnet-lite4.onnx", "", "", inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
+    processNet("dnn/efficientnet-lite4.onnx", "", inp);
 }
 
-PERF_TEST_P_(DNNTestNetwork, YuNet) {
-    processNet("dnn/onnx/models/yunet-202303.onnx", "", "", cv::Size(640, 640));
+PERF_TEST_P_(DNNTestNetwork, YuNet_320) {
+    processNet("dnn/onnx/models/yunet-202605.onnx", "", cv::Size(320, 320));
+}
+
+PERF_TEST_P_(DNNTestNetwork, YuNet_640) {
+    processNet("dnn/onnx/models/yunet-202605.onnx", "", cv::Size(640, 640));
+}
+
+PERF_TEST_P_(DNNTestNetwork, YuNet_1280) {
+    processNet("dnn/onnx/models/yunet-202605.onnx", "", cv::Size(1280, 736));
 }
 
 PERF_TEST_P_(DNNTestNetwork, SFace) {
-    processNet("dnn/face_recognition_sface_2021dec.onnx", "", "", cv::Size(112, 112));
+    processNet("dnn/face_recognition_sface_2021dec.onnx", "", cv::Size(112, 112));
 }
 
 PERF_TEST_P_(DNNTestNetwork, MPPalm) {
     Mat inp(cv::Size(192, 192), CV_32FC3);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    transposeND(inp, {0, 2, 3, 1}, inp);
-    processNet("dnn/palm_detection_mediapipe_2023feb.onnx", "", "", inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
+    processNet("dnn/palm_detection_mediapipe_2023feb.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, MPHand) {
     Mat inp(cv::Size(224, 224), CV_32FC3);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    transposeND(inp, {0, 2, 3, 1}, inp);
-    processNet("dnn/handpose_estimation_mediapipe_2023feb.onnx", "", "", inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
+    processNet("dnn/handpose_estimation_mediapipe_2023feb.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, MPPose) {
     Mat inp(cv::Size(256, 256), CV_32FC3);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    transposeND(inp, {0, 2, 3, 1}, inp);
-    processNet("dnn/pose_estimation_mediapipe_2023mar.onnx", "", "", inp);
+    cv::transpose(inp, {0, 2, 3, 1}, inp);
+    processNet("dnn/pose_estimation_mediapipe_2023mar.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, PPOCRv3) {
     applyTestTag(CV_TEST_TAG_MEMORY_512MB);
-    processNet("dnn/onnx/models/PP_OCRv3_DB_text_det.onnx", "", "", cv::Size(736, 736));
+    processNet("dnn/onnx/models/PP_OCRv3_DB_text_det.onnx", "", cv::Size(736, 736));
 }
 
 PERF_TEST_P_(DNNTestNetwork, PPHumanSeg) {
-    processNet("dnn/human_segmentation_pphumanseg_2023mar.onnx", "", "", cv::Size(192, 192));
+    processNet("dnn/human_segmentation_pphumanseg_2023mar.onnx", "", cv::Size(192, 192));
 }
 
 PERF_TEST_P_(DNNTestNetwork, CRNN) {
     Mat inp(cv::Size(100, 32), CV_32FC1);
     randu(inp, 0.0f, 1.0f);
     inp = blobFromImage(inp, 1.0, Size(), Scalar(), false);
-    processNet("dnn/text_recognition_CRNN_EN_2021sep.onnx", "", "", inp);
+    processNet("dnn/text_recognition_CRNN_EN_2021sep.onnx", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, VitTrack) {
@@ -423,8 +417,7 @@ PERF_TEST_P_(DNNTestNetwork, VitTrack) {
     randu(inp2, 0.0f, 1.0f);
     inp1 = blobFromImage(inp1, 1.0, Size(), Scalar(), false);
     inp2 = blobFromImage(inp2, 1.0, Size(), Scalar(), false);
-    processNet("dnn/onnx/models/object_tracking_vittrack_2023sep.onnx", "", "",
-               {std::make_tuple(inp1, "template"), std::make_tuple(inp2, "search")});
+    processNet("dnn/onnx/models/object_tracking_vittrack_2023sep.onnx", "", {std::make_tuple(inp1, "template"), std::make_tuple(inp2, "search")});
 }
 
 PERF_TEST_P_(DNNTestNetwork, EfficientDet_int8)
@@ -435,14 +428,508 @@ PERF_TEST_P_(DNNTestNetwork, EfficientDet_int8)
     }
     Mat inp = imread(findDataFile("dnn/dog416.png"));
     inp = blobFromImage(inp, 1.0 / 255.0, Size(320, 320), Scalar(), true);
-    processNet("dnn/tflite/coco_efficientdet_lite0_v1_1.0_quant_2021_09_06.tflite", "", "", inp);
+    processNet("dnn/tflite/coco_efficientdet_lite0_v1_1.0_quant_2021_09_06.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YuNet_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/face_detection_yunet_2023mar_int8.onnx", "", cv::Size(640, 640));
+}
+
+PERF_TEST_P_(DNNTestNetwork, SFace_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/face_recognition_sface_2021dec_int8.onnx", "", cv::Size(112, 112));
+}
+
+PERF_TEST_P_(DNNTestNetwork, DenseNet_121_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/densenet-12-int8.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, EfficientNet_int8)
+{
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    transposeND(inp, {0, 2, 3, 1}, inp);
+    processNet("dnn/onnx/models/efficientnet-lite4-11-int8.onnx", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, PPOCRv3_int8)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    if (target != DNN_TARGET_CPU || backend != DNN_BACKEND_OPENCV)
+        throw SkipTestException("");
+    processNet("dnn/onnx/models/text_detection_en_ppocrv3_2023may_int8.onnx", "", cv::Size(736, 736));
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLOv8n_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/dog416.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolov8n.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLOv5nu_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/dog416.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolov5nu.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLO26n_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/dog416.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolo26n.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YOLO26n_seg_TFLite)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    Mat inp = imread(findDataFile("dnn/street.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/tflite/yolo26n-seg.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, ResNet18_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/space_shuttle.jpg"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/resnet18.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, MobileNetV2_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/space_shuttle.jpg"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/mobilenet_v2.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, SqueezeNet_v1_1_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/space_shuttle.jpg"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/squeezenet1_1.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, YuNet_TFLite)
+{
+    Mat inp = imread(findDataFile("cv/shared/lena.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(160, 120), Scalar(), true);
+    processNet("dnn/tflite/yunet_float32.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, HandLandmark_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/pose.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/tflite/hand_landmark_lite.tflite", "", inp);
+}
+
+PERF_TEST_P_(DNNTestNetwork, PoseLandmark_TFLite)
+{
+    Mat inp = imread(findDataFile("dnn/pose.png"));
+    inp = blobFromImage(inp, 1.0 / 255.0, Size(256, 256), Scalar(), true);
+    processNet("dnn/tflite/pose_landmark_lite.tflite", "", inp);
 }
 
 PERF_TEST_P_(DNNTestNetwork, VIT_B_32)
 {
     applyTestTag(CV_TEST_TAG_DEBUG_VERYLONG);
 
-    processNet("dnn/onnx/models/vit_b_32.onnx", "", "", cv::Size(224, 224));
+    processNet("dnn/onnx/models/vit_b_32.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, BERT)
+{
+    const int seq_len = 9;
+    int64_t input_ids_data[seq_len] = {101, 1996, 103, 2938, 2006, 1996, 13523, 1012, 102};
+    int64_t attention_mask_data[seq_len] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
+    int64_t token_type_ids_data[seq_len] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int shp[2] = {1, seq_len};
+    Mat input_ids(2, shp, CV_64S, input_ids_data);
+    Mat attention_mask(2, shp, CV_64S, attention_mask_data);
+    Mat token_type_ids(2, shp, CV_64S, token_type_ids_data);
+    processNet("dnn/onnx/models/bert.onnx", "",
+               {std::make_tuple(input_ids, "input_ids"),
+                std::make_tuple(attention_mask, "attention_mask"),
+                std::make_tuple(token_type_ids, "token_type_ids")});
+}
+
+PERF_TEST_P_(DNNTestNetwork, VIT_Base_Patch16_224)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    pinnedInput = "x";
+    processNet("dnn/vit_base_patch16_224_Opset16.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, DeiT_Tiny_Patch16_224)
+{
+    pinnedInput = "x";
+    processNet("dnn/deit_tiny_patch16_224_Opset16.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, MobileViT_XS)
+{
+    processNet("dnn/mobilevit_xs_Opset16.onnx", "", cv::Size(256, 256));
+}
+
+PERF_TEST_P_(DNNTestNetwork, MobileViTv2_100_ONNX)
+{
+    processNet("dnn/mobilevitv2_100_Opset16.onnx", "", cv::Size(256, 256));
+}
+
+PERF_TEST_P_(DNNTestNetwork, BEiT_Base_Patch16_224)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+    processNet("dnn/beit_base_patch16_224_Opset16.onnx", "", cv::Size(224, 224));
+}
+
+PERF_TEST_P_(DNNTestNetwork, BlazeFace)
+{
+    Mat input(cv::Size(128, 128), CV_32FC3);
+    randu(input, 0.0f, 1.0f);
+    input = blobFromImage(input, 1.0 / 255.0, Size(128, 128));
+
+    const int oneDim[] = {1};
+    Mat conf(1, oneDim, CV_32F); conf.ptr<float>()[0] = 0.20f;
+    Mat iou(1, oneDim, CV_32F); iou.ptr<float>()[0] = 0.30f;
+    Mat maxDet(1, oneDim, CV_64S); maxDet.ptr<int64_t>()[0] = 25;
+
+    processNet("dnn/onnx/models/blazeface.onnx", "",
+               {std::make_tuple(input, "image"),
+                std::make_tuple(conf, "conf_threshold"),
+                std::make_tuple(iou, "iou_threshold"),
+                std::make_tuple(maxDet, "max_detections")});
+}
+
+PERF_TEST_P_(DNNTestNetwork, FacePaint)
+{
+    processNet("dnn/onnx/models/face_paint_512_v2_0.onnx", "", cv::Size(512, 512));
+}
+
+// Model: https://huggingface.co/vietanhdev/segment-anything-2-onnx-models/blob/main/sam2_hiera_large.encoder.onnx
+PERF_TEST_P_(DNNTestNetwork, SAM2_Encoder)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_2GB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(1024, 1024), Scalar(), true);
+    processNet("dnn/onnx/models/sam2_hiera_large.encoder.onnx", "", inp);
+}
+
+// Model: https://huggingface.co/vietanhdev/segment-anything-2-onnx-models/blob/main/sam2_hiera_large.decoder.onnx
+PERF_TEST_P_(DNNTestNetwork, SAM2_Decoder)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_1GB, CV_TEST_TAG_VERYLONG);
+
+    // Synthetic encoder outputs used as decoder inputs
+    int shp_embed[4]  = {1, 256, 64, 64};
+    int shp_feat0[4]  = {1, 32, 256, 256};
+    int shp_feat1[4]  = {1, 64, 128, 128};
+
+    Mat image_embed(4, shp_embed, CV_32F);
+    Mat high_res_feats_0(4, shp_feat0, CV_32F);
+    Mat high_res_feats_1(4, shp_feat1, CV_32F);
+    randu(image_embed, 0.0f, 1.0f);
+    randu(high_res_feats_0, 0.0f, 1.0f);
+    randu(high_res_feats_1, 0.0f, 1.0f);
+
+    // Single point prompt at center of image, label=1 (foreground)
+    int shp_pts[3]   = {1, 1, 2};
+    int shp_lbl[2]   = {1, 1};
+    int shp_mask[4]  = {1, 1, 256, 256};
+    int shp_hasmask[1] = {1};
+    float point_coords_data[2]  = {512.0f, 512.0f};
+    float point_labels_data[1]  = {1.0f};
+    float has_mask_input_data[1]= {0.0f};
+    Mat point_coords(3, shp_pts, CV_32F, point_coords_data);
+    Mat point_labels(2, shp_lbl, CV_32F, point_labels_data);
+    Mat mask_input(4, shp_mask, CV_32F, Scalar(0));
+    Mat has_mask_input(1, shp_hasmask, CV_32F, has_mask_input_data);
+
+    processNet("dnn/onnx/models/sam2_hiera_large.decoder.onnx", "",
+               {std::make_tuple(image_embed,      "image_embed"),
+                std::make_tuple(high_res_feats_0, "high_res_feats_0"),
+                std::make_tuple(high_res_feats_1, "high_res_feats_1"),
+                std::make_tuple(point_coords,     "point_coords"),
+                std::make_tuple(point_labels,     "point_labels"),
+                std::make_tuple(mask_input,       "mask_input"),
+                std::make_tuple(has_mask_input,   "has_mask_input")});
+}
+
+// Model: https://huggingface.co/onnx-community/sam3-tracker-ONNX/blob/main/onnx/prompt_encoder_mask_decoder.onnx
+PERF_TEST_P_(DNNTestNetwork, SAM3_Decoder)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_1GB, CV_TEST_TAG_VERYLONG);
+
+    // Synthetic encoder outputs used as decoder inputs
+    int shp_emb0[4] = {1, 32, 288, 288};
+    int shp_emb1[4] = {1, 64, 144, 144};
+    int shp_emb2[4] = {1, 256, 72, 72};
+    Mat image_embeddings_0(4, shp_emb0, CV_32F);
+    Mat image_embeddings_1(4, shp_emb1, CV_32F);
+    Mat image_embeddings_2(4, shp_emb2, CV_32F);
+    randu(image_embeddings_0, -0.2f, 0.2f);
+    randu(image_embeddings_1, -0.2f, 0.2f);
+    randu(image_embeddings_2, -0.2f, 0.2f);
+
+    // One foreground point and one box in the 1008x1008 input image
+    int shp_pts[4] = {1, 1, 1, 2};
+    int shp_lbl[3] = {1, 1, 1};
+    int shp_box[3] = {1, 1, 4};
+    float input_points_data[2] = {504.0f, 504.0f};
+    int64_t input_labels_data[1] = {1};
+    float input_boxes_data[4] = {252.0f, 252.0f, 756.0f, 756.0f};
+    Mat input_points(4, shp_pts, CV_32F, input_points_data);
+    Mat input_labels(3, shp_lbl, CV_64S, input_labels_data);
+    Mat input_boxes(3, shp_box, CV_32F, input_boxes_data);
+
+    processNet("dnn/onnx/models/sam3_tracker/prompt_encoder_mask_decoder.onnx", "",
+               {std::make_tuple(input_points,       "input_points"),
+                std::make_tuple(input_labels,       "input_labels"),
+                std::make_tuple(input_boxes,        "input_boxes"),
+                std::make_tuple(image_embeddings_0, "image_embeddings.0"),
+                std::make_tuple(image_embeddings_1, "image_embeddings.1"),
+                std::make_tuple(image_embeddings_2, "image_embeddings.2")});
+}
+
+// Model: https://github.com/opencv/opencv_zoo/tree/main/models/optical_flow_estimation_raft
+PERF_TEST_P_(DNNTestNetwork, RAFT)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_2GB, CV_TEST_TAG_VERYLONG);
+
+    // RAFT takes two consecutive frames to estimate optical flow between them
+    Mat frame0 = imread(findDataFile("gpu/opticalflow/frame0.png"));
+    Mat frame1 = imread(findDataFile("gpu/opticalflow/frame1.png"));
+    Mat blob0 = blobFromImage(frame0, 1.0, Size(480, 360), Scalar(), true);
+    Mat blob1 = blobFromImage(frame1, 1.0, Size(480, 360), Scalar(), true);
+
+    processNet("dnn/onnx/models/optical_flow_estimation_raft_2023aug.onnx", "",
+               {std::make_tuple(blob0, "0"),
+                std::make_tuple(blob1, "1")});
+}
+
+// Model: https://huggingface.co/onnx-community/owlv2-base-patch16-finetuned-ONNX
+PERF_TEST_P_(DNNTestNetwork, OWLv2)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_1GB, CV_TEST_TAG_VERYLONG);
+
+    // Image input: [1, 3, 960, 960] (60x60 patches x 16 = 960)
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat pixel_values = blobFromImage(sample, 1.0 / 255.0, Size(960, 960), Scalar(), true);
+
+    // Text query tokens: "a dog" with CLIP tokenizer, seq_len=16
+    // [BOS=49406, "a"=320, "dog"=1929, EOS=49407, pad=0, ...]
+    const int seq_len = 16;
+    int shp[2] = {1, seq_len};
+    int64_t input_ids_data[seq_len]     = {49406, 320, 1929, 49407, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int64_t attention_mask_data[seq_len]= {1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    Mat input_ids(2, shp, CV_64S, input_ids_data);
+    Mat attention_mask(2, shp, CV_64S, attention_mask_data);
+
+    processNet("dnn/onnx/models/owlv2_base_patch_16.onnx", "",
+               {std::make_tuple(input_ids,      "input_ids"),
+                std::make_tuple(pixel_values,   "pixel_values"),
+                std::make_tuple(attention_mask, "attention_mask")});
+}
+
+// Model: https://drive.google.com/file/d/1IU7iktOUbvNPFnDJb_ivl3LxYIdpEp3f/view?usp=drive_link
+PERF_TEST_P_(DNNTestNetwork, YOLO26m_Seg)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/onnx/models/yolo26m-seg.onnx", "", inp);
+}
+
+// Model: https://drive.google.com/file/d/17OWMXSiefFMmj46CT42Fd2q5kl_jHRBC/view?usp=drive_link
+PERF_TEST_P_(DNNTestNetwork, YOLO26n)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/onnx/models/yolo26n.onnx", "", inp);
+}
+
+// Model: https://huggingface.co/Xenova/segformer_b2_clothes/blob/main/onnx/model.onnx
+PERF_TEST_P_(DNNTestNetwork, SegFormer_B2_Clothes)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(512, 512), Scalar(), true);
+    processNet("dnn/onnx/models/segformer_b2_clothes.onnx", "", inp);
+}
+
+// Model: https://huggingface.co/Xenova/siglip-base-patch16-224/blob/main/onnx/model.onnx
+PERF_TEST_P_(DNNTestNetwork, SigLIP)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    // Image input: [1, 3, 224, 224] normalized to [-1, 1]
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat pixel_values = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(0.5, 0.5, 0.5), true);
+    pixel_values = (pixel_values - 0.5f) / 0.5f;
+
+    // Text input: dummy token IDs for "a photo of a dog", seq_len=64
+    const int seq_len = 64;
+    int shp[2] = {1, seq_len};
+    Mat input_ids(2, shp, CV_64S, Scalar(0));
+    // BOS=1, "a photo of a dog"=some tokens, EOS=2
+    int64_t* ids = input_ids.ptr<int64_t>();
+    ids[0] = 1; ids[1] = 263; ids[2] = 2514; ids[3] = 275; ids[4] = 262; ids[5] = 3914; ids[6] = 2;
+
+    processNet("dnn/onnx/models/siglip_base_patch16_224.onnx", "",
+               {std::make_tuple(input_ids,    "input_ids"),
+                std::make_tuple(pixel_values, "pixel_values")});
+}
+
+// Model: https://huggingface.co/onnx-community/depth-anything-v2-small/blob/main/onnx/model.onnx
+PERF_TEST_P_(DNNTestNetwork, Depth_Anything_V2)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/street.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(518, 518), Scalar(), true);
+    processNet("dnn/onnx/models/depth_anything_v2_small.onnx", "", inp);
+}
+
+// Model: https://drive.google.com/file/d/1G2begS7rrEmWnI-xj2K5UL3PQ7H_0svc/view?usp=drive_link
+PERF_TEST_P_(DNNTestNetwork, RetinaFace)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB);
+
+    processNet("dnn/onnx/models/retinaface_10g.onnx", "", cv::Size(640, 640));
+}
+
+// Model: https://huggingface.co/onnx-community/grounding-dino-tiny-ONNX
+PERF_TEST_P_(DNNTestNetwork, Grounding_DINO)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_2GB, CV_TEST_TAG_VERYLONG);
+
+    // Image input: [1, 3, 800, 800]
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat pixel_values = blobFromImage(sample, 1.0 / 255.0, Size(800, 800), Scalar(), true);
+
+    // Text token inputs (dummy tokens for "dog ." as query text, seq_len=7)
+    const int seq_len = 7;
+    int64_t input_ids_data[seq_len]      = {101, 3899, 1012, 102, 0, 0, 0};
+    int64_t attention_mask_data[seq_len] = {1, 1, 1, 1, 0, 0, 0};
+    int64_t token_type_ids_data[seq_len] = {0, 0, 0, 0, 0, 0, 0};
+
+    int shp[2] = {1, seq_len};
+    Mat input_ids(2, shp, CV_64S, input_ids_data);
+    Mat attention_mask(2, shp, CV_64S, attention_mask_data);
+    Mat token_type_ids(2, shp, CV_64S, token_type_ids_data);
+
+    // Image attention mask: [1, 800, 800] all ones (valid pixels)
+    int shp_mask[3] = {1, 800, 800};
+    Mat pixel_mask(3, shp_mask, CV_64S, Scalar(1));
+
+    processNet("dnn/onnx/models/grounding_dino_tiny.onnx", "",
+               {std::make_tuple(pixel_values,  "pixel_values"),
+                std::make_tuple(input_ids,     "input_ids"),
+                std::make_tuple(token_type_ids,"token_type_ids"),
+                std::make_tuple(attention_mask,"attention_mask"),
+                std::make_tuple(pixel_mask,    "pixel_mask")});
+}
+
+// Model: https://drive.google.com/file/d/1P6a7oS_dV5y09FsCA4XDZK1-WcdZbWFh/view?usp=drive_link
+PERF_TEST_P_(DNNTestNetwork, RF_DETR)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_1GB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(560, 560), Scalar(), true);
+    processNet("dnn/onnx/models/rfdetr.onnx", "", inp);
+}
+
+// Model: https://drive.google.com/file/d/1OrSmlXURayVQgW8nrrxjggzPMN7xPRGJ/view?usp=sharing
+PERF_TEST_P_(DNNTestNetwork, RT_DETR_L)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_1GB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(640, 640), Scalar(), true);
+    processNet("dnn/onnx/models/rtdetr-l.onnx", "", inp);
+}
+
+// Model: https://drive.google.com/file/d/1HuR5jeGtgX6TKFlWR5JjwZ7be-JDwz57/view?usp=drive_link
+PERF_TEST_P_(DNNTestNetwork, RTMPose_M)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(192, 256), Scalar(), true);
+    processNet("dnn/onnx/models/rtmpose_m.onnx", "", inp);
+}
+
+// Model: https://huggingface.co/tomjackson2023/rembg/resolve/main/u2net.onnx
+PERF_TEST_P_(DNNTestNetwork, U2Net)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(320, 320), Scalar(), true);
+    processNet("dnn/onnx/models/u2net.onnx", "",
+               {std::make_tuple(inp, "input.1")});
+}
+
+// Model: https://huggingface.co/qualcomm/Real-ESRGAN-x4plus/resolve/01179a4da7bf5ac91faca650e6afbf282ac93933/Real-ESRGAN-x4plus.onnx
+PERF_TEST_P_(DNNTestNetwork, RealESRGAN_x4plus)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(128, 128), Scalar(), true);
+    processNet("dnn/onnx/models/realesrgan_x4plus.onnx", "",
+               {std::make_tuple(inp, "image")});
+}
+
+// Model: https://huggingface.co/rocca/swin-ir-onnx/resolve/main/003_realSR_BSRGAN_DFO_s64w8_SwinIR-M_x4_GAN.onnx
+PERF_TEST_P_(DNNTestNetwork, SwinIR_x4)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(128, 128), Scalar(), true);
+    processNet("dnn/onnx/models/swinir_x4_gan.onnx", "", inp);
+}
+
+// Model: https://huggingface.co/onnx-community/BiRefNet-ONNX/resolve/main/onnx/model.onnx
+PERF_TEST_P_(DNNTestNetwork, BiRefNet)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_2GB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(1024, 1024), Scalar(), true);
+    processNet("dnn/onnx/models/birefnet.onnx", "",
+               {std::make_tuple(inp, "input_image")});
+}
+
+// Model: https://huggingface.co/onnx-community/dinov2-small/resolve/main/onnx/model.onnx
+PERF_TEST_P_(DNNTestNetwork, DINOv2_Small)
+{
+    applyTestTag(CV_TEST_TAG_MEMORY_512MB, CV_TEST_TAG_VERYLONG);
+
+    Mat sample = imread(findDataFile("dnn/dog416.png"));
+    Mat inp = blobFromImage(sample, 1.0 / 255.0, Size(224, 224), Scalar(), true);
+    processNet("dnn/onnx/models/dinov2_small.onnx", "",
+               {std::make_tuple(inp, "pixel_values")});
 }
 
 INSTANTIATE_TEST_CASE_P(/*nothing*/, DNNTestNetwork, dnnBackendsAndTargets());

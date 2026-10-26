@@ -6,9 +6,53 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "../net_impl.hpp"
 #include <cmath>
 
-namespace cv { namespace dnn {
+namespace cv
+{
+namespace dnn
+{
+
+/*
+    RandomNormalLike layer, as defined in ONNX specification:
+    https://onnx.ai/onnx/operators/onnx__RandomNormalLike.html
+
+    Supported Opsets: 1-22
+*/
+
+namespace
+{
+    void fillRandomNormal(OutputArray out, float mean, float scale,
+                          bool has_seed, float seed)
+    {
+        CV_Assert(out.isMat() || out.isUMat());
+        const Scalar mean_s = Scalar::all(mean);
+        const Scalar scale_s = Scalar::all(scale);
+
+        RNG local_rng;
+        if (has_seed)
+        {
+            uint64 seed_u64 = (uint64)std::llround((double)seed);
+            if (!seed_u64)
+                seed_u64 = 0x12345678ULL;
+            local_rng = RNG(seed_u64);
+        }
+
+        RNG& rng = has_seed ? local_rng : theRNG();
+
+        if (out.isMat())
+        {
+            Mat& m = out.getMatRef();
+            rng.fill(m, RNG::NORMAL, mean_s, scale_s);
+        }
+        else
+        {
+            UMat& u = out.getUMatRef();
+            rng.fill(u, RNG::NORMAL, mean_s, scale_s);
+        }
+    }
+}
 
 class RandomNormalLikeLayerImpl CV_FINAL : public RandomNormalLikeLayer
 {
@@ -17,20 +61,14 @@ public:
     {
         setParamsFrom(params);
 
-        mean = params.get<double>("mean", 0.0);
-        scale = params.get<double>("scale", 1.0);
+        mean = params.get<float>("mean", 0.f);
+        scale = params.get<float>("scale", 1.f);
+        int dt = params.get<int>("dtype", -1);
+        outputType = dt >= 0 ? onnxDataTypeToCV(static_cast<OnnxDataType>(dt)) : -1;
+        has_seed = params.has("seed");
+        seed = has_seed ? params.get<float>("seed") : 0.f;
 
-        hasSeed = params.has("seed");
-        if (hasSeed)
-        {
-            seed = params.get<double>("seed");
-        }
-
-        depth = params.get<int>("depth", CV_32F);
-        if (params.has("dtype"))
-        {
-            depth = onnxDataTypeToCV(static_cast<OnnxDataType>(params.get<int>("dtype")));
-        }
+        CV_Assert(scale >= 0.f);
     }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
@@ -38,87 +76,77 @@ public:
         return backendId == DNN_BACKEND_OPENCV;
     }
 
-    virtual bool getMemoryShapes(const std::vector<MatShape>& inputs,
-                                 const int requiredOutputs,
-                                 std::vector<MatShape>& outputs,
-                                 std::vector<MatShape>& internals) const CV_OVERRIDE
+    virtual bool dynamicOutputShapes() const CV_OVERRIDE
     {
-        CV_UNUSED(requiredOutputs);
-        CV_UNUSED(internals);
-        CV_CheckEQ(inputs.size(), 1ull, "RandomNormalLike: one input is expected");
-
-        outputs.assign(1, inputs[0]);
         return false;
     }
 
-    virtual void forward(InputArrayOfArrays inputs_arr,
-                         OutputArrayOfArrays outputs_arr,
-                         OutputArrayOfArrays internals_arr) CV_OVERRIDE
+    bool getMemoryShapes(const std::vector<MatShape>& inputs,
+                         const int requiredOutputs,
+                         std::vector<MatShape>& outputs,
+                         std::vector<MatShape>& internals) const CV_OVERRIDE
     {
-        CV_UNUSED(internals_arr);
+        CV_Assert(inputs.size() == (size_t)1);
+        CV_Check(requiredOutputs, requiredOutputs == 0 || requiredOutputs == 1,
+                 "RandomNormalLike layer expects one output");
+        outputs.assign(1, inputs[0]);
+        internals.clear();
+        return true;
+    }
+
+    void getTypes(const std::vector<MatType>& inputs,
+                  const int requiredOutputs,
+                  const int requiredInternals,
+                  std::vector<MatType>& outputs,
+                  std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size() == (size_t)1);
+        int outType = outputType >= 0 ? outputType : inputs[0];
+        outputs.assign(1, outType);
+        CV_Assert(requiredInternals == 0);
+        internals.clear();
+    }
+
+    void forward(InputArrayOfArrays inputs_arr,
+                 OutputArrayOfArrays outputs_arr,
+                 OutputArrayOfArrays) CV_OVERRIDE
+    {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        std::vector<Mat> inputs, outputs;
-        inputs_arr.getMatVector(inputs);
-        outputs_arr.getMatVector(outputs);
+        Size size = inputs_arr.size();
+        int ninputs = size.area();
+        CV_Assert(ninputs == 1);
 
-        CV_Assert(!inputs.empty());
-        CV_Assert(!outputs.empty());
+        Mat inp = inputs_arr.getMat(0);
+        MatShape outShape = inp.shape();
 
-        Mat out = outputs[0];
-        const int desiredDepth = depth;
-        const bool needRecreate = out.depth() != desiredDepth;
-        Mat outBlob;
-        if (needRecreate)
-        {
-            const int dims = out.dims;
-            const int* sizes = out.size.p;
-            outBlob = Mat(dims, sizes, CV_MAKETYPE(desiredDepth, out.channels()));
-        }
-        else
-        {
-            outBlob = out;
-        }
+        int outType = outputType >= 0 ? outputType : inp.type();
 
-        RNG seededRng;
-        RNG* rng = &theRNG();
-        if (hasSeed)
-        {
-            Cv64suf u;
-            u.f = seed;
-            seededRng = RNG(u.u ? u.u : 1);
-            rng = &seededRng;
-        }
-
-        if (outBlob.depth() == CV_32F || outBlob.depth() == CV_64F || outBlob.depth() == CV_16F)
-        {
-            rng->fill(outBlob, RNG::NORMAL, mean, scale);
-        }
-        else
-        {
-            Mat tmp(outBlob.size.dims(), outBlob.size.p, CV_32F);
-            rng->fill(tmp, RNG::NORMAL, mean, scale);
-            tmp.convertTo(outBlob, outBlob.type());
-        }
-
-        if (needRecreate)
-        {
-            outputs_arr.assign(std::vector<Mat>{outBlob});
+        auto kind = outputs_arr.kind();
+        if (kind == _InputArray::STD_VECTOR_MAT) {
+            std::vector<Mat>& outs = outputs_arr.getMatVecRef();
+            outs.resize(1);
+            outs[0].fit(outShape, outType);
+            fillRandomNormal(outs[0], mean, scale, has_seed, seed);
+        } else if (kind == _InputArray::STD_VECTOR_UMAT) {
+            std::vector<UMat>& outs = outputs_arr.getUMatVecRef();
+            outs.resize(1);
+            outs[0].fit(outShape, outType);
+            fillRandomNormal(outs[0], mean, scale, has_seed, seed);
+        } else {
+            CV_Error(Error::StsNotImplemented, "");
         }
     }
 
 private:
-    double mean;
-    double scale;
-    bool hasSeed = false;
-    double seed = 0.0;
-    int depth;
+    int outputType;
 };
 
-Ptr<RandomNormalLikeLayer> RandomNormalLikeLayer::create(const LayerParams& params)
+Ptr<Layer> RandomNormalLikeLayer::create(const LayerParams& params)
 {
     return makePtr<RandomNormalLikeLayerImpl>(params);
 }
 
-}} // namespace cv::dnn
+}
+}

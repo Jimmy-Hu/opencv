@@ -265,6 +265,16 @@ void cvtColor( InputArray _src, OutputArray _dst, int code, int dcn, AlgorithmHi
             cvtColorXYZ2BGR(_src, _dst, dcn, swapBlue(code));
             break;
 
+        case COLOR_BGR2Oklab:
+        case COLOR_RGB2Oklab:
+            cvtColorBGR2Oklab(_src, _dst, swapBlue(code));
+            break;
+
+        case COLOR_Oklab2BGR:
+        case COLOR_Oklab2RGB:
+            cvtColorOklab2BGR(_src, _dst, dcn, swapBlue(code));
+            break;
+
         case COLOR_BGR2HSV: case COLOR_BGR2HSV_FULL:
         case COLOR_RGB2HSV: case COLOR_RGB2HSV_FULL:
             cvtColorBGR2HSV(_src, _dst, swapBlue(code), isFullRangeHSV(code));
@@ -386,17 +396,3 @@ void cvtColor( InputArray _src, OutputArray _dst, int code, int dcn, AlgorithmHi
     }
 }
 } //namespace cv
-
-#ifndef OPENCV_EXCLUDE_C_API
-
-CV_IMPL void
-cvCvtColor( const CvArr* srcarr, CvArr* dstarr, int code )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst0 = cv::cvarrToMat(dstarr), dst = dst0;
-    CV_Assert( src.depth() == dst.depth() );
-
-    cv::cvtColor(src, dst, code, dst.channels());
-    CV_Assert( dst.data == dst0.data );
-}
-
-#endif

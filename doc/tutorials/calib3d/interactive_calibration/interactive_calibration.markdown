@@ -4,7 +4,7 @@ Interactive camera calibration application {#tutorial_interactive_calibration}
 @tableofcontents
 
 @prev_tutorial{tutorial_real_time_pose}
-@next_tutorial{tutorial_usac}
+@next_tutorial{tutorial_multiview_camera_calibration}
 
 |    |    |
 | -: | :- |
@@ -107,7 +107,7 @@ QR faster than SVD, but potentially less precise
 -  *camera_resolution*: resolution of camera which is used for calibration
 
 **Note:** *charuco_dict*, *charuco_square_length* and *charuco_marker_size* are used for chAruco pattern generation
-(see Aruco module description for details: [Aruco tutorials](https://github.com/opencv/opencv_contrib/tree/4.x/modules/aruco/tutorials))
+(see Aruco module description for details: [Aruco tutorials](https://github.com/opencv/opencv_contrib/tree/5.x/modules/aruco/tutorials))
 
 Default chAruco pattern:
 

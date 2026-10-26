@@ -93,13 +93,15 @@ using namespace cv::segmentation;  // FIXIT
 using namespace cv::aruco;
 typedef aruco::DetectorParameters aruco_DetectorParameters;
 typedef QRCodeDetectorAruco::Params QRCodeDetectorAruco_Params;
+using namespace cv::mcc;
 #endif
 
 #ifdef HAVE_OPENCV_DNN
 using namespace cv::dnn;
+typedef dnn::Net dnn_Net;
 #endif
 
-#ifdef HAVE_OPENCV_FEATURES2D
+#ifdef HAVE_OPENCV_FEATURES
 typedef SimpleBlobDetector::Params SimpleBlobDetector_Params;
 #endif
 

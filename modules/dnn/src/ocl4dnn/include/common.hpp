@@ -41,7 +41,7 @@
 
 #ifndef _OPENCV_LIBDNN_COMMON_HPP_
 #define _OPENCV_LIBDNN_COMMON_HPP_
-#include "../../caffe/glog_emulator.hpp"
+#include "glog_emulator.hpp"
 #include <opencv2/core/opencl/runtime/opencl_core.hpp>
 
 // Macro to select the single (_float) or double (_double) precision kernel
@@ -54,5 +54,7 @@
     } while (0)
 
 bool clOptionSupport(cv::String option);
+
+cv::String matTypeToOclType(int cvMatType);
 
 #endif

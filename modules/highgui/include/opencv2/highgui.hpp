@@ -87,44 +87,6 @@ It provides easy interface to:
     See below the example used to generate the figure:
 
     @include highgui_qt.cpp
-
-    @defgroup highgui_winrt WinRT support
-
-    This figure explains new functionality implemented with WinRT GUI. The new GUI provides an Image control,
-    and a slider panel. Slider panel holds trackbars attached to it.
-
-    Sliders are attached below the image control. Every new slider is added below the previous one.
-
-    See below the example used to generate the figure:
-    @code
-    void sample_app::MainPage::ShowWindow()
-    {
-        static cv::String windowName("sample");
-        cv::winrt_initContainer(this->cvContainer);
-        cv::namedWindow(windowName); // not required
-
-        cv::Mat image = cv::imread("Assets/sample.jpg");
-        cv::Mat converted = cv::Mat(image.rows, image.cols, CV_8UC4);
-        cv::cvtColor(image, converted, COLOR_BGR2BGRA);
-        cv::imshow(windowName, converted); // this will create window if it hasn't been created before
-
-        int state = 42;
-        cv::TrackbarCallback callback = [](int pos, void* userdata)
-        {
-            if (pos == 0) {
-                cv::destroyWindow(windowName);
-            }
-        };
-        cv::TrackbarCallback callbackTwin = [](int pos, void* userdata)
-        {
-            if (pos >= 70) {
-                cv::destroyAllWindows();
-            }
-        };
-        cv::createTrackbar("Sample trackbar", windowName, &state, 100, callback);
-        cv::createTrackbar("Twin brother", windowName, &state, 100, callbackTwin);
-    }
-    @endcode
 @}
 */
 
@@ -238,6 +200,11 @@ typedef void (*TrackbarCallback)(int pos, void* userdata);
 @param userdata The optional parameter.
  */
 typedef void (*OpenGlDrawCallback)(void* userdata);
+
+/** @brief Callback function defined to be called when a window's resources should be freed. See cv::setOpenGlFreeCallback
+@param userdata The window's OpenGL user data to be freed.
+ */
+typedef void (*OpenGlFreeCallback)(void* userdata);
 
 /** @brief Callback function for a button created by cv::createButton
 @param state current state of the button. It could be -1 for a push button, 0 or 1 for a check/radio box button.
@@ -447,9 +414,10 @@ The function getWindowImageRect returns the client screen coordinates, width and
  */
 CV_EXPORTS_W Rect getWindowImageRect(const String& winname);
 
-/** @example samples/cpp/create_mask.cpp
+/** @example samples/cpp/snippets/create_mask.cpp
 This program demonstrates using mouse events and how to make and use a mask image (black and white) .
 */
+
 /** @brief Sets mouse handler for the specified window
 
 @param winname Name of the window.
@@ -654,6 +622,26 @@ prototyped as void Foo(void\*) .
  */
 CV_EXPORTS void setOpenGlDrawCallback(const String& winname, OpenGlDrawCallback onOpenGlDraw, void* userdata = 0);
 
+/** @brief Sets a callback function to be called when OpenGL resources related to a window should be freed.
+
+@param winname Name of the window.
+@param onOpenGlFree Pointer to the function to be called when resources should be freed. This
+function should be prototyped as void Foo(void\*) .
+ */
+CV_EXPORTS void setOpenGlFreeCallback(const String& winname, OpenGlFreeCallback onOpenGlFree);
+
+/** @brief This function returns the pointer to the function associated to a window to be called every frame. See cv::setOpenGlDrawCallback.
+
+@param winname Name of the window.
+ */
+CV_EXPORTS OpenGlDrawCallback getOpenGlDrawCallback(const String& winname);
+
+/** @brief This function returns the pointer to the OpenGL user data associated to a window.
+
+@param winname Name of the window.
+ */
+CV_EXPORTS void* getOpenGlUserData(const String& winname);
+
 /** @brief Sets the specified window as current OpenGL context.
 
 @param winname Name of the window.
@@ -759,7 +747,7 @@ CV_EXPORTS_W void displayOverlay(const String& winname, const String& text, int 
 
 The function displayStatusBar displays useful information/tips on top of the window for a certain
 amount of time *delayms* . This information is displayed on the window statusbar (the window must be
-created with the CV_GUI_EXPANDED flags).
+created with the cv::WINDOW_GUI_EXPANDED flags).
 
 @param winname Name of the window.
 @param text Text to write on the window statusbar.
@@ -776,7 +764,7 @@ location of the window windowName.
 
 @param windowName Name of the window.
  */
-CV_EXPORTS void saveWindowParameters(const String& windowName);
+CV_EXPORTS_W void saveWindowParameters(const String& windowName);
 
 /** @brief Loads parameters of the specified window.
 
@@ -785,7 +773,7 @@ location of the window windowName.
 
 @param windowName Name of the window.
  */
-CV_EXPORTS void loadWindowParameters(const String& windowName);
+CV_EXPORTS_W void loadWindowParameters(const String& windowName);
 
 CV_EXPORTS  int startLoop(int (*pt2Func)(int argc, char *argv[]), int argc, char* argv[]);
 

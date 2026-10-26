@@ -110,12 +110,14 @@ enum ImwriteFlags {
        IMWRITE_TIFF_XDPI           = 257,//!< For TIFF, use to specify the X direction DPI
        IMWRITE_TIFF_YDPI           = 258,//!< For TIFF, use to specify the Y direction DPI
        IMWRITE_TIFF_COMPRESSION    = 259,//!< For TIFF, use to specify the image compression scheme. See cv::ImwriteTiffCompressionFlags. The compression scheme can be specified by this flag; the default is LZW compression, except for 32F depth where it is NONE
+       IMWRITE_TIFF_COMPRESSION_LEVEL = 260,//!< For TIFF, if IMWRITE_TIFF_COMPRESSION was used and supports it, sets a compression level. Valid range and meaning depends on the compression scheme. It is currently 1-9 for DEFLATE, 0-9 for LZMA, 1-22 for ZSTD, 1-100 for WEBP. -1 can be used as default.
        IMWRITE_TIFF_ROWSPERSTRIP   = 278,//!< For TIFF, use to specify the number of rows per strip.
        IMWRITE_TIFF_PREDICTOR      = 317,//!< For TIFF, use to specify predictor. See cv::ImwriteTiffPredictorFlags. Default is IMWRITE_TIFF_PREDICTOR_HORIZONTAL .
        IMWRITE_JPEG2000_COMPRESSION_X1000 = 272,//!< For JPEG2000, use to specify the target compression rate (multiplied by 1000). The value can be from 0 to 1000. Default is 1000.
-       IMWRITE_AVIF_QUALITY        = 512,//!< For AVIF, it can be a quality between 0 and 100 (the higher the better). Default is 95.
-       IMWRITE_AVIF_DEPTH          = 513,//!< For AVIF, it can be 8, 10 or 12. If >8, it is stored/read as CV_16U. Default is 8.
+       IMWRITE_AVIF_QUALITY        = 512,//!< For AVIF, it can be a **color-planes** quality between 0 and 100 (the higher the better). Default is 95.
+       IMWRITE_AVIF_DEPTH          = 513,//!< For AVIF, it can be 8, 10, 12 or 16. 16 requires libavif v1.4.0 or later (for a single still image only, not animation). If >8, it is stored/read as CV_16U. Default is 8.
        IMWRITE_AVIF_SPEED          = 514,//!< For AVIF, it is between 0 (slowest) and 10(fastest). Default is 9.
+       IMWRITE_AVIF_ALPHA_QUALITY  = 515,//!< For AVIF, it can be an **alpha-plane** quality between 0 and 100 (the higher the better). If not specified, it is synced with the color plane quality. Default is 95.
        IMWRITE_JPEGXL_QUALITY      = 640,//!< For JPEG XL, it can be a quality from 0 to 100 (the higher is the better). Default value is 95. If set, distance parameter is re-calicurated from quality level automatically. This parameter request libjxl v0.10 or later.
        IMWRITE_JPEGXL_EFFORT       = 641,//!< For JPEG XL, encoder effort/speed level without affecting decoding speed; it is between 1 (fastest) and 10 (slowest). Default is 7.
        IMWRITE_JPEGXL_DISTANCE     = 642,//!< For JPEG XL, distance level for lossy compression: target max butteraugli distance, lower = higher quality, 0 = lossless; range: 0 .. 25. Default is 1.
@@ -404,22 +406,23 @@ embedded in the file (such as EXIF, XMP, etc.), depending on file format support
 @param filename Name of the file to be loaded.
 @param metadataTypes Output vector with types of metadata chunks returned in metadata, see ImageMetadataType.
 @param metadata Output vector of vectors or vector of matrices to store the retrieved metadata.
-@param flags Flag that can take values of cv::ImreadModes, default with cv::IMREAD_ANYCOLOR.
+@param flags Flag that can take values of cv::ImreadModes.
 
 @return The loaded image as a cv::Mat object. If the image cannot be read, the function returns an empty matrix.
 */
 CV_EXPORTS_W Mat imreadWithMetadata( const String& filename, CV_OUT std::vector<int>& metadataTypes,
-                                     OutputArrayOfArrays metadata, int flags = IMREAD_ANYCOLOR);
+                                     OutputArrayOfArrays metadata, int flags);
 
 /** @brief Loads a multi-page image from a file.
 
 The function imreadmulti loads a multi-page image from the specified file into a vector of Mat objects.
 @param filename Name of file to be loaded.
 @param mats A vector of Mat objects holding each page.
-@param flags Flag that can take values of cv::ImreadModes, default with cv::IMREAD_ANYCOLOR.
+@param flags Flag that can take values of cv::ImreadModes, default with cv::IMREAD_COLOR_BGR.
+@note The default flags value was changed from cv::IMREAD_ANYCOLOR to cv::IMREAD_COLOR_BGR for unification.
 @sa cv::imread
 */
-CV_EXPORTS_W bool imreadmulti(const String& filename, CV_OUT std::vector<Mat>& mats, int flags = IMREAD_ANYCOLOR);
+CV_EXPORTS_W bool imreadmulti(const String& filename, CV_OUT std::vector<Mat>& mats, int flags = IMREAD_COLOR_BGR);
 
 /** @brief Loads images of a multi-page image from a file.
 
@@ -503,10 +506,11 @@ CV_EXPORTS_W bool imencodeanimation(const String& ext, const Animation& animatio
 The function imcount returns the number of pages in a multi-page image (e.g. TIFF), the number of frames in an animation (e.g. AVIF), and 1 otherwise.
 If the image cannot be decoded, 0 is returned.
 @param filename Name of file to be loaded.
-@param flags Flag that can take values of cv::ImreadModes, default with cv::IMREAD_ANYCOLOR.
+@param flags Flag that can take values of cv::ImreadModes, default with cv::IMREAD_COLOR_BGR.
+@note The default flags value was changed from cv::IMREAD_ANYCOLOR to cv::IMREAD_COLOR_BGR for unification.
 @todo when cv::IMREAD_LOAD_GDAL flag used the return value will be 0 or 1 because OpenCV's GDAL decoder doesn't support multi-page reading yet.
 */
-CV_EXPORTS_W size_t imcount(const String& filename, int flags = IMREAD_ANYCOLOR);
+CV_EXPORTS_W size_t imcount(const String& filename, int flags = IMREAD_COLOR_BGR);
 
 /** @brief Saves an image to a specified file.
 
@@ -537,7 +541,8 @@ can be saved using this function, with these exceptions:
 - With PGM/PPM encoder, 8-bit unsigned (CV_8U) and 16-bit unsigned (CV_16U) images can be saved.
 - With TIFF encoder, 8-bit unsigned (CV_8U), 8-bit signed (CV_8S),
                      16-bit unsigned (CV_16U), 16-bit signed (CV_16S),
-                     32-bit signed (CV_32S),
+                     32-bit unsigned (CV_32U), 32-bit signed (CV_32S),
+                     64-bit unsigned (CV_64U), 64-bit signed (CV_64S),
                      32-bit float (CV_32F) and 64-bit float (CV_64F) images can be saved.
   - Multiple images (vector of Mat) can be saved in TIFF format (see the code sample below).
   - 32-bit float 3-channel (CV_32FC3) TIFF images can be saved
@@ -551,10 +556,11 @@ can be saved using this function, with these exceptions:
     Fully transparent pixels should have an alpha value of 0, while fully opaque pixels should have an alpha value of 255.
   - 8-bit single-channel images (CV_8UC1) are not supported due to GIF's limitation to indexed color formats.
 - With AVIF encoder, 8-bit unsigned (CV_8U) and 16-bit unsigned (CV_16U) images can be saved.
-  - CV_16U images can be saved as only 10-bit or 12-bit (not 16-bit). See IMWRITE_AVIF_DEPTH.
+  - CV_16U images can be saved as only 10-bit or 12-bit (and 16-bit with libavif 1.4.0+). See @ref IMWRITE_AVIF_DEPTH.
   - AVIF images with an alpha channel can be saved using this function.
     To achieve this, create an 8-bit 4-channel (CV_8UC4) / 16-bit 4-channel (CV_16UC4) BGRA image, ensuring the alpha channel is the last component.
-    Fully transparent pixels should have an alpha value of 0, while fully opaque pixels should have an alpha value of 255 (8-bit) / 1023 (10-bit) / 4095 (12-bit) (see the code sample below).
+    Fully transparent pixels should have an alpha value of 0, while fully opaque pixels should have an alpha value of 255 (8-bit) / 1023 (10-bit) / 4095 (12-bit) / 65535 (16-bit) (see the code sample below).
+    Note that if the alpha plane contains only fully opaque pixels, the destination saves only color channels due to a libavif limitation.
 
 If the image format is not supported, the image will be converted to 8-bit unsigned (CV_8U) and saved that way.
 
@@ -588,7 +594,7 @@ CV_EXPORTS_W bool imwriteWithMetadata( const String& filename, InputArray img,
                                        const std::vector<int>& params = std::vector<int>());
 
 //! @brief multi-image overload for bindings
-CV_WRAP static inline
+CV_WRAP inline
 bool imwritemulti(const String& filename, InputArrayOfArrays img,
                   const std::vector<int>& params = std::vector<int>())
 {
@@ -619,12 +625,12 @@ See cv::imread for the list of supported formats and flags description.
 @param buf Input array or vector of bytes containing the encoded image data.
 @param metadataTypes Output vector with types of metadata chucks returned in metadata, see cv::ImageMetadataType
 @param metadata Output vector of vectors or vector of matrices to store the retrieved metadata
-@param flags Flag that can take values of cv::ImreadModes, default with cv::IMREAD_ANYCOLOR.
+@param flags Flag that can take values of cv::ImreadModes.
 
 @return The decoded image as a cv::Mat object. If decoding fails, the function returns an empty matrix.
 */
 CV_EXPORTS_W Mat imdecodeWithMetadata( InputArray buf, CV_OUT std::vector<int>& metadataTypes,
-                                       OutputArrayOfArrays metadata, int flags = IMREAD_ANYCOLOR );
+                                       OutputArrayOfArrays metadata, int flags );
 
 /** @overload
 @param buf Input array or vector of bytes.

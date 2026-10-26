@@ -3,7 +3,7 @@ USAC: Improvement of Random Sample Consensus in OpenCV {#tutorial_usac}
 
 @tableofcontents
 
-@prev_tutorial{tutorial_interactive_calibration}
+@prev_tutorial{tutorial_multiview_camera_calibration}
 
 |    |    |
 | -: | :- |
@@ -15,7 +15,7 @@ This work was integrated as part of the Google Summer of Code (August 2020).
 Contribution
 ------
 
-The integrated part to OpenCV `calib3d` module is RANSAC-based universal
+The integrated part to OpenCV `3d` module is RANSAC-based universal
 framework USAC (`namespace usac`) written in C++. The framework includes
 different state-of-the-arts methods for sampling, verification or local
 optimization. The main advantage of the framework is its independence to

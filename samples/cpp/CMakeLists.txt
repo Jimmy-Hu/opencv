@@ -7,15 +7,15 @@ set(OPENCV_CPP_SAMPLES_REQUIRED_DEPS
   opencv_imgcodecs
   opencv_videoio
   opencv_highgui
-  opencv_ml
   opencv_video
   opencv_objdetect
   opencv_photo
-  opencv_features2d
-  opencv_calib3d
+  opencv_features
+  opencv_geometry
+  opencv_stereo
+  opencv_calib
   opencv_stitching
   opencv_dnn
-  opencv_gapi
   ${OPENCV_MODULES_PUBLIC}
   ${OpenCV_LIB_COMPONENTS})
 ocv_check_dependencies(${OPENCV_CPP_SAMPLES_REQUIRED_DEPS})
@@ -24,8 +24,8 @@ if(NOT BUILD_EXAMPLES OR NOT OCV_DEPENDENCIES_FOUND)
   return()
 endif()
 
-set(DEPS_example_snippet_imgproc_segmentation opencv_core opencv_imgproc)
-set(DEPS_example_cpp_intelligent_scissors opencv_core opencv_imgproc opencv_imgcodecs opencv_highgui)
+set(DEPS_example_snippet_imgproc_segmentation opencv_core opencv_photo)
+set(DEPS_example_cpp_intelligent_scissors opencv_core opencv_photo opencv_imgcodecs opencv_highgui)
 
 project(cpp_samples)
 ocv_include_modules_recurse(${OPENCV_CPP_SAMPLES_REQUIRED_DEPS})
@@ -71,11 +71,9 @@ endforeach()
 include("tutorial_code/calib3d/real_time_pose_estimation/CMakeLists.txt" OPTIONAL)
 
 # Standalone samples only
-if(OpenCV_FOUND AND NOT CMAKE_VERSION VERSION_LESS "3.1")
+if(OpenCV_FOUND)
   add_subdirectory("example_cmake")
 endif()
-if(OpenCV_FOUND AND NOT CMAKE_VERSION VERSION_LESS "3.9"
-    AND NOT OPENCV_EXAMPLES_SKIP_PARALLEL_BACKEND
-)
+if(OpenCV_FOUND AND NOT OPENCV_EXAMPLES_SKIP_PARALLEL_BACKEND)
   add_subdirectory("tutorial_code/core/parallel_backend")
 endif()

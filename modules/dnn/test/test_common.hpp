@@ -6,9 +6,14 @@
 #define __OPENCV_TEST_COMMON_HPP__
 
 #include "opencv2/dnn/utils/inference_engine.hpp"
+#include <string>
 
 #ifdef HAVE_OPENCL
 #include "opencv2/core/ocl.hpp"
+#endif
+#include "opencv2/core/utils/configuration.private.hpp"
+#ifdef HAVE_CUDA
+#include "opencv2/core/cuda.hpp"
 #endif
 
 // src/op_inf_engine.hpp
@@ -19,7 +24,6 @@
 #define INF_ENGINE_VER_MAJOR_EQ(ver) (((INF_ENGINE_RELEASE) / 10000) == ((ver) / 10000))
 
 #define CV_TEST_TAG_DNN_SKIP_OPENCV_BACKEND      "dnn_skip_opencv_backend"
-#define CV_TEST_TAG_DNN_SKIP_HALIDE              "dnn_skip_halide"
 #define CV_TEST_TAG_DNN_SKIP_CPU                 "dnn_skip_cpu"
 #define CV_TEST_TAG_DNN_SKIP_CPU_FP16            "dnn_skip_cpu_fp16"
 #define CV_TEST_TAG_DNN_SKIP_OPENCL              "dnn_skip_ocl"
@@ -137,7 +141,7 @@ bool validateVPUType();
 
 testing::internal::ParamGenerator< tuple<Backend, Target> > dnnBackendsAndTargets(
         bool withInferenceEngine = true,
-        bool withHalide = false,
+        bool obsolete_withHalide = false, // this is kept for compatibility
         bool withCpuOCV = true,
         bool withVkCom = true,
         bool withCUDA = true,
@@ -163,9 +167,22 @@ public:
         getDefaultThresholds(backend, target, &default_l1, &default_lInf);
     }
 
+    static bool cudaTF32Enabled()
+    {
+#ifdef HAVE_CUDA
+        static const bool enabled = cv::utils::getConfigurationParameterBool("OPENCV_DNN_CUDA_ALLOW_TF32", true) &&
+                                    cv::cuda::getCudaEnabledDeviceCount() > 0 &&
+                                    cv::cuda::DeviceInfo().majorVersion() >= 8;
+        return enabled;
+#else
+        return false;
+#endif
+    }
+
     static void getDefaultThresholds(int backend, int target, double* l1, double* lInf)
     {
-        if (target == DNN_TARGET_CPU_FP16 || target == DNN_TARGET_CUDA_FP16 || target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD)
+        if (target == DNN_TARGET_CPU_FP16 || target == DNN_TARGET_CUDA_FP16 || target == DNN_TARGET_OPENCL_FP16 || target == DNN_TARGET_MYRIAD ||
+            (target == DNN_TARGET_CUDA && cudaTF32Enabled()))
         {
             *l1 = 4e-3;
             *lInf = 2e-2;
@@ -196,6 +213,11 @@ public:
 
     void expectNoFallbacks(Net& net, bool raiseError = true)
     {
+        // The new DNN engine does not support back-ends for now
+        // bug: https://github.com/opencv/opencv/issues/26198
+        if (net.getMainGraph())
+            return;
+
         // Check if all the layers are supported with current backend and target.
         // Some layers might be fused so their timings equal to zero.
         std::vector<double> timings;
@@ -241,7 +263,25 @@ protected:
     }
 };
 
-} // namespace
+void runLayer(cv::Ptr<cv::dnn::Layer> layer, std::vector<cv::Mat> &inpBlobs, std::vector<cv::Mat> &outBlobs);
 
+inline std::string getCurrentTestNameNoParams()
+{
+    const ::testing::TestInfo* const test_info =
+        ::testing::UnitTest::GetInstance()->current_test_info();
+    if (!test_info)
+        return std::string();
+    std::string suite = test_info->test_case_name();
+    std::string name  = test_info->name();
+    const auto suite_slash = suite.find('/');
+    if (suite_slash != std::string::npos)
+        suite = suite.substr(0, suite_slash);
+    const auto name_slash = name.find('/');
+    if (name_slash != std::string::npos)
+        name = name.substr(0, name_slash);
+    return suite + "." + name;
+}
+
+} // namespace
 
 #endif

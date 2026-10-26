@@ -53,8 +53,6 @@
 #include "opencv2/core/hal/intrin.hpp"
 #include "opencl_kernels_imgproc.hpp"
 
-#include "opencv2/core/openvx/ovx_defs.hpp"
-
 #include "filter.hpp"
 
 #include "opencv2/core/softfloat.hpp"
@@ -200,6 +198,7 @@ softdouble getGaussianKernelBitExact(std::vector<softdouble>& result, int n, dou
 Mat getGaussianKernel(int n, double sigma, int ktype)
 {
     CV_CheckDepth(ktype, ktype == CV_32F || ktype == CV_64F, "");
+    CV_Assert(n > 0);
     Mat kernel(n, 1, ktype);
 
     std::vector<softdouble> kernel_bitexact;
@@ -382,88 +381,6 @@ static bool ocl_GaussianBlur_8UC1(InputArray _src, OutputArray _dst, Size ksize,
     idxArg = kernel.set(idxArg, (int)dst.cols);
 
     return kernel.run(2, globalsize, (localsize[0] == 0) ? NULL : localsize, false);
-}
-
-#endif
-
-#ifdef HAVE_OPENVX
-
-namespace ovx {
-    template <> inline bool skipSmallImages<VX_KERNEL_GAUSSIAN_3x3>(int w, int h) { return w*h < 320 * 240; }
-}
-static bool openvx_gaussianBlur(InputArray _src, OutputArray _dst, Size ksize,
-                                double sigma1, double sigma2, int borderType)
-{
-    if (sigma2 <= 0)
-        sigma2 = sigma1;
-    // automatic detection of kernel size from sigma
-    if (ksize.width <= 0 && sigma1 > 0)
-        ksize.width = cvRound(sigma1*6 + 1) | 1;
-    if (ksize.height <= 0 && sigma2 > 0)
-        ksize.height = cvRound(sigma2*6 + 1) | 1;
-
-    if (_src.type() != CV_8UC1 ||
-        _src.cols() < 3 || _src.rows() < 3 ||
-        ksize.width != 3 || ksize.height != 3)
-        return false;
-
-    sigma1 = std::max(sigma1, 0.);
-    sigma2 = std::max(sigma2, 0.);
-
-    if (!(sigma1 == 0.0 || (sigma1 - 0.8) < DBL_EPSILON) || !(sigma2 == 0.0 || (sigma2 - 0.8) < DBL_EPSILON) ||
-        ovx::skipSmallImages<VX_KERNEL_GAUSSIAN_3x3>(_src.cols(), _src.rows()))
-        return false;
-
-    Mat src = _src.getMat();
-    Mat dst = _dst.getMat();
-
-    if ((borderType & BORDER_ISOLATED) == 0 && src.isSubmatrix())
-        return false; //Process isolated borders only
-    vx_enum border;
-    switch (borderType & ~BORDER_ISOLATED)
-    {
-    case BORDER_CONSTANT:
-        border = VX_BORDER_CONSTANT;
-        break;
-    case BORDER_REPLICATE:
-        border = VX_BORDER_REPLICATE;
-        break;
-    default:
-        return false;
-    }
-
-    try
-    {
-        ivx::Context ctx = ovx::getOpenVXContext();
-
-        Mat a;
-        if (dst.data != src.data)
-            a = src;
-        else
-            src.copyTo(a);
-
-        ivx::Image
-            ia = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
-                ivx::Image::createAddressing(a.cols, a.rows, 1, (vx_int32)(a.step)), a.data),
-            ib = ivx::Image::createFromHandle(ctx, VX_DF_IMAGE_U8,
-                ivx::Image::createAddressing(dst.cols, dst.rows, 1, (vx_int32)(dst.step)), dst.data);
-
-        //ATTENTION: VX_CONTEXT_IMMEDIATE_BORDER attribute change could lead to strange issues in multi-threaded environments
-        //since OpenVX standard says nothing about thread-safety for now
-        ivx::border_t prevBorder = ctx.immediateBorder();
-        ctx.setImmediateBorder(border, (vx_uint8)(0));
-        ivx::IVX_CHECK_STATUS(vxuGaussian3x3(ctx, ia, ib));
-        ctx.setImmediateBorder(prevBorder);
-    }
-    catch (const ivx::RuntimeError & e)
-    {
-        VX_DbgThrow(e.what());
-    }
-    catch (const ivx::WrapperError & e)
-    {
-        VX_DbgThrow(e.what());
-    }
-    return true;
 }
 
 #endif
@@ -819,33 +736,3 @@ void GaussianBlur(InputArray _src, OutputArray _dst, Size ksize,
 }
 
 } // namespace
-
-//////////////////////////////////////////////////////////////////////////////////////////
-
-CV_IMPL void
-cvSmooth( const void* srcarr, void* dstarr, int smooth_type,
-          int param1, int param2, double param3, double param4 )
-{
-    cv::Mat src = cv::cvarrToMat(srcarr), dst0 = cv::cvarrToMat(dstarr), dst = dst0;
-
-    CV_Assert( dst.size() == src.size() &&
-        (smooth_type == CV_BLUR_NO_SCALE || dst.type() == src.type()) );
-
-    if( param2 <= 0 )
-        param2 = param1;
-
-    if( smooth_type == CV_BLUR || smooth_type == CV_BLUR_NO_SCALE )
-        cv::boxFilter( src, dst, dst.depth(), cv::Size(param1, param2), cv::Point(-1,-1),
-            smooth_type == CV_BLUR, cv::BORDER_REPLICATE );
-    else if( smooth_type == CV_GAUSSIAN )
-        cv::GaussianBlur( src, dst, cv::Size(param1, param2), param3, param4, cv::BORDER_REPLICATE );
-    else if( smooth_type == CV_MEDIAN )
-        cv::medianBlur( src, dst, param1 );
-    else
-        cv::bilateralFilter( src, dst, param1, param3, param4, cv::BORDER_REPLICATE );
-
-    if( dst.data != dst0.data )
-        CV_Error( cv::Error::StsUnmatchedFormats, "The destination image does not have the proper type" );
-}
-
-/* End of file. */

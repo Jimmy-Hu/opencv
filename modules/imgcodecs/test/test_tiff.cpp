@@ -689,6 +689,28 @@ TEST(Imgcodecs_Tiff, readWrite_unsigned)
     EXPECT_EQ(0, remove(filenameOutput.c_str()));
 }
 
+// See https://github.com/opencv/opencv/issues/29615
+// Decoding a 16-bit 4-channel TIFF used to form an out of range pointer in
+// icvCvt_BGRA2RGBA_16u_C4R because the byte step was divided by an unsigned
+// sizeof and then had size.width*4 subtracted, which wraps around for a zero
+// step. This just checks that a 16UC4 TIFF round-trips correctly; the value is
+// mainly that the sanitizer builds no longer report the pointer overflow.
+TEST(Imgcodecs_Tiff, regression_29615_16UC4)
+{
+    Mat img(4, 3, CV_16UC4);
+    randu(img, Scalar::all(0), Scalar::all(65535));
+
+    vector<uchar> buf;
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tiff", img, buf)));
+
+    Mat decoded;
+    ASSERT_NO_THROW(decoded = imdecode(buf, IMREAD_UNCHANGED));
+    ASSERT_FALSE(decoded.empty());
+    ASSERT_EQ(CV_16UC4, decoded.type());
+    ASSERT_EQ(img.size(), decoded.size());
+    EXPECT_EQ(0, cvtest::norm(img, decoded, NORM_INF));
+}
+
 TEST(Imgcodecs_Tiff, readWrite_32FC1)
 {
     const string root = cvtest::TS::ptr()->get_data_path();
@@ -818,6 +840,41 @@ TEST(Imgcodecs_Tiff, read_palette_color_image_rgb_and_bgr)
     EXPECT_EQ(img_bgr.at<Vec3b>(32, 24), Vec3b(0, 0, 255));
 }
 
+TEST(Imgcodecs_Tiff, read_16bit_rgb_and_bgr)
+{
+    // Every sample differs so that a short or misdirected row copy is visible.
+    Mat src(8, 8, CV_16UC3);
+    for (int y = 0; y < src.rows; y++)
+    {
+        for (int x = 0; x < src.cols; x++)
+        {
+            src.at<Vec3w>(y, x) = Vec3w((ushort)(1000 + x), (ushort)(2000 + y), (ushort)(3000 + x + y));
+        }
+    }
+
+    vector<uchar> buf;
+    ASSERT_TRUE(imencode(".tiff", src, buf));
+
+    Mat img_rgb, img_bgr;
+    ASSERT_NO_THROW(img_bgr = cv::imdecode(buf, IMREAD_ANYDEPTH | IMREAD_COLOR_BGR));
+    ASSERT_NO_THROW(img_rgb = cv::imdecode(buf, IMREAD_ANYDEPTH | IMREAD_COLOR_RGB));
+    ASSERT_EQ(CV_16UC3, img_bgr.type());
+    ASSERT_EQ(CV_16UC3, img_rgb.type());
+
+    Mat expected_rgb(src.size(), CV_16UC3);
+    for (int y = 0; y < src.rows; y++)
+    {
+        for (int x = 0; x < src.cols; x++)
+        {
+            const Vec3w& s = src.at<Vec3w>(y, x);
+            expected_rgb.at<Vec3w>(y, x) = Vec3w(s[2], s[1], s[0]);
+        }
+    }
+
+    EXPECT_PRED_FORMAT2(cvtest::MatComparator(0, 0), src, img_bgr);
+    EXPECT_PRED_FORMAT2(cvtest::MatComparator(0, 0), expected_rgb, img_rgb);
+}
+
 TEST(Imgcodecs_Tiff, read_4_bit_palette_color_image)
 {
     const string root = cvtest::TS::ptr()->get_data_path();
@@ -933,7 +990,10 @@ Imgcodes_Tiff_TypeAndComp all_types[] = {
     { CV_8SC1,  true  }, { CV_8SC3,  true  }, { CV_8SC4,  true  },
     { CV_16UC1, true  }, { CV_16UC3, true  }, { CV_16UC4, true  },
     { CV_16SC1, true  }, { CV_16SC3, true  }, { CV_16SC4, true  },
+    { CV_32UC1, true  }, { CV_32UC3, true  }, { CV_32UC4, true  },
     { CV_32SC1, true  }, { CV_32SC3, true  }, { CV_32SC4, true  },
+    { CV_64UC1, true  }, { CV_64UC3, true  }, { CV_64UC4, true  },
+    { CV_64SC1, true  }, { CV_64SC3, true  }, { CV_64SC4, true  },
     { CV_32FC1, true  }, { CV_32FC3, true  }, { CV_32FC4, true  },
     { CV_64FC1, false }, { CV_64FC3, false }, { CV_64FC4, false }  // No compression
 };
@@ -1099,7 +1159,7 @@ TEST(Imgcodecs_Tiff_Modes, write_multipage)
     ASSERT_TRUE(res);
 
     vector<Mat> read_pages;
-    imreadmulti(tmp_filename, read_pages);
+    imreadmulti(tmp_filename, read_pages, cv::IMREAD_ANYCOLOR);
     for (size_t i = 0; i < page_count; i++)
     {
         EXPECT_PRED_FORMAT2(cvtest::MatComparator(0, 0), read_pages[i], pages[i]);
@@ -1333,6 +1393,129 @@ const int Imgcodecs_Tiff_32F_Compressions_32F_All_Values[] =
 };
 
 INSTANTIATE_TEST_CASE_P(compressions_32F, Imgcodecs_Tiff_32F_Compressions_32F, testing::ValuesIn(Imgcodecs_Tiff_32F_Compressions_32F_All_Values));
+
+TEST(Imgcodecs_Tiff, support_webp)
+{
+    //build a dummy image that can be heavily compressed
+    cv::Mat src(cv::Size(640, 480), CV_8UC3);
+    src.forEach<cv::Vec3b>([&](cv::Vec3b& pixel, const int* pos) {
+      const int y = pos[0];
+      const int x = pos[1];
+      const uchar value = static_cast<uchar>(y*src.cols+x);
+      pixel = cv::Vec3b(value, value, value);
+    });
+
+    vector<uint8_t> bufNone;
+    vector<uint8_t> bufWebP;
+    vector<uint8_t> bufLZW;
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tif", src, bufNone, {IMWRITE_TIFF_COMPRESSION, IMWRITE_TIFF_COMPRESSION_NONE})));
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tif", src, bufWebP, {IMWRITE_TIFF_COMPRESSION, IMWRITE_TIFF_COMPRESSION_WEBP})));
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tif", src, bufLZW,  {IMWRITE_TIFF_COMPRESSION, IMWRITE_TIFF_COMPRESSION_LZW})));
+
+    std::cout << "TIFF-None: " << bufNone.size() << " bytes" << std::endl;
+    std::cout << "TIFF-LZW:  " << bufLZW.size()  << " bytes" << std::endl;
+    std::cout << "TIFF-WebP: " << bufWebP.size() << " bytes" << std::endl;
+
+    // If the size of the TIFF file compressed with WebP matches
+    // the size compressed with LZW, it indicates that the underlying
+    // libtiff configuration does not support TIFF-WebP, and OpenCV
+    // has fallen back to LZW. This is an expected environment-dependent
+    // behavior rather than a test failure, so we gracefully skip the test.
+    if (bufWebP.size() == bufLZW.size()) {
+        throw SkipTestException("TIFF-WebP appears to be unsupported (compressed size is identical to LZW).");
+    }
+
+    // We expect WebP compressed size must be smaller than None.
+    ASSERT_LE(bufWebP.size(), bufNone.size());
+}
+
+typedef testing::TestWithParam<ImwriteTiffCompressionFlags> Imgcodecs_Tiff_compression_schema;
+
+TEST_P(Imgcodecs_Tiff_compression_schema, normal)
+{
+    const ImwriteTiffCompressionFlags compression = GetParam();
+    cv::Mat src(cv::Size(320,240), CV_8UC3, cv::Scalar(45,167,56));
+    std::vector<uint8_t> buf;
+    bool ret = false;
+    EXPECT_NO_THROW(ret = imencode(".tif", src, buf, {IMWRITE_TIFF_COMPRESSION, compression}));
+    EXPECT_TRUE(ret);
+    EXPECT_FALSE(buf.empty());
+}
+
+const ImwriteTiffCompressionFlags Imgcodecs_Tiff_compression_schema_list[] =
+{
+    static_cast<ImwriteTiffCompressionFlags>(0), // Expected it is not defined
+    IMWRITE_TIFF_COMPRESSION_NONE,
+    IMWRITE_TIFF_COMPRESSION_LZW,
+    IMWRITE_TIFF_COMPRESSION_DEFLATE,
+    IMWRITE_TIFF_COMPRESSION_ADOBE_DEFLATE,
+    IMWRITE_TIFF_COMPRESSION_LZMA,
+    IMWRITE_TIFF_COMPRESSION_ZSTD,
+    IMWRITE_TIFF_COMPRESSION_WEBP,
+    IMWRITE_TIFF_COMPRESSION_JXL,
+    IMWRITE_TIFF_COMPRESSION_PIXARFILM, // Expected it is not supported.
+};
+
+INSTANTIATE_TEST_CASE_P(Imgcodecs_Tiff, Imgcodecs_Tiff_compression_schema,
+        testing::ValuesIn(Imgcodecs_Tiff_compression_schema_list),
+        testing::PrintToStringParamName()
+);
+
+// https://github.com/opencv/opencv/pull/30165
+
+typedef tuple< int, int, int > Method_minLevel_maxLevel;
+typedef testing::TestWithParam<Method_minLevel_maxLevel> Imgcodecs_Tiff_compress_level;
+
+TEST_P(Imgcodecs_Tiff_compress_level, normal)
+{
+    // Get test parameters
+    const int compressMethod     = get<0>(GetParam());
+    const int minLevel           = get<1>(GetParam());
+    const int maxLevel           = get<2>(GetParam());
+
+    //build a dummy image that can be heavily compressed
+    cv::Mat src = cv::Mat(cv::Size(640, 480), CV_8UC3);
+    src.forEach<cv::Vec3b>([&](cv::Vec3b& pixel, const int* pos) {
+      const int y = pos[0];
+      const int x = pos[1];
+      const uchar value = static_cast<uchar>(y*src.cols+x);
+      pixel = cv::Vec3b(value, value, value);
+    });
+
+    std::vector<uint8_t> bufNone;
+    std::vector<int> paramsNone = { IMWRITE_TIFF_COMPRESSION, IMWRITE_TIFF_COMPRESSION_NONE};
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tiff", src, bufNone, paramsNone)));
+
+    std::vector<uint8_t> bufDef;
+    std::vector<int> paramsDef = {IMWRITE_TIFF_COMPRESSION, compressMethod};
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tiff", src, bufDef, paramsDef)));
+
+    std::vector<uint8_t> bufMin;
+    std::vector<int> paramsMin = {IMWRITE_TIFF_COMPRESSION, compressMethod, IMWRITE_TIFF_COMPRESSION_LEVEL, minLevel};
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tiff", src, bufMin, paramsMin)));
+
+    std::vector<uint8_t> bufMax;
+    std::vector<int> paramsMax = {IMWRITE_TIFF_COMPRESSION, compressMethod, IMWRITE_TIFF_COMPRESSION_LEVEL, maxLevel};
+    ASSERT_NO_THROW(ASSERT_TRUE(imencode(".tiff", src, bufMax, paramsMax)));
+
+    ASSERT_LT(bufDef.size(), bufNone.size());
+    ASSERT_LE(bufDef.size(), bufMin.size());
+    ASSERT_LE(bufMax.size(), bufDef.size());
+    ASSERT_NE(bufMax.size(), bufMin.size());
+}
+
+const Method_minLevel_maxLevel supportedMethod_minLevel_maxLevel[] =
+{
+    make_tuple<int, int, int>(IMWRITE_TIFF_COMPRESSION_DEFLATE, 1, 9),
+    make_tuple<int, int, int>(IMWRITE_TIFF_COMPRESSION_ADOBE_DEFLATE, 1, 9),
+//    make_tuple<int, int, int>(IMWRITE_TIFF_COMPRESSION_LZMA, 0, 9),
+//    make_tuple<int, int, int>(IMWRITE_TIFF_COMPRESSION_ZSTD, 1, 22),
+//    make_tuple<int, int, int>(IMWRITE_TIFF_COMPRESSION_WEBP, 1, 100),
+};
+
+INSTANTIATE_TEST_CASE_P(Imgcodecs_Tiff, Imgcodecs_Tiff_compress_level,
+    testing::ValuesIn(supportedMethod_minLevel_maxLevel)
+);
 
 #endif
 

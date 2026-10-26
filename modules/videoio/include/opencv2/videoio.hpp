@@ -57,7 +57,6 @@
     @defgroup videoio_flags_base Flags for video I/O
     @defgroup videoio_flags_others Additional flags for video I/O API backends
     @defgroup videoio_hwaccel Hardware-accelerated video decoding and encoding
-    @defgroup videoio_c C API for video I/O
     @defgroup videoio_ios iOS glue for video I/O
     @defgroup videoio_winrt WinRT glue for video I/O
     @defgroup videoio_registry Query I/O API backends registry
@@ -91,7 +90,6 @@ https://learn.microsoft.com/en-us/windows/win32/medfound/mf-readwrite-enable-har
 */
 enum VideoCaptureAPIs {
        CAP_ANY          = 0,            //!< Auto detect == 0
-       CAP_VFW          = 200,          //!< Video For Windows (obsolete, removed)
        CAP_V4L          = 200,          //!< V4L/V4L2 capturing support
        CAP_V4L2         = CAP_V4L,      //!< Same as CAP_V4L
        CAP_FIREWIRE     = 300,          //!< IEEE 1394 drivers
@@ -99,16 +97,11 @@ enum VideoCaptureAPIs {
        CAP_IEEE1394     = CAP_FIREWIRE, //!< Same value as CAP_FIREWIRE
        CAP_DC1394       = CAP_FIREWIRE, //!< Same value as CAP_FIREWIRE
        CAP_CMU1394      = CAP_FIREWIRE, //!< Same value as CAP_FIREWIRE
-       CAP_QT           = 500,          //!< QuickTime (obsolete, removed)
-       CAP_UNICAP       = 600,          //!< Unicap drivers (obsolete, removed)
        CAP_DSHOW        = 700,          //!< DirectShow (via videoInput)
        CAP_PVAPI        = 800,          //!< PvAPI, Prosilica GigE SDK
-       CAP_OPENNI       = 900,          //!< OpenNI (for Kinect)
-       CAP_OPENNI_ASUS  = 910,          //!< OpenNI (for Asus Xtion)
        CAP_ANDROID      = 1000,         //!< MediaNDK (API Level 21+) and NDK Camera (API level 24+) for Android
        CAP_XIAPI        = 1100,         //!< XIMEA Camera API
        CAP_AVFOUNDATION = 1200,         //!< AVFoundation framework for iOS (OS X Lion will have the same API)
-       CAP_GIGANETIX    = 1300,         //!< Smartek Giganetix GigEVisionSDK
        CAP_MSMF         = 1400,         //!< Microsoft Media Foundation (via videoInput). See platform specific notes above.
        CAP_WINRT        = 1410,         //!< Microsoft Windows Runtime using Media Foundation
        CAP_INTELPERC    = 1500,         //!< RealSense (former Intel Perceptual Computing SDK)
@@ -136,6 +129,7 @@ enum VideoCaptureAPIs {
  @sa videoio_flags_others, VideoCapture::get(), VideoCapture::set()
 */
 enum VideoCaptureProperties {
+       CAP_PROP_UNKNOWN        =-1, //!< Returned by VideoCapture::get if the requested property is unknown or unsupported
        CAP_PROP_POS_MSEC       =0, //!< Current position of the video file in milliseconds.
        CAP_PROP_POS_FRAMES     =1, //!< 0-based index of the frame to be decoded/captured next. When the index i is set in RAW mode (CAP_PROP_FORMAT == -1) this will seek to the key frame k, where k <= i.
        CAP_PROP_POS_AVI_RATIO  =2, //!< Relative position of the video file: 0=start of the film, 1=end of the film.
@@ -220,6 +214,7 @@ enum VideoCaptureProperties {
  @sa VideoWriter::get(), VideoWriter::set()
 */
 enum VideoWriterProperties {
+  VIDEOWRITER_PROP_UNKNOWN = -1, //!< Returned by VideoWriter::get if the requested property is unknown or unsupported
   VIDEOWRITER_PROP_QUALITY = 1,    //!< Current quality (0..100%) of the encoded videostream. Can be adjusted dynamically in some codecs.
   VIDEOWRITER_PROP_FRAMEBYTES = 2, //!< (Read-only): Size of just encoded video frame. Note that the encoding order may be different from representation order.
   VIDEOWRITER_PROP_NSTRIPES = 3,   //!< Number of stripes for parallel encoding. -1 for auto detection.
@@ -234,11 +229,33 @@ enum VideoWriterProperties {
   VIDEOWRITER_PROP_KEY_FLAG = 11, //!< Set to non-zero to signal that the following frames are key frames or zero if not, when encapsulating raw video (\ref VIDEOWRITER_PROP_RAW_VIDEO != 0). FFmpeg back-end only.
   VIDEOWRITER_PROP_PTS = 12, //!< Specifies the frame presentation timestamp for each frame using the FPS time base. This property is **only** necessary when encapsulating **externally** encoded video where the decoding order differs from the presentation order, such as in GOP patterns with bi-directional B-frames. The value should be provided by your external encoder and for video sources with fixed frame rates it is equivalent to dividing the current frame's presentation time (\ref CAP_PROP_POS_MSEC) by the frame duration (1000.0 / VideoCapture::get(\ref CAP_PROP_FPS)). It can be queried from the resulting encapsulated video file using VideoCapture::get(\ref CAP_PROP_PTS). FFmpeg back-end only.
   VIDEOWRITER_PROP_DTS_DELAY = 13, //!< Specifies the maximum difference between presentation (pts) and decompression timestamps (dts) using the FPS time base. This property is necessary **only** when encapsulating **externally** encoded video where the decoding order differs from the presentation order, such as in GOP patterns with bi-directional B-frames. The value should be calculated based on the specific GOP pattern used during encoding. For example, in a GOP with presentation order IBP and decoding order IPB, this value would be 1, as the B-frame is the second frame presented but the third to be decoded. It can be queried from the resulting encapsulated video file using VideoCapture::get(\ref CAP_PROP_DTS_DELAY). Non-zero values usually imply the stream is encoded using B-frames. FFmpeg back-end only.
-  VIDEOWRITER_PROP_COLOR_SPACE = 14, //!< (**open-only**) GStreamer backend only. Pixel format for the encoding profile. Default is "I420". Other values: "NV12", "BGRx". See GStreamer raw video formats for more options.
+  VIDEOWRITER_PROP_COLOR_SPACE = 14, //!< (**open-only**) Pixel format of the encoded stream as a 4-character code, see VideoWriter::fourcc. GStreamer: raw format the encoder input is restricted to, for example "I420", "NV12" or "BGRx", see GStreamer raw video formats for more options. When not set, the encoder picks its own input format. FFmpeg: uses the same encoding as the read-only \ref CAP_PROP_CODEC_PIXEL_FORMAT, VideoWriter::open() fails if the code is unknown or the selected encoder does not support it, hardware accelerated encoding accepts only "NV12", VideoWriter::get() returns the pixel format in use. FFmpeg and GStreamer back-ends.
   VIDEOWRITER_PROP_ENABLE_ALPHA = 15, //!< (**open-only**) FFmpeg backend only. Defines that input frames contain alpha channel.
+  VIDEOWRITER_PROP_BITRATE = 16, //!< (**open-only**) Target bitrate of the encoded video stream in bits per second. Ignored when \ref VIDEOWRITER_PROP_CRF is set. VideoWriter::open() fails if the selected encoder does not support it. GStreamer supports `x264enc`, `x265enc`, `vp8enc`, `vp9enc`, `openh264enc`, `vaapih264enc`, `vah264enc`, `svtav1enc` and `avenc_*`, for other encoders set the bitrate in the pipeline string. VideoWriter::get() returns the value passed to open(), or 0 if it was not set. FFmpeg and GStreamer back-ends.
+  VIDEOWRITER_PROP_CRF = 17, //!< (**open-only**) Constant Rate Factor, lower values give better quality and larger files. Only supported by encoders exposing a constant-quality control - `crf` for libx264, libx265, libvpx and libaom in FFmpeg; `quantizer` for `x264enc`, `crf` through `option-string` for `x265enc`, and `cq-level` in constant quality mode for `vp8enc`/`vp9enc` in GStreamer. The useful range is codec specific, 0..51 for FFmpeg libx264 and 0..50 for GStreamer `x264enc`. Takes precedence over \ref VIDEOWRITER_PROP_BITRATE. VideoWriter::open() fails if the selected encoder does not support it. VideoWriter::get() returns the value passed to open(), or -1 if it was not set. FFmpeg and GStreamer back-ends.
+  VIDEOWRITER_PROP_PRESET = 18, //!< (**open-only**) Encoding speed/compression trade-off, one of #VideoWriterPresets. Only supported by encoders exposing a preset control (libx264 and libx265, or the `x264enc`/`x265enc` GStreamer elements). VideoWriter::open() fails if the selected encoder does not support it, or if the value is not a valid #VideoWriterPresets. VideoWriter::get() returns the value passed to open(), or -1 if it was not set. FFmpeg and GStreamer back-ends.
+  VIDEOWRITER_PROP_GOP_SIZE = 19, //!< (**open-only**) Group Of Pictures size, i.e. the maximum interval between key frames. VideoWriter::open() fails if the selected encoder does not support it. VideoWriter::get() returns the value passed to open(), or 0 if it was not set. FFmpeg and GStreamer back-ends.
 #ifndef CV_DOXYGEN
   CV__VIDEOWRITER_PROP_LATEST
 #endif
+};
+
+/** @brief cv::VideoWriter encoder presets for \ref cv::VIDEOWRITER_PROP_PRESET.
+
+Ordered from fastest encoding / lowest compression to slowest / highest. Names match the
+preset system used by libx264 and libx265.
+*/
+enum VideoWriterPresets {
+  VIDEOWRITER_PRESET_ULTRAFAST = 0, //!< Fastest encoding, lowest compression efficiency.
+  VIDEOWRITER_PRESET_SUPERFAST = 1,
+  VIDEOWRITER_PRESET_VERYFAST = 2,
+  VIDEOWRITER_PRESET_FASTER = 3,
+  VIDEOWRITER_PRESET_FAST = 4,
+  VIDEOWRITER_PRESET_MEDIUM = 5,    //!< Encoder default.
+  VIDEOWRITER_PRESET_SLOW = 6,
+  VIDEOWRITER_PRESET_SLOWER = 7,
+  VIDEOWRITER_PRESET_VERYSLOW = 8,
+  VIDEOWRITER_PRESET_PLACEBO = 9    //!< Slowest encoding, highest compression efficiency.
 };
 
 //! @} videoio_flags_base
@@ -743,6 +760,22 @@ enum VideoCaptureOBSensorProperties{
 
 //! @} videoio_flags_others
 
+/** @brief Camera device reported by a videoio backend
+ */
+struct CV_EXPORTS_W_SIMPLE VideoDeviceInfo
+{
+    CV_WRAP VideoDeviceInfo() : cam_idx(-1), backend(CAP_ANY) {}
+
+    //! Index to pass to cv::VideoCapture together with VideoDeviceInfo::backend to open this device.
+    //! Under #CAP_ANY, an index of 100 or more is reinterpreted as a backend selector (see cv::VideoCapture::open),
+    //! so cam_idx alone does not reliably identify the device.
+    CV_PROP_RW int cam_idx;
+    //! Device name reported by the backend, or "cam: <index>" if unavailable
+    CV_PROP_RW std::string cam_name;
+    //! Backend that reported this device
+    CV_PROP_RW VideoCaptureAPIs backend;
+};
+
 /** @brief Read data stream interface
  */
 class CV_EXPORTS_W IStreamReader
@@ -779,12 +812,11 @@ namespace internal { class VideoCapturePrivateAccessor; }
 The class provides C++ API for capturing video from cameras or for reading video files and image sequences.
 
 Here is how the class can be used:
-@include samples/cpp/videocapture_basic.cpp
+@include samples/cpp/snippets/videocapture_basic.cpp
 
-@note In @ref videoio_c "C API" the black-box structure `CvCapture` is used instead of %VideoCapture.
 @note
 -   (C++) A basic sample on using the %VideoCapture interface can be found at
-    `OPENCV_SOURCE_CODE/samples/cpp/videocapture_starter.cpp`
+    `OPENCV_SOURCE_CODE/samples/cpp/videocapture_combined.cpp`
 -   (Python) A basic sample on using the %VideoCapture interface can be found at
     `OPENCV_SOURCE_CODE/samples/python/video.py`
 -   (Python) A multi threaded video processing sample can be found at
@@ -796,9 +828,6 @@ class CV_EXPORTS_W VideoCapture
 {
 public:
     /** @brief Default constructor
-    @note In @ref videoio_c "C API", when you finished working with video, release CvCapture structure with
-    cvReleaseCapture(), or use Ptr\<CvCapture\> that calls cvReleaseCapture() automatically in the
-    destructor.
      */
     CV_WRAP VideoCapture();
 
@@ -970,10 +999,6 @@ public:
     and the function returns an empty image (with %cv::Mat, test it with Mat::empty()).
 
     @sa read()
-
-    @note In @ref videoio_c "C API", functions cvRetrieveFrame() and cv.RetrieveFrame() return image stored inside the video
-    capturing structure. It is not allowed to modify or release the image! You can copy the frame using
-    cvCloneImage and then do whatever you want with the copy.
      */
     CV_WRAP virtual bool retrieve(OutputArray image, int flag = 0);
 
@@ -996,10 +1021,6 @@ public:
     most convenient method for reading video files or capturing data from decode and returns the just
     grabbed frame. If no frames has been grabbed (camera has been disconnected, or there are no more
     frames in video file), the method returns false and the function returns empty image (with %cv::Mat, test it with Mat::empty()).
-
-    @note In @ref videoio_c "C API", functions cvRetrieveFrame() and cv.RetrieveFrame() return image stored inside the video
-    capturing structure. It is not allowed to modify or release the image! You can copy the frame using
-    cvCloneImage and then do whatever you want with the copy.
      */
     CV_WRAP virtual bool read(OutputArray image);
 
@@ -1018,7 +1039,7 @@ public:
 
     @param propId Property identifier from cv::VideoCaptureProperties (eg. cv::CAP_PROP_POS_MSEC, cv::CAP_PROP_POS_FRAMES, ...)
     or one from @ref videoio_flags_others
-    @return Value for the specified property. Value 0 is returned when querying a property that is
+    @return Value for the specified property. Value cv::CAP_PROP_UNKNOWN is returned when querying a property that is
     not supported by the backend used by the VideoCapture instance.
 
     @note Reading / writing properties involves many layers. Some unexpected result might happens
@@ -1082,7 +1103,7 @@ class IVideoWriter;
 Check @ref tutorial_video_write "the corresponding tutorial" for more details
 */
 
-/** @example samples/cpp/videowriter_basic.cpp
+/** @example samples/cpp/videowriter.cpp
 An example using VideoCapture and VideoWriter class
 */
 
@@ -1209,8 +1230,13 @@ public:
 
     The function/method writes the specified image to video file. It must have the same size as has
     been specified when opening the video writer.
+
+    @return `true` if the frame was written successfully by the underlying backend,
+    `false` otherwise (for example, on network errors when streaming, encoder failures,
+    or unsupported input frames). Backends that do not surface per-frame status from
+    their native API report `true` on best-effort success.
      */
-    CV_WRAP virtual void write(InputArray image);
+    CV_WRAP virtual bool write(InputArray image);
 
     /** @brief Sets a property in the VideoWriter.
 

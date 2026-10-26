@@ -24,6 +24,8 @@ struct Layer_Resize : public TestBaseWithParam<tuple<Backend, Target>>
         lp.set("width", outW);
         lp.set("height", outH);
 
+
+
         int id = net.addLayerToPrev(lp.name, lp.type, lp);
         net.connect(0, 0, id, 0);
 

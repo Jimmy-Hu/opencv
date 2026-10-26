@@ -84,19 +84,11 @@ if(NOT ${found})
                         "Consider providing the '${executable}' variable via CMake command line or environment variables\n")
       endif()
       ocv_clear_vars(PYTHONINTERP_FOUND PYTHON_EXECUTABLE PYTHON_VERSION_STRING PYTHON_VERSION_MAJOR PYTHON_VERSION_MINOR PYTHON_VERSION_PATCH)
-      if(NOT CMAKE_VERSION VERSION_LESS "3.12")
-        if(_python_version_major STREQUAL "2")
-          set(__PYTHON_PREFIX Python2)
-        else()
-          set(__PYTHON_PREFIX Python3)
-        endif()
-        find_host_package(${__PYTHON_PREFIX} "${preferred_version}" COMPONENTS Interpreter)
-        if(${__PYTHON_PREFIX}_EXECUTABLE)
-          set(PYTHON_EXECUTABLE "${${__PYTHON_PREFIX}_EXECUTABLE}")
-          find_host_package(PythonInterp "${preferred_version}")  # Populate other variables
-        endif()
-      else()
-        message(STATUS "Consider using CMake 3.12+ for better Python support")
+      set(__PYTHON_PREFIX Python3)
+      find_host_package(${__PYTHON_PREFIX} "${preferred_version}" COMPONENTS Interpreter)
+      if(${__PYTHON_PREFIX}_EXECUTABLE)
+        set(PYTHON_EXECUTABLE "${${__PYTHON_PREFIX}_EXECUTABLE}")
+        find_host_package(PythonInterp "${preferred_version}")  # Populate other variables
       endif()
     endif()
     if(PYTHONINTERP_FOUND AND "${_python_version_major}" STREQUAL "${PYTHON_VERSION_MAJOR}")
@@ -130,6 +122,23 @@ if(NOT ${found})
       endif()
       if(NOT ${${include_dir_env}} STREQUAL "")
           set(PYTHON_INCLUDE_DIR "${${include_dir_env}}")
+      endif()
+      if (APPLE AND NOT CMAKE_CROSSCOMPILING)
+          if (NOT PYTHON_LIBRARY AND NOT PYTHON_INCLUDE_DIR)
+              execute_process(COMMAND ${_executable} -c "from sysconfig import *; print(get_config_var('INCLUDEPY'))"
+                              RESULT_VARIABLE _cvpy_process
+                              OUTPUT_VARIABLE _include_dir
+                              OUTPUT_STRIP_TRAILING_WHITESPACE)
+              execute_process(COMMAND ${_executable} -c "from sysconfig import *; print('%s/%s' % (get_config_var('LIBDIR'), get_config_var('LIBRARY').replace('.a', '.dylib' if get_platform().startswith('macos') else '.so')))"
+                              RESULT_VARIABLE _cvpy_process
+                              OUTPUT_VARIABLE _library
+                              OUTPUT_STRIP_TRAILING_WHITESPACE)
+              if (_include_dir AND _library AND EXISTS "${_include_dir}/Python.h" AND EXISTS "${_library}")
+                  set(PYTHON_INCLUDE_PATH "${_include_dir}")
+                  set(PYTHON_INCLUDE_DIR "${_include_dir}")
+                  set(PYTHON_LIBRARY "${_library}")
+              endif()
+          endif()
       endif()
 
       # not using _version_string here, because it might not conform to the CMake version format
@@ -208,9 +217,6 @@ if(NOT ${found})
         if(CMAKE_CROSSCOMPILING)
           message(STATUS "Cannot probe for Python/Numpy support (because we are cross-compiling OpenCV)")
           message(STATUS "If you want to enable Python/Numpy support, set the following variables:")
-          message(STATUS "  PYTHON2_INCLUDE_PATH")
-          message(STATUS "  PYTHON2_LIBRARIES (optional on Unix-like systems)")
-          message(STATUS "  PYTHON2_NUMPY_INCLUDE_DIRS")
           message(STATUS "  PYTHON3_INCLUDE_PATH")
           message(STATUS "  PYTHON3_LIBRARIES (optional on Unix-like systems)")
           message(STATUS "  PYTHON3_NUMPY_INCLUDE_DIRS")
@@ -268,20 +274,6 @@ if(OPENCV_PYTHON_SKIP_DETECTION)
   return()
 endif()
 
-ocv_check_environment_variables(OPENCV_ENABLE_PYTHON2)
-ocv_check_environment_variables(PYTHON2_EXECUTABLE)
-if((OPENCV_ENABLE_PYTHON2 OR PYTHON2_EXECUTABLE OR BUILD_opencv_python2)
-    AND NOT OPENCV_PYTHON2_SKIP_DETECTION
-)
-  find_python("" "${MIN_VER_PYTHON2}" PYTHON2_LIBRARY PYTHON2_INCLUDE_DIR
-    PYTHON2INTERP_FOUND PYTHON2_EXECUTABLE PYTHON2_VERSION_STRING
-    PYTHON2_VERSION_MAJOR PYTHON2_VERSION_MINOR PYTHON2LIBS_FOUND
-    PYTHON2LIBS_VERSION_STRING PYTHON2_LIBRARIES PYTHON2_LIBRARY
-    PYTHON2_DEBUG_LIBRARIES PYTHON2_LIBRARY_DEBUG PYTHON2_INCLUDE_PATH
-    PYTHON2_INCLUDE_DIR PYTHON2_INCLUDE_DIR2 PYTHON2_PACKAGES_PATH
-    PYTHON2_NUMPY_INCLUDE_DIRS PYTHON2_NUMPY_VERSION)
-endif()
-
 option(OPENCV_PYTHON3_VERSION "Python3 version" "")
 find_python("${OPENCV_PYTHON3_VERSION}" "${MIN_VER_PYTHON3}" PYTHON3_LIBRARY PYTHON3_INCLUDE_DIR
     PYTHON3INTERP_FOUND PYTHON3_EXECUTABLE PYTHON3_VERSION_STRING
@@ -305,12 +297,7 @@ endif()
 
 if(PYTHON_DEFAULT_EXECUTABLE)
     set(PYTHON_DEFAULT_AVAILABLE "TRUE")
-elseif(PYTHON2_EXECUTABLE AND PYTHON2INTERP_FOUND)
-    # Use Python 2 as default Python interpreter
-    set(PYTHON_DEFAULT_AVAILABLE "TRUE")
-    set(PYTHON_DEFAULT_EXECUTABLE "${PYTHON2_EXECUTABLE}")
 elseif(PYTHON3_EXECUTABLE AND PYTHON3INTERP_FOUND)
-    # Use Python 3 as fallback Python interpreter (if there is no Python 2)
     set(PYTHON_DEFAULT_AVAILABLE "TRUE")
     set(PYTHON_DEFAULT_EXECUTABLE "${PYTHON3_EXECUTABLE}")
 endif()

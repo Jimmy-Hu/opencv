@@ -1,5 +1,3 @@
-from __future__ import print_function
-
 import os, tempfile, numpy as np
 
 import sys
@@ -54,9 +52,9 @@ class aruco_objdetect_test(NewOpenCVTests):
                     _charucoCorners, _charuco_ids_cv, marker_corners_cv, marker_ids_cv = charuco_detector.detectBoard(from_cv_img)
                     marker_corners_svg_map, marker_corners_cv_map = {}, {}
                     for i in range(len(marker_ids_svg)):
-                        marker_corners_svg_map[int(marker_ids_svg[i][0])] = marker_corners_svg[i]
+                        marker_corners_svg_map[int(marker_ids_svg[i])] = marker_corners_svg[i]
                     for i in range(len(marker_ids_cv)):
-                        marker_corners_cv_map[int(marker_ids_cv[i][0])] = marker_corners_cv[i]
+                        marker_corners_cv_map[int(marker_ids_cv[i])] = marker_corners_cv[i]
 
                     for key_svg in marker_corners_svg_map.keys():
                         marker_svg = marker_corners_svg_map[key_svg]
@@ -111,9 +109,9 @@ class aruco_objdetect_test(NewOpenCVTests):
                     _charucoCorners, _charuco_ids_cv, marker_corners_cv, marker_ids_cv = charuco_detector.detectBoard(from_cv_img)
                     marker_corners_svg_map, marker_corners_cv_map = {}, {}
                     for i in range(len(marker_ids_svg)):
-                        marker_corners_svg_map[int(marker_ids_svg[i][0])] = marker_corners_svg[i]
+                        marker_corners_svg_map[int(marker_ids_svg[i])] = marker_corners_svg[i]
                     for i in range(len(marker_ids_cv)):
-                        marker_corners_cv_map[int(marker_ids_cv[i][0])] = marker_corners_cv[i]
+                        marker_corners_cv_map[int(marker_ids_cv[i])] = marker_corners_cv[i]
 
                     for key_svg in marker_corners_svg_map.keys():
                         marker_svg = marker_corners_svg_map[key_svg]

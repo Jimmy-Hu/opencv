@@ -136,9 +136,17 @@ PERF_TEST_P_(Conv1D, conv1d)
     Mat output = net.forward();
 
     MatShape netInputShape = shape(input);
+    cv::dnn::MatType netInputType = input.depth();
+
+    bool fp16 = false;
+#ifdef HAVE_OPENCL
+    fp16 = ocl::Device::getDefault().isExtensionSupported("cl_khr_fp16");
+#endif
+    if (netInputType == CV_32F && fp16 && targetId == DNN_TARGET_OPENCL_FP16)
+        netInputType = CV_16F;
     size_t weightsMemory = 0, blobsMemory = 0;
-    net.getMemoryConsumption(netInputShape, weightsMemory, blobsMemory);
-    int64 flops = net.getFLOPS(netInputShape);
+    net.getMemoryConsumption(netInputShape, netInputType, weightsMemory, blobsMemory);
+    int64 flops = net.getFLOPS(netInputShape, netInputType);
     CV_Assert(flops > 0);
 
     std::cout
@@ -157,7 +165,7 @@ PERF_TEST_P_(Conv1D, conv1d)
 
 INSTANTIATE_TEST_CASE_P(/**/, Conv1D, Combine(
         Conv1DParamID::all(),
-        dnnBackendsAndTargets(false, false)  // defined in ../test/test_common.hpp
+        dnnBackendsAndTargets(/* withInferenceEngine = */false, /* obsolete_withHalide = */false)  // defined in ../test/test_common.hpp
 ));
 
 } // namespace

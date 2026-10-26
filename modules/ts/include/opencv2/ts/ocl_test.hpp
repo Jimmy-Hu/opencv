@@ -48,7 +48,6 @@
 #include "opencv2/videoio.hpp"
 #include "opencv2/highgui.hpp"
 #include "opencv2/imgproc.hpp"
-#include "opencv2/imgproc/types_c.h"
 #include "opencv2/core/ocl.hpp"
 
 namespace cvtest {
@@ -109,6 +108,18 @@ do \
     ASSERT_EQ((mat1).size(), (mat2).size()); \
     EXPECT_LE(cvtest::ocl::TestUtils::checkNormRelative((mat1), (mat2)), eps) \
         << "Size: " << (mat1).size() << std::endl; \
+} while ((void)0, 0)
+
+#define EXPECT_MAT_N_DIFF_EPS(mat1, mat2, eps, num) \
+do \
+{ \
+    ASSERT_EQ(mat1.type(), mat2.type()); \
+    ASSERT_EQ(mat1.size(), mat2.size()); \
+    Mat diff, mask; \
+    absdiff(mat1, mat2, diff); \
+    cv::compare(diff.reshape(1), Scalar::all(eps), mask, CMP_GT); \
+    EXPECT_LE(countNonZero(mask), num) \
+    << "Size: " << mat1.size() << std::endl; \
 } while ((void)0, 0)
 
 #define EXPECT_MAT_N_DIFF(mat1, mat2, num) \
@@ -372,6 +383,8 @@ IMPLEMENT_PARAM_CLASS(Channels, int)
 #define OCL_ON(...) cv::ocl::setUseOpenCL(true); __VA_ARGS__ ;
 
 #define OCL_ALL_DEPTHS Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F)
+#define OCL_ABSOLUTELY_ALL_DEPTHS Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32U, CV_64S, CV_64U, CV_16F, CV_16BF, CV_32F, CV_64F, CV_Bool)
+//, CV_16F, CV_16BF, CV_64U, CV_64S, CV_32U)
 #define OCL_ALL_DEPTHS_16F Values(CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F, CV_16F)
 #define OCL_ALL_CHANNELS Values(1, 2, 3, 4)
 

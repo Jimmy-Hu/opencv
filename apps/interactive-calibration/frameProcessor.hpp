@@ -6,7 +6,7 @@
 #define FRAME_PROCESSOR_HPP
 
 #include <opencv2/core.hpp>
-#include <opencv2/calib3d.hpp>
+#include <opencv2/calib.hpp>
 #include <opencv2/objdetect.hpp>
 
 #include "calibCommon.hpp"

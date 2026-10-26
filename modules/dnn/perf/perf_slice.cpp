@@ -6,7 +6,7 @@
 
 namespace opencv_test {
 
-struct Layer_Slice_Test : public TestBaseWithParam<tuple<Backend, Target>>
+struct Layer_Slice : public TestBaseWithParam<tuple<Backend, Target>>
 {
     void test_slice(const std::vector<int>& input_shape, int axis, int begin, int end, int step = 1)
     {
@@ -58,29 +58,29 @@ struct Layer_Slice_Test : public TestBaseWithParam<tuple<Backend, Target>>
     }
 };
 
-PERF_TEST_P_(Layer_Slice_Test, Slice_Contiguous_Axis0)
+PERF_TEST_P_(Layer_Slice, Slice_Contiguous_Axis0)
 {
     test_slice({64, 128, 128}, 0, 10, 54);
 }
 
-PERF_TEST_P_(Layer_Slice_Test, Slice_Contiguous_Axis2)
+PERF_TEST_P_(Layer_Slice, Slice_Contiguous_Axis2)
 {
     test_slice({64, 128, 128}, 2, 10, 118);
 }
 
-PERF_TEST_P_(Layer_Slice_Test, Slice_Small_Middle)
+PERF_TEST_P_(Layer_Slice, Slice_Small_Middle)
 {
     test_slice({32, 64, 32}, 1, 20, 40);
 }
 
-PERF_TEST_P_(Layer_Slice_Test, Slice_Strided_Axis0_Step2)
+PERF_TEST_P_(Layer_Slice, Slice_Strided_Axis0_Step2)
 {
     // Strided slice on outer axis.
     // [64, 128, 128] -> [0:64:2, ...]
     test_slice({64, 128, 128}, 0, 0, 64, 2);
 }
 
-PERF_TEST_P_(Layer_Slice_Test, Slice_Strided_Axis2_Step2)
+PERF_TEST_P_(Layer_Slice, Slice_Strided_Axis2_Step2)
 {
     // Strided slice on inner axis.
     // [64, 128, 128] -> [..., 0:128:2]
@@ -88,6 +88,6 @@ PERF_TEST_P_(Layer_Slice_Test, Slice_Strided_Axis2_Step2)
 }
 
 
-INSTANTIATE_TEST_CASE_P(/**/, Layer_Slice_Test, dnnBackendsAndTargets(false, false, true, false, false, false, false, false));
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Slice, dnnBackendsAndTargets(false, false, true, false, false, false, false, false));
 
 } // namespace opencv_test

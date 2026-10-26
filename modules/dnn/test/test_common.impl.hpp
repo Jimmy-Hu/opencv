@@ -14,6 +14,7 @@
 
 #include <opencv2/core/utils/configuration.private.hpp>
 #include <opencv2/core/utils/logger.hpp>
+#include <opencv2/geometry.hpp>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -30,7 +31,6 @@ void PrintTo(const cv::dnn::Backend& v, std::ostream* os)
 {
     switch (v) {
     case DNN_BACKEND_DEFAULT: *os << "DEFAULT"; return;
-    case DNN_BACKEND_HALIDE: *os << "HALIDE"; return;
     case DNN_BACKEND_INFERENCE_ENGINE: *os << "DLIE*"; return;
     case DNN_BACKEND_VKCOM: *os << "VKCOM"; return;
     case DNN_BACKEND_OPENCV: *os << "OCV"; return;
@@ -80,11 +80,42 @@ void normAssert(
         cv::InputArray ref, cv::InputArray test, const char *comment /*= ""*/,
         double l1 /*= 0.00001*/, double lInf /*= 0.0001*/)
 {
-    double normL1 = cvtest::norm(ref, test, cv::NORM_L1) / ref.getMat().total();
-    EXPECT_LE(normL1, l1) << comment << "  |ref| = " << cvtest::norm(ref, cv::NORM_INF);
+    cv::Mat refMat = ref.getMat();
+    cv::Mat testMat = test.getMat();
+    // 16-bit float types (half / bfloat16) are compared as float32: the two-arg
+    // cvtest::norm requires identical types and does not down-convert them.
+    if (refMat.depth() == CV_16F || refMat.depth() == CV_16BF)
+        refMat.convertTo(refMat, CV_32F);
+    if (testMat.depth() == CV_16F || testMat.depth() == CV_16BF)
+        testMat.convertTo(testMat, CV_32F);
+    const cv::MatShape refShape = refMat.shape();
+    const cv::MatShape testShape = testMat.shape();
+    const bool scalar1dCompatible =
+        (refShape.isScalar() && testShape.size() == 1 && testShape[0] == 1) ||
+        (testShape.isScalar() && refShape.size() == 1 && refShape[0] == 1);
+    if (scalar1dCompatible)
+    {
+        const cv::MatShape oneShape{1};
+        if (refShape.isScalar())
+            refMat = refMat.reshape(1, oneShape);
+        if (testShape.isScalar())
+            testMat = testMat.reshape(1, oneShape);
+    }
 
-    double normInf = cvtest::norm(ref, test, cv::NORM_INF);
-    EXPECT_LE(normInf, lInf) << comment << "  |ref| = " << cvtest::norm(ref, cv::NORM_INF);
+    // Empty tensors are valid for ONNX conformance tests. Avoid 0/0 in normL1
+    // and verify emptiness compatibility directly.
+    if (refMat.total() == 0 || testMat.total() == 0)
+    {
+        EXPECT_EQ(refMat.total(), testMat.total()) << comment;
+        EXPECT_EQ(refMat.size, testMat.size) << comment;
+        return;
+    }
+
+    double normL1 = cvtest::norm(refMat, testMat, cv::NORM_L1) / refMat.total();
+    EXPECT_LE(normL1, l1) << comment << "  |ref| = " << cvtest::norm(refMat, cv::NORM_INF);
+
+    double normInf = cvtest::norm(refMat, testMat, cv::NORM_INF);
+    EXPECT_LE(normInf, lInf) << comment << "  |ref| = " << cvtest::norm(refMat, cv::NORM_INF);
 }
 
 std::vector<cv::Rect2d> matToBoxes(const cv::Mat& m)
@@ -258,7 +289,7 @@ void readFileContent(const std::string& filename, CV_OUT std::vector<char>& cont
 
 testing::internal::ParamGenerator< tuple<Backend, Target> > dnnBackendsAndTargets(
         bool withInferenceEngine /*= true*/,
-        bool withHalide /*= false*/,
+        bool obsolete_withHalide /*= false*/,
         bool withCpuOCV /*= true*/,
         bool withVkCom /*= true*/,
         bool withCUDA /*= true*/,
@@ -271,12 +302,6 @@ testing::internal::ParamGenerator< tuple<Backend, Target> > dnnBackendsAndTarget
 
     std::vector< tuple<Backend, Target> > targets;
     std::vector< Target > available;
-    if (withHalide)
-    {
-        available = getAvailableTargets(DNN_BACKEND_HALIDE);
-        for (std::vector< Target >::const_iterator i = available.begin(); i != available.end(); ++i)
-            targets.push_back(make_tuple(DNN_BACKEND_HALIDE, *i));
-    }
     if (withInferenceEngine)
     {
         available = getAvailableTargets(DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019);
@@ -446,11 +471,6 @@ void initDNNTests()
         CV_TEST_TAG_DNN_SKIP_CPU, CV_TEST_TAG_DNN_SKIP_CPU_FP16,
         CV_TEST_TAG_DNN_SKIP_OPENCL, CV_TEST_TAG_DNN_SKIP_OPENCL_FP16
     );
-#if defined(HAVE_HALIDE)
-    registerGlobalSkipTag(
-        CV_TEST_TAG_DNN_SKIP_HALIDE
-    );
-#endif
 #if defined(INF_ENGINE_RELEASE)
     registerGlobalSkipTag(
         CV_TEST_TAG_DNN_SKIP_IE,

@@ -6,32 +6,8 @@
 #define CAP_INTERFACE_HPP
 
 #include "opencv2/core.hpp"
-#include "opencv2/core/core_c.h"
 #include "opencv2/videoio.hpp"
-#include "opencv2/videoio/videoio_c.h"
 #include "opencv2/videoio/utils.private.hpp"
-
-//===================================================
-
-// Legacy structs
-
-struct CvCapture
-{
-    virtual ~CvCapture() {}
-    virtual double getProperty(int) const { return 0; }
-    virtual bool setProperty(int, double) { return 0; }
-    virtual bool grabFrame() { return true; }
-    virtual IplImage* retrieveFrame(int) { return 0; }
-    virtual int getCaptureDomain() { return cv::CAP_ANY; } // Return the type of the capture object: CAP_DSHOW, etc...
-};
-
-struct CvVideoWriter
-{
-    virtual ~CvVideoWriter() {}
-    virtual bool writeFrame(const IplImage*) { return false; }
-    virtual int getCaptureDomain() const { return cv::CAP_ANY; } // Return the type of the capture object: CAP_FFMPEG, etc...
-    virtual double getProperty(int) const { return 0; }
-};
 
 //===================================================
 
@@ -214,7 +190,7 @@ class IVideoCapture
 {
 public:
     virtual ~IVideoCapture() {}
-    virtual double getProperty(int) const { return 0; }
+    virtual double getProperty(int) const { return CAP_PROP_UNKNOWN; }
     virtual bool setProperty(int, double) { return false; }
     virtual bool grabFrame() = 0;
     virtual bool retrieveFrame(int, OutputArray) = 0;
@@ -226,10 +202,10 @@ class IVideoWriter
 {
 public:
     virtual ~IVideoWriter() {}
-    virtual double getProperty(int) const { return 0; }
+    virtual double getProperty(int) const { return CAP_PROP_UNKNOWN; }
     virtual bool setProperty(int, double) { return false; }
     virtual bool isOpened() const = 0;
-    virtual void write(InputArray) = 0;
+    virtual bool write(InputArray) = 0;
     virtual int getCaptureDomain() const { return cv::CAP_ANY; } // Return the type of the capture object: CAP_FFMPEG, etc...
 };
 
@@ -326,6 +302,15 @@ protected:
 
 //==================================================================================================
 
+inline VideoDeviceInfo makeVideoDeviceInfo(int cam_idx, VideoCaptureAPIs backend, const std::string& cam_name)
+{
+    VideoDeviceInfo info;
+    info.cam_idx = cam_idx;
+    info.cam_name = cam_name.empty() ? cv::format("cam: %d", cam_idx) : cam_name;
+    info.backend = backend;
+    return info;
+}
+
 Ptr<IVideoCapture> cvCreateFileCapture_FFMPEG_proxy(const std::string &filename, const VideoCaptureParameters& params);
 Ptr<IVideoCapture> cvCreateCameraCapture_FFMPEG_proxy(int index, const VideoCaptureParameters& params);
 Ptr<IVideoCapture> cvCreateStreamCapture_FFMPEG_proxy(const Ptr<IStreamReader>& stream, const VideoCaptureParameters& params);
@@ -349,6 +334,7 @@ Ptr<IVideoCapture> create_AVFoundation_capture_cam(int index);
 Ptr<IVideoWriter> create_AVFoundation_writer(const std::string& filename, int fourcc,
                                              double fps, const Size& frameSize,
                                              const VideoWriterParameters& params);
+std::vector<VideoDeviceInfo> enumerate_AVFoundation_devices();
 
 Ptr<IVideoCapture> create_WRT_capture(int device);
 
@@ -358,11 +344,14 @@ Ptr<IVideoCapture> cvCreateCapture_MSMF(const Ptr<IStreamReader>& stream, const 
 Ptr<IVideoWriter> cvCreateVideoWriter_MSMF(const std::string& filename, int fourcc,
                                            double fps, const Size& frameSize,
                                            const VideoWriterParameters& params);
+std::vector<VideoDeviceInfo> enumerate_MSMF_devices();
 
 Ptr<IVideoCapture> create_DShow_capture(int index, const VideoCaptureParameters& params);
+std::vector<VideoDeviceInfo> enumerate_DShow_devices();
 
 Ptr<IVideoCapture> create_V4L_capture_cam(int index);
 Ptr<IVideoCapture> create_V4L_capture_file(const std::string &filename);
+std::vector<VideoDeviceInfo> enumerate_V4L_devices();
 
 Ptr<IVideoCapture> create_OpenNI2_capture_cam( int index );
 Ptr<IVideoCapture> create_OpenNI2_capture_file( const std::string &filename );
@@ -384,6 +373,7 @@ Ptr<IVideoCapture> create_XIMEA_capture_file( const std::string &serialNumber );
 Ptr<IVideoCapture> create_ueye_camera(int camera);
 
 Ptr<IVideoCapture> create_Aravis_capture( int index );
+std::vector<VideoDeviceInfo> enumerate_Aravis_devices();
 
 Ptr<IVideoCapture> createMotionJpegCapture(const std::string& filename);
 Ptr<IVideoWriter> createMotionJpegWriter(const std::string& filename, int fourcc,

@@ -7,6 +7,7 @@
 #include "opencl_kernels_core.hpp"
 #include "stat.hpp"
 
+#include "stat_parallel.hpp"
 #include "sum.simd.hpp"
 #include "sum.simd_declarations.hpp" // defines CV_CPU_DISPATCH_MODES_ALL=AVX2,...,BASELINE based on CMakeLists.txt content
 
@@ -48,7 +49,7 @@ bool ocl_sum( InputArray _src, Scalar & res, int sum_op, InputArray _mask,
 
     int ddepth = std::max(sum_op == OCL_OP_SUM_SQR ? CV_32F : CV_32S, depth),
             dtype = CV_MAKE_TYPE(ddepth, cn);
-    CV_Assert(!haveMask || _mask.type() == CV_8UC1);
+    CV_Assert(!haveMask || _mask.type() == CV_8U || _mask.type() == CV_8S || _mask.type() == CV_Bool);
 
     int wgs2_aligned = 1;
     while (wgs2_aligned < (int)wgs)
@@ -118,52 +119,46 @@ bool ocl_sum( InputArray _src, Scalar & res, int sum_op, InputArray _mask,
 
 #endif
 
-Scalar sum(InputArray _src)
+// serial implementation, also used for the pieces of the parallel version
+static Scalar sum_(const Mat& src)
 {
-    CV_INSTRUMENT_REGION();
-
-    Scalar _res = Scalar::all(0.0);
-
-#ifdef HAVE_OPENCL
-    CV_OCL_RUN_(OCL_PERFORMANCE_CHECK(_src.isUMat()) && _src.dims() <= 2,
-                ocl_sum(_src, _res, OCL_OP_SUM),
-                _res);
-#endif
-
-    Mat src = _src.getMat();
+    Scalar _res;
     int cn = src.channels();
-    CV_CheckLE( cn, 4, "cv::sum does not support more than 4 channels" );
 
-    if (_src.dims() <= 2)
+    if (src.dims <= 2)
     {
         CALL_HAL_RET2(sum, cv_hal_sum, _res, src.data, src.step, src.type(), src.cols, src.rows, &_res[0]);
     }
-    else if (_src.isContinuous())
+    else if (src.isContinuous())
     {
         CALL_HAL_RET2(sum, cv_hal_sum, _res, src.data, 0, src.type(), (int)src.total(), 1, &_res[0]);
     }
 
     int k, depth = src.depth();
     SumFunc func = getSumFunc(depth);
-    CV_Assert( func != nullptr );
+    if (func == nullptr) {
+        if (depth == CV_Bool && cn == 1)
+            return Scalar((double)countNonZero(src));
+        CV_Error_(Error::StsNotImplemented, ("sum: %s input is not supported, convert the input to another type (e.g. CV_32F) first",
+                                            typeToString(src.type()).c_str()));
+    }
 
     const Mat* arrays[] = {&src, 0};
     uchar* ptrs[1] = {};
     NAryMatIterator it(arrays, ptrs);
-    int total = (int)it.size, blockSize = total, intSumBlockSize = 0;
+    int total = (int)it.size, blockSize = total, partialBlockSize = 0;
     int j, count = 0;
-    AutoBuffer<int> _buf;
+    int _buf[CV_CN_MAX];
     int* buf = (int*)&_res[0];
     size_t esz = 0;
-    bool blockSum = depth < CV_32S;
+    bool partialSumIsInt = depth < CV_32S;
+    bool blockSum = partialSumIsInt || depth == CV_16F || depth == CV_16BF;
 
     if( blockSum )
     {
-        intSumBlockSize = depth <= CV_8S ? (1 << 23) : (1 << 15);
-        blockSize = std::min(blockSize, intSumBlockSize);
-        _buf.allocate(cn);
-        buf = _buf.data();
-
+        partialBlockSize = depth <= CV_8S ? (1 << 23) : (1 << 15);
+        blockSize = std::min(blockSize, partialBlockSize);
+        buf = _buf;
         for( k = 0; k < cn; k++ )
             buf[k] = 0;
         esz = src.elemSize();
@@ -176,18 +171,55 @@ Scalar sum(InputArray _src)
             int bsz = std::min(total - j, blockSize);
             func( ptrs[0], 0, (uchar*)buf, bsz, cn );
             count += bsz;
-            if( blockSum && (count + blockSize >= intSumBlockSize || (i+1 >= it.nplanes && j+bsz >= total)) )
+            if( blockSum && (count + blockSize >= partialBlockSize || (i+1 >= it.nplanes && j+bsz >= total)) )
             {
-                for( k = 0; k < cn; k++ )
-                {
-                    _res[k] += buf[k];
-                    buf[k] = 0;
+                if (partialSumIsInt) {
+                    for( k = 0; k < cn; k++ )
+                    {
+                        _res[k] += buf[k];
+                        buf[k] = 0;
+                    }
+                } else {
+                    for( k = 0; k < cn; k++ )
+                    {
+                        _res[k] += ((float*)buf)[k];
+                        buf[k] = 0;
+                    }
                 }
                 count = 0;
             }
             ptrs[0] += bsz*esz;
         }
     }
+    return _res;
+}
+
+Scalar sum(InputArray _src)
+{
+    CV_INSTRUMENT_REGION();
+
+    Scalar _res;
+#ifdef HAVE_OPENCL
+    CV_OCL_RUN_(OCL_PERFORMANCE_CHECK(_src.isUMat()) && _src.dims() <= 2,
+                ocl_sum(_src, _res, OCL_OP_SUM),
+                _res);
+#endif
+
+    Mat src = _src.getMat();
+    CV_CheckLE( src.channels(), 4, "cv::sum does not support more than 4 channels" );
+
+    std::vector<StatChunk> chunks;
+    if (!splitForParallelStat(src, Mat(), chunks))
+        return sum_(src);
+
+    std::vector<Scalar> part(chunks.size());
+    parallel_for_(Range(0, (int)chunks.size()), [&](const Range& r)
+    {
+        for (int i = r.start; i < r.end; i++)
+            part[i] = sum_(chunks[i].src);
+    });
+    for (const Scalar& v : part)
+        _res += v;
     return _res;
 }
 

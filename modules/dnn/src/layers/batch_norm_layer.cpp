@@ -12,7 +12,6 @@ Implementation of Batch Normalization layer.
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_webnn.hpp"
@@ -93,8 +92,12 @@ public:
         const float* weightsData = hasWeights ? blobs[weightsBlobIndex].ptr<float>() : 0;
         const float* biasData = hasBias ? blobs[biasBlobIndex].ptr<float>() : 0;
 
-        origin_weights.create(1, (int)n, CV_32F);
-        origin_bias.create(1, (int)n, CV_32F);
+        // 1-D [n], NOT 1xn: the fused scale/bias participate in element-wise ops against 0/1-D
+        // inputs, and under the broadcasting rules (4) op (1,4) yields (1,4) - a 2-D result that
+        // would not fit a preallocated 1-D output blob. 1-D weights keep every shape exact.
+        const int sz1d[] = { (int)n };
+        origin_weights.create(1, sz1d, CV_32F);
+        origin_bias.create(1, sz1d, CV_32F);
 
         float* dstWeightsData = origin_weights.ptr<float>();
         float* dstBiasData = origin_bias.ptr<float>();
@@ -109,8 +112,8 @@ public:
 
     virtual void finalize(InputArrayOfArrays, OutputArrayOfArrays) CV_OVERRIDE
     {
-        origin_weights.reshape(1, 1).copyTo(weights_);
-        origin_bias.reshape(1, 1).copyTo(bias_);
+        origin_weights.copyTo(weights_);
+        origin_bias.copyTo(bias_);
     }
 
     void getScaleShift(Mat& scale, Mat& shift) const CV_OVERRIDE
@@ -134,9 +137,11 @@ public:
             (numFusedBias != numChannels && numFusedBias != 1 && !b.empty()))
             return false;
 
+        // reshape the fused factors to 1-D [numChannels], matching weights_/bias_ - a 1xn operand
+        // would broadcast the result up to 2-D and detach weights_ from its expected 1-D shape
+        const int fsz[] = { numChannels };
         if (!w.empty())
         {
-            w = w.reshape(1, 1);
             if (numFusedWeights == 1)
             {
                 multiply(weights_, w.at<float>(0), weights_);
@@ -144,17 +149,17 @@ public:
             }
             else
             {
+                w = w.reshape(1, 1, fsz);
                 multiply(weights_, w, weights_);
                 multiply(bias_, w, bias_);
             }
         }
         if (!b.empty())
         {
-            b = b.reshape(1, 1);
             if (numFusedBias == 1)
                 add(bias_, b.at<float>(0), bias_);
             else
-                add(bias_, b.reshape(1, 1), bias_);
+                add(bias_, b.reshape(1, 1, fsz), bias_);
         }
         return true;
     }
@@ -164,6 +169,11 @@ public:
                          std::vector<MatShape> &outputs,
                          std::vector<MatShape> &internals) const CV_OVERRIDE
     {
+        if (inputs[0].size() == 0) { // Support for 0D input
+            outputs.push_back(MatShape::scalar()); // Output is also a scalar.
+            return true;
+        }
+
         dims = inputs[0].size();
         if (!useGlobalStats && inputs[0][0] != 1)
             CV_Error(Error::StsNotImplemented, "Batch normalization in training mode with batch size > 1");
@@ -179,7 +189,6 @@ public:
 #endif
         return (backendId == DNN_BACKEND_OPENCV) ||
                backendId == DNN_BACKEND_CUDA ||
-               (backendId == DNN_BACKEND_HALIDE && haveHalide()) ||
                backendId == DNN_BACKEND_WEBNN ||
                backendId == DNN_BACKEND_CANN;
     }
@@ -274,6 +283,20 @@ public:
         inputs_arr.getMatVector(inputs);
         outputs_arr.getMatVector(outputs);
 
+        if (inputs[0].dims <= 1) { // Handling for 0D and 1D
+            Mat &inpBlob = inputs[0];
+            Mat &outBlob = outputs[0];
+            CV_Assert(inpBlob.total() == weights_.total());
+            // run on 1-D [n] views (a 0-D blob views as [1]) so every operand shape matches exactly:
+            // the result lands in the preallocated output blob in place, no realloc/detach possible
+            const int n1[] = { (int)inpBlob.total() };
+            Mat inp1d = inpBlob.reshape(1, 1, n1);
+            Mat out1d = outBlob.reshape(1, 1, n1);
+            cv::multiply(inp1d, weights_, out1d);
+            cv::add(out1d, bias_, out1d);
+            return;
+        }
+
         CV_Assert(blobs.size() >= 2);
         CV_Assert(inputs.size() == 1);
 
@@ -286,7 +309,6 @@ public:
         for (size_t ii = 0; ii < outputs.size(); ii++)
         {
             Mat &outBlob = outputs[ii];
-
             for(int num = 0; num < outBlob.size[0]; num++)
             {
                 for (int n = 0; n < outBlob.size[1]; n++)
@@ -342,52 +364,6 @@ public:
         return make_cuda_node<cuda4dnn::BatchNormOp>(preferableTarget, std::move(context->stream), weights_, bias_);
     }
 #endif
-
-    virtual Ptr<BackendNode> tryAttach(const Ptr<BackendNode>& node) CV_OVERRIDE
-    {
-        switch (node->backendId)
-        {
-            case DNN_BACKEND_HALIDE:
-            {
-#ifdef HAVE_HALIDE
-                auto base = node.dynamicCast<HalideBackendNode>();
-                Halide::Func& input = base->funcs.back();
-                Halide::Var x("x"), y("y"), c("c"), n("n");
-                Halide::Func top = attachHalide(input(x, y, c, n));
-                return Ptr<BackendNode>(new HalideBackendNode(base, top));
-#endif  // HAVE_HALIDE
-                break;
-            }
-        }
-        return Ptr<BackendNode>();
-    }
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        Halide::Buffer<float> input = halideBuffer(inputs[0]);
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = attachHalide(input(x, y, c, n));
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
-
-#ifdef HAVE_HALIDE
-    // attachHalide can work both with Halide::Buffer and Halide::Func. In the
-    // second case it will be a fusion.
-    Halide::Func attachHalide(const Halide::Expr& input)
-    {
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-
-        const int numChannels = weights_.total();
-        auto weights = wrapToHalideBuffer(weights_, {numChannels});
-        auto bias = wrapToHalideBuffer(bias_, {numChannels});
-        top(x, y, c, n) = input * weights(c) + bias(c);
-        return top;
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_CANN
     virtual Ptr<BackendNode> initCann(const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -464,19 +440,6 @@ public:
         return Ptr<BackendNode>(new InfEngineNgraphNode(scale_shift));
     }
 #endif  // HAVE_DNN_NGRAPH
-
-    virtual bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                             const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        params.set("input_scale", scales[0][0]);
-        params.set("input_zeropoint", zeropoints[0][0]);
-        params.set("eps", epsilon);
-
-        params.blobs.clear();
-        params.blobs.push_back(origin_weights);
-        params.blobs.push_back(origin_bias);
-        return true;
-    }
 
 #ifdef HAVE_WEBNN
     virtual Ptr<BackendNode> initWebnn(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE

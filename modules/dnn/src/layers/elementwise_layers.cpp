@@ -42,8 +42,9 @@
 
 #include "../precomp.hpp"
 #include "layers_common.hpp"
+#include "cpu_kernels/blocked_pointwise.hpp"
+#include "../adjacency_graph.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_vkcom.hpp"
@@ -53,6 +54,7 @@
 #include <opencv2/dnn/shape_utils.hpp>
 #include <iostream>
 #include <limits>
+#include <type_traits>
 #include <cfenv>
 
 #ifdef HAVE_OPENCL
@@ -94,6 +96,130 @@ using std::sin;
 using std::sinh;
 using std::tan;
 
+int ActivationLayer::getLayouts(const std::vector<DataLayout>& actualInputs,
+                                std::vector<DataLayout>& desiredInputs,
+                                const int requiredOutputs,
+                                std::vector<DataLayout>& outputs) const
+{
+    size_t ninputs = actualInputs.size();
+    CV_Assert(ninputs >= 1u);
+    desiredInputs = actualInputs;
+    outputs.assign(requiredOutputs, actualInputs[0]);
+    return 0;
+}
+
+struct PowerFunctor;
+struct AbsValFunctor;
+struct SignFunctor;
+
+template<typename Func>
+struct ElementWiseIntDispatch
+{
+    static inline bool supports(const Func&, int) { return false; }
+    static inline bool apply(const Func&, const Mat&, Mat&) { return false; }
+};
+
+static inline bool isIntegerDepth(int depth)
+{
+    return depth == CV_8U || depth == CV_8S || depth == CV_16U || depth == CV_16S ||
+           depth == CV_32U || depth == CV_32S || depth == CV_64U || depth == CV_64S;
+}
+
+static inline bool isUnsignedDepth(int depth)
+{
+    return depth == CV_8U || depth == CV_16U || depth == CV_32U || depth == CV_64U;
+}
+
+template<typename T> static inline T intAbs(T x, std::true_type)
+{
+    // Negating the type's minimum is undefined; the unsigned round trip wraps instead.
+    typedef typename std::make_unsigned<T>::type UT;
+    return x < 0 ? (T)(UT(0) - (UT)x) : x;
+}
+
+template<typename T> static inline T intAbs(T x, std::false_type) { return x; }
+
+template<typename T> static inline T intSign(T x, std::true_type) { return (T)((x > 0) - (x < 0)); }
+
+template<typename T> static inline T intSign(T x, std::false_type) { return (T)(x != 0); }
+
+struct IntAbsOp
+{
+    template<typename T> static inline T apply(T x)
+    {
+        return intAbs(x, std::integral_constant<bool, std::numeric_limits<T>::is_signed>());
+    }
+};
+
+struct IntSignOp
+{
+    template<typename T> static inline T apply(T x)
+    {
+        return intSign(x, std::integral_constant<bool, std::numeric_limits<T>::is_signed>());
+    }
+};
+
+template<typename Body> static inline void blockedParallelFor(size_t total, Body&& body)
+{
+    const size_t BLOCK_SIZE = 1 << 16;
+    parallel_for_(Range(0, (int)((total + BLOCK_SIZE - 1) / BLOCK_SIZE)),
+        [&](const Range& r)
+        {
+            for (int b = r.start; b < r.end; b++)
+            {
+                size_t start = (size_t)b * BLOCK_SIZE;
+                body(start, std::min(BLOCK_SIZE, total - start));
+            }
+        });
+}
+
+template<typename T, typename Op> static inline void intUnaryKernel(const Mat& src, Mat& dst)
+{
+    const T* srcptr = src.ptr<T>();
+    T* dstptr = dst.ptr<T>();
+
+    blockedParallelFor(src.total(), [&](size_t start, size_t len)
+    {
+        for (size_t i = start; i < start + len; i++)
+            dstptr[i] = Op::apply(srcptr[i]);
+    });
+}
+
+template<typename Op> static inline bool intUnaryDispatch(const Mat& src, Mat& dst)
+{
+    if (src.type() != dst.type())
+        return false;
+
+    switch (src.depth())
+    {
+        case CV_8U:  intUnaryKernel<uint8_t,  Op>(src, dst); break;
+        case CV_8S:  intUnaryKernel<int8_t,   Op>(src, dst); break;
+        case CV_16U: intUnaryKernel<uint16_t, Op>(src, dst); break;
+        case CV_16S: intUnaryKernel<int16_t,  Op>(src, dst); break;
+        case CV_32U: intUnaryKernel<uint32_t, Op>(src, dst); break;
+        case CV_32S: intUnaryKernel<int32_t,  Op>(src, dst); break;
+        case CV_64U: intUnaryKernel<uint64_t, Op>(src, dst); break;
+        case CV_64S: intUnaryKernel<int64_t,  Op>(src, dst); break;
+        default: return false;
+    }
+    return true;
+}
+
+static int computeElementwiseNstripes(const Mat& src)
+{
+    // Must match PBody::operator()'s own planeSize: it splits the per-sample plane, i.e. the
+    // dimensions from 2 on, and nothing else. A rank-1 tensor has no such dimensions -- PBody
+    // reads it as a single plane of size 1 whose elements are all channels, and the channel
+    // loop is not striped -- so its plane size is 1 here too, however many elements it holds.
+    // Deriving it from size[0] instead would ask for stripes PBody cannot hand out any work.
+    size_t planeSize = 1;
+    for (int d = 2; d < src.dims; ++d)
+        planeSize *= (size_t)src.size[d];
+
+    int nstripes = (int)std::max(1.0, (double)src.total() * (1. / 1024));
+    return (int)std::min((size_t)nstripes, planeSize);
+}
+
 template<typename Func>
 class ElementWiseLayer : public Func::Layer
 {
@@ -131,8 +257,8 @@ public:
                 planeSize *= src_->size[i];
 
             size_t stripeSize = (planeSize + nstripes - 1)/nstripes;
-            size_t stripeStart = r.start*stripeSize;
-            size_t stripeEnd = std::min(r.end*stripeSize, planeSize);
+            size_t stripeStart = std::min((size_t)r.start*stripeSize, planeSize);
+            size_t stripeEnd = std::min((size_t)r.end*stripeSize, planeSize);
 
             for( int i = 0; i < nsamples; i++ )
             {
@@ -143,7 +269,11 @@ public:
         }
     };
 
-    ElementWiseLayer(const Func &f=Func()) { func = f; }
+    ElementWiseLayer(const Func &f=Func())
+    {
+        registerFusionOpsOnce<ElementWiseLayer<Func> >({ &ElementWiseLayer<Func>::unfoldOp, nullptr });
+        func = f;
+    }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
@@ -153,38 +283,6 @@ public:
     virtual void finalize(InputArrayOfArrays, OutputArrayOfArrays) CV_OVERRIDE
     {
         func.finalize();
-    }
-
-    virtual Ptr<BackendNode> tryAttach(const Ptr<BackendNode>& node) CV_OVERRIDE
-    {
-        switch (node->backendId)
-        {
-            case DNN_BACKEND_HALIDE:
-            {
-#ifdef HAVE_HALIDE
-                auto base = node.dynamicCast<HalideBackendNode>();
-                Halide::Func& input = base->funcs.back();
-                Halide::Var x("x"), y("y"), c("c"), n("n");
-                Halide::Func top = (this->name.empty() ? Halide::Func() : Halide::Func(this->name));
-                func.attachHalide(input(x, y, c, n), top);
-                return Ptr<BackendNode>(new HalideBackendNode(base, top));
-#endif  // HAVE_HALIDE
-                break;
-            }
-        }
-        return Ptr<BackendNode>();
-    }
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        Halide::Buffer<float> input = halideBuffer(inputs[0]);
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (this->name.empty() ? Halide::Func() : Halide::Func(this->name));
-        func.attachHalide(input(x, y, c, n), top);
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
     }
 
 #ifdef HAVE_CANN
@@ -236,11 +334,33 @@ public:
         return true;
     }
 
+    void getTypes(const std::vector<MatType>& inputs,
+                  const int requiredOutputs,
+                  const int requiredInternals,
+                  std::vector<MatType>& outputs,
+                  std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size());
+        for (auto input : inputs)
+        {
+            // Types the functor has no integer kernel for follow the default gate.
+            if (!ElementWiseIntDispatch<Func>::supports(func, input))
+            {
+                LayerInfo::getTypes(inputs, requiredOutputs, requiredInternals, outputs, internals);
+                return;
+            }
+        }
+
+        outputs.assign(requiredOutputs, inputs[0]);
+        internals.assign(requiredInternals, inputs[0]);
+    }
+
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
 
-        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(this->preferableTarget),
+        // The OCL kernels compute in float, which would silently round wide integers.
+        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(this->preferableTarget) && !isIntegerDepth(inputs_arr.depth()),
                    func.applyOCL(inputs_arr, outputs_arr, internals_arr))
 
         if (inputs_arr.depth() == CV_16F)
@@ -257,12 +377,54 @@ public:
         {
             const Mat &src = inputs[i];
             Mat &dst = outputs[i];
-            CV_Assert_N(src.size == dst.size, src.type() == dst.type(),
-                      src.isContinuous(), dst.isContinuous(), src.type() == CV_32F);
 
-            const int nstripes = getNumThreads();
-            PBody body(func, src, dst, nstripes);
-            parallel_for_(Range(0, nstripes), body, nstripes);
+            if (src.total() == 0)
+                continue;
+
+            CV_Assert_N(src.size == dst.size, src.isContinuous(), dst.isContinuous());
+
+            if (ElementWiseIntDispatch<Func>::apply(func, src, dst))
+                continue;
+
+            if ((src.depth() == CV_32F || src.depth() == CV_64F) && src.type() == dst.type() &&
+                func.applyCore(src, dst))
+                continue;
+
+            if (src.type() == CV_32F && dst.type() == CV_32F)
+            {
+                // Try fast activation function path first
+                std::vector<float> activParams_;
+                ActivationFunc activFunc = func.getActivationFunc(CV_32F, activParams_);
+                if (activFunc) {
+                    const float* params = activParams_.empty() ? nullptr : activParams_.data();
+                    size_t total = src.total();
+                    const float* srcptr = src.ptr<float>();
+                    float* dstptr = dst.ptr<float>();
+
+                    blockedParallelFor(total, [&](size_t start, size_t len) {
+                        activFunc(srcptr + start, dstptr + start, len, params);
+                    });
+                    continue;
+                }
+
+                const int nstripes = computeElementwiseNstripes(src);
+                PBody body(func, src, dst, nstripes);
+                parallel_for_(Range(0, nstripes), body, nstripes);
+                continue;
+            }
+
+            if (src.type() == CV_64F && dst.type() == CV_64F)
+            {
+                Mat src_f, dst_f(dst.size, CV_32F);
+                src.convertTo(src_f, CV_32F);
+                const int nstripes = computeElementwiseNstripes(src_f);
+                PBody body(func, src_f, dst_f, nstripes);
+                parallel_for_(Range(0, nstripes), body, nstripes);
+                dst_f.convertTo(dst, CV_64F);
+                continue;
+            }
+
+            CV_Error(Error::StsUnsupportedFormat, "ElementWiseLayer: unsupported input/output type; expected CV_32F or CV_64F.");
         }
     }
 
@@ -271,23 +433,43 @@ public:
         func.apply(src, dst, -1, len, planeSize, cn0, cn1);
     }
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const CV_OVERRIDE
+    {
+        return func.getActivationFunc(depth, activParams);
+    }
+
+    static bool unfoldOp(const Layer* self, LayerMath& out, const ConstOperand& side)
+    {
+        return static_cast<const ElementWiseLayer<Func>*>(self)->unfoldMath(out, side);
+    }
+
+    bool unfoldMath(LayerMath& out, const ConstOperand& side) const
+    {
+        std::vector<float> params;
+        ActivationFunc fn = func.getActivationFunc(CV_32F, params);
+        if (!func.unfoldOp(out, side)) {
+            // No expression, but a host that can run the kernel can still take it on.
+            if (!fn)
+                return false;
+            out.setKernel(fn, params);
+            return true;
+        }
+        if (fn)
+            out.setKernel(fn, params);
+        return true;
+    }
+
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
         void *context_,
-        const std::vector<Ptr<BackendWrapper>>& inputs,
-        const std::vector<Ptr<BackendWrapper>>& outputs
+        InputArrayOfArrays /*inputs*/,
+        InputArrayOfArrays /*outputs*/
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
         return func.initCUDA(Layer::preferableTarget, context->stream);
     }
 #endif
-
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        return func.tryQuantize(scales, zeropoints, params);
-    }
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
                            const std::vector<MatShape> &outputs) const CV_OVERRIDE
@@ -323,15 +505,63 @@ struct BaseFunctor
 
     void getScaleShift(Mat&, Mat&) const {}
 
-    bool tryQuantize(const std::vector<std::vector<float>>&, const std::vector<std::vector<int>>&, LayerParams&) { return false; }
+    ActivationFunc getActivationFunc(int /*depth*/, std::vector<float>& /*activParams*/) const
+    { return nullptr; }
+
+    bool unfoldOp(LayerMath&, const ConstOperand&) const { return false; }
+
+    // CV_32F/CV_64F via the core element-wise engine; false if there is no exact equivalent
+    bool applyCore(const Mat&, Mat&) const { return false; }
 };
+
+// 1-d views: Mat::create() would reallocate a 0-d dst
+static inline bool applyCoreExpr(const std::string& expr, const Mat& src, Mat& dst)
+{
+    CV_Assert(src.isContinuous() && dst.isContinuous() && src.total() == dst.total() &&
+              src.total() <= (size_t)INT_MAX);
+    int n = (int)src.total();
+    std::vector<Mat> res{Mat(1, &n, dst.type(), dst.data)};
+    cv::texpr(expr, std::vector<Mat>{Mat(1, &n, src.type(), src.data)}, res);
+    CV_Assert(res[0].data == dst.data);
+    return true;
+}
+
+static inline std::string exprConst(float v)
+{
+    return cv::format("%.9g", v);
+}
 
 struct ReLUFunctor : public BaseFunctor
 {
     typedef ReLULayer Layer;
+
+    bool applyCore(const Mat& src, Mat& dst) const
+    {
+        return slope == 0.f && applyCoreExpr("relu({0})", src, dst);
+    }
     float slope;
 
     explicit ReLUFunctor(float slope_=1.f) : slope(slope_) {}
+
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams = {slope};
+        return cv::dnn::getActivationFunc(ACTIV_RELU);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int zero = r.constant(0.f);
+        const int pos  = r.binary(FusionEltwiseOp::MAX, LayerMath::INPUT_VALUE, zero);
+        if (slope == 0.f)
+            return true;
+        const int neg    = r.binary(FusionEltwiseOp::MIN, LayerMath::INPUT_VALUE, zero);
+        const int s      = r.constant(slope);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, neg, s);
+        r.binary(FusionEltwiseOp::ADD, pos, scaled);
+        return true;
+    }
 
     bool supportBackend(int backendId, int)
     {
@@ -351,7 +581,6 @@ struct ReLUFunctor : public BaseFunctor
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -438,21 +667,6 @@ struct ReLUFunctor : public BaseFunctor
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        if (slope)
-        {
-            top(x, y, c, n) = select(input >= 0.0f, input, slope * input);
-        }
-        else
-        {
-            top(x, y, c, n) = max(input, 0.0f);
-        }
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
                                 const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -507,32 +721,6 @@ struct ReLUFunctor : public BaseFunctor
     }
 #endif
 
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params)
-    {
-        if (slope != 0.f)
-        {
-            float inpScale = scales[0][0], outScale = scales[1][0];
-            int inpZp = zeropoints[0][0], outZp = zeropoints[1][0];
-
-            Mat lookUpTable(1, 256, CV_8S);
-            int8_t* table = lookUpTable.ptr<int8_t>();
-            for (int i = -128; i < 128; i++)
-            {
-                float x = inpScale*(i - inpZp);
-                float y = x >= 0.f ? x : slope*x;
-                int quantized = outZp + (int)std::round(y/outScale);
-                table[i+128] = saturate_cast<int8_t>(quantized);
-            }
-            params.blobs.clear();
-            params.blobs.push_back(lookUpTable);
-        }
-        params.set("input_scale", scales[0][0]);
-        params.set("input_zeropoint", zeropoints[0][0]);
-        params.set("slope", slope);
-        return true;
-    }
-
     int64 getFLOPSPerElement() const { return 1; }
 };
 
@@ -547,6 +735,19 @@ struct ReLU6Functor : public BaseFunctor
         CV_Assert(minValue <= maxValue);
     }
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams = {minValue, maxValue};
+        return cv::dnn::getActivationFunc(ACTIV_CLIP);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        r.clamp(LayerMath::INPUT_VALUE, minValue, maxValue);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
 #ifdef HAVE_INF_ENGINE
@@ -555,7 +756,6 @@ struct ReLU6Functor : public BaseFunctor
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_WEBNN ||
                backendId == DNN_BACKEND_CANN;
     }
@@ -632,14 +832,6 @@ struct ReLU6Functor : public BaseFunctor
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = clamp(input, minValue, maxValue);
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
                                 const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -692,14 +884,6 @@ struct ReLU6Functor : public BaseFunctor
     }
 #endif
 
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params)
-    {
-        params.set("input_scale", scales[0][0]);
-        params.set("input_zeropoint", zeropoints[0][0]);
-        return true;
-    }
-
     int64 getFLOPSPerElement() const { return 2; }
 };
 
@@ -750,41 +934,12 @@ struct BaseDefaultFunctor : public BaseFunctor
 
     inline void setKernelParams(ocl::Kernel& kernel) const {}
 
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params)
-    {
-        float inpScale = scales[0][0], outScale = scales[1][0];
-        int inpZp = zeropoints[0][0], outZp = zeropoints[1][0];
-
-        Mat lookUpTable(1, 256, CV_8S);
-        int8_t* table = lookUpTable.ptr<int8_t>();
-        for (int i = -128; i < 128; i++)
-        {
-            float x = inpScale * static_cast<float>(i - inpZp);
-            float y = static_cast<T const*>(this)->calculate(x);
-            int quantized = outZp + static_cast<int>(std::round(y/outScale));
-            table[i+128] = saturate_cast<int8_t>(quantized);
-        }
-        params.blobs.clear();
-        params.blobs.push_back(lookUpTable);
-        params.set("input_scale", scales[0][0]);
-        params.set("input_zeropoint", zeropoints[0][0]);
-        return true;
-    }
-
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(int target, csl::Stream stream)
     {
         CV_Error(Error::StsNotImplemented, "");
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        CV_Error(Error::StsNotImplemented, "");
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
@@ -843,6 +998,19 @@ struct GeluFunctor : public BaseFunctor {
 #else
         vlanes = 1;
 #endif
+    }
+
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_GELU);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        fusion::detail::gelu(r);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -978,6 +1146,31 @@ struct GeluApproximationFunctor : public BaseDefaultFunctor<GeluApproximationFun
 
     explicit GeluApproximationFunctor() {}
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_GELU_APPROX);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int x       = LayerMath::INPUT_VALUE;
+        const int coef    = r.constant(GeluApproximationConstants::coef_sqrt_2_pi);
+        const int sq      = r.binary(FusionEltwiseOp::MUL, x, x);
+        const int cubic   = r.binary(FusionEltwiseOp::MUL, coef, sq);
+        const int sqrt2pi = r.constant(GeluApproximationConstants::sqrt_2_pi);
+        const int inner   = r.binary(FusionEltwiseOp::ADD, sqrt2pi, cubic);
+        const int arg     = r.binary(FusionEltwiseOp::MUL, x, inner);
+        const int tanhArg = r.unary(FusionEltwiseOp::TANH, arg);
+        const int one     = r.constant(1.f);
+        const int gate    = r.binary(FusionEltwiseOp::ADD, one, tanhArg);
+        const int half    = r.constant(0.5f);
+        const int halfX   = r.binary(FusionEltwiseOp::MUL, half, x);
+        r.binary(FusionEltwiseOp::MUL, halfX, gate);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV;
@@ -987,6 +1180,32 @@ struct GeluApproximationFunctor : public BaseDefaultFunctor<GeluApproximationFun
     {
         return 0.5f * x * (1.f + tanh(x * (GeluApproximationConstants::sqrt_2_pi +
                                            GeluApproximationConstants::coef_sqrt_2_pi * x * x)));
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f), two = vx_setall_f32(2.f), half = vx_setall_f32(0.5f);
+            v_float32 c1 = vx_setall_f32(GeluApproximationConstants::sqrt_2_pi);
+            v_float32 c2 = vx_setall_f32(GeluApproximationConstants::coef_sqrt_2_pi);
+            v_float32 lo = vx_setall_f32(-88.f), hi = vx_setall_f32(88.f);
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                v_float32 u = v_mul(x, v_fma(v_mul(x, x), c2, c1));
+                v_float32 e = v_exp(v_min(v_max(v_add(u, u), lo), hi));
+                v_float32 th = v_sub(one, v_div(two, v_add(e, one)));
+                vx_store(dstptr + i, v_mul(v_mul(half, x), v_add(one, th)));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
     int64 getFLOPSPerElement() const { return 100; }
@@ -999,6 +1218,19 @@ struct TanHFunctor : public BaseDefaultFunctor<TanHFunctor>
 {
     typedef TanHLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_TANH);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        r.unary(FusionEltwiseOp::TANH, LayerMath::INPUT_VALUE);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
 #ifdef HAVE_INF_ENGINE
@@ -1007,7 +1239,6 @@ struct TanHFunctor : public BaseDefaultFunctor<TanHFunctor>
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -1016,20 +1247,34 @@ struct TanHFunctor : public BaseDefaultFunctor<TanHFunctor>
         return tanh(x);
     }
 
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f), two = vx_setall_f32(2.f);
+            v_float32 lo = vx_setall_f32(-88.f), hi = vx_setall_f32(88.f);
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                v_float32 e = v_exp(v_min(v_max(v_add(x, x), lo), hi));   // e^{2x}, clamped
+                vx_store(dstptr + i, v_sub(one, v_div(two, v_add(e, one)))); // 1 - 2/(e+1)
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
+    }
+
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(int target, csl::Stream stream)
     {
         return make_cuda_node<cuda4dnn::TanHOp>(target, stream);
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = tanh(input);
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
@@ -1069,9 +1314,11 @@ struct SwishFunctor : public BaseDefaultFunctor<SwishFunctor>
 {
     using Layer = SwishLayer;
 
+    // ONNX Swish-24: y = x * sigmoid(alpha * x). alpha != 1 has no fused kernel.
+    float alpha;
     int vlanes;
 
-    explicit SwishFunctor() {
+    explicit SwishFunctor(float alpha_ = 1.f) : alpha(alpha_) {
 #if (CV_SIMD || CV_SIMD_SCALABLE)
         vlanes = VTraits<v_float32>::vlanes();
 #else
@@ -1079,18 +1326,41 @@ struct SwishFunctor : public BaseDefaultFunctor<SwishFunctor>
 #endif
     }
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F || alpha != 1.f) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_SWISH);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        if (alpha != 1.f)
+            return false;
+        const int gate = fusion::detail::sigmoid(r);
+        r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, gate);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV ||
-               backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
-               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
-               backendId == DNN_BACKEND_CANN;
+        if (backendId == DNN_BACKEND_OPENCV)
+            return true;
+        // The CUDA/OpenVINO/CANN nodes below are the alpha == 1 formula only.
+        return alpha == 1.f &&
+               (backendId == DNN_BACKEND_CUDA ||
+                backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
+                backendId == DNN_BACKEND_CANN);
+    }
+
+    inline void setKernelParams(ocl::Kernel& kernel) const
+    {
+        kernel.set(3, alpha);
     }
 
     inline float calculate(float x) const
     {
-        return x / (1.f + exp(-x));
+        return x / (1.f + exp(-alpha * x));
     }
 
     void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const {
@@ -1098,13 +1368,13 @@ struct SwishFunctor : public BaseDefaultFunctor<SwishFunctor>
         for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize) {
             int i = 0;
 #if (CV_SIMD || CV_SIMD_SCALABLE)
-            // x / (1.f + exp(-x));
             v_float32 one = vx_setall_f32(1.0f),
+                      valpha = vx_setall_f32(alpha),
                       zero = vx_setzero_f32();
             for (; i <= len - vlanes; i += vlanes) {
                 v_float32 x = vx_load(srcptr + i);
 
-                v_float32 t = v_sub(zero, x);
+                v_float32 t = v_sub(zero, v_mul(valpha, x));
                 t = v_exp(t);
                 t = v_add(one, t);
                 t = v_div(x, t);
@@ -1125,14 +1395,6 @@ struct SwishFunctor : public BaseDefaultFunctor<SwishFunctor>
         return make_cuda_node<cuda4dnn::SwishOp>(target, stream);
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = input / (1.0f + exp(-input));
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
@@ -1193,11 +1455,17 @@ struct MishFunctor : public BaseDefaultFunctor<MishFunctor>
 #endif
     }
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_MISH);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
                backendId == DNN_BACKEND_CANN;
     }
@@ -1241,14 +1509,6 @@ struct MishFunctor : public BaseDefaultFunctor<MishFunctor>
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = input * tanh(log(1.0f + exp(input)));
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
                                 const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -1287,14 +1547,17 @@ struct SigmoidFunctor : public BaseDefaultFunctor<SigmoidFunctor>
 {
     typedef SigmoidLayer Layer;
 
-    int vlanes;
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_SIGMOID);
+    }
 
-    explicit SigmoidFunctor() {
-#if (CV_SIMD || CV_SIMD_SCALABLE)
-        vlanes = VTraits<v_float32>::vlanes();
-#else
-        vlanes = 1;
-#endif
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        fusion::detail::sigmoid(r);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -1305,7 +1568,6 @@ struct SigmoidFunctor : public BaseDefaultFunctor<SigmoidFunctor>
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -1321,59 +1583,12 @@ struct SigmoidFunctor : public BaseDefaultFunctor<SigmoidFunctor>
         return y;
     }
 
-    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const {
-        CV_UNUSED(stripeStart);
-        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize) {
-            int i = 0;
-#if (CV_SIMD || CV_SIMD_SCALABLE)
-            // Using identity: 1 / (1 + exp(-x)) === 1 - (1 / (1 + exp(x)))
-            // Clamping x to [-80.f, 88.f] prevents both v_exp overflow (inf) and subnormal underflow.
-            v_float32 one = vx_setall_f32(1.0f);
-            v_float32 min_val = vx_setall_f32(-80.0f), max_val = vx_setall_f32(88.0f);
-            int step2 = vlanes * 2;
-
-            // 2-way unrolled loop optimized for minimal register dependency
-            for (; i <= len - step2; i += step2) {
-                v_float32 x0 = vx_load(srcptr + i);
-                v_float32 x1 = vx_load(srcptr + i + vlanes);
-
-                x0 = v_min(v_max(x0, min_val), max_val);
-                x1 = v_min(v_max(x1, min_val), max_val);
-
-                // y = 1.0f - (1.0f / (1.0f + exp(x)))
-                v_float32 dst0 = v_sub(one, v_div(one, v_add(one, v_exp(x0))));
-                v_float32 dst1 = v_sub(one, v_div(one, v_add(one, v_exp(x1))));
-
-                vx_store(dstptr + i, dst0);
-                vx_store(dstptr + i + vlanes, dst1);
-            }
-
-            for (; i <= len - vlanes; i += vlanes) {
-                v_float32 x = vx_load(srcptr + i);
-                x = v_min(v_max(x, min_val), max_val);
-                vx_store(dstptr + i, v_sub(one, v_div(one, v_add(one, v_exp(x)))));
-            }
-#endif
-            for (; i < len; i++) {
-                dstptr[i] = calculate(srcptr[i]);
-            }
-        }
-    }
-
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(int target, csl::Stream stream)
     {
         return make_cuda_node<cuda4dnn::SigmoidOp>(target, stream);
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = 1.0f / (1.0f + exp(-input));
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
@@ -1424,6 +1639,19 @@ struct ELUFunctor : public BaseDefaultFunctor<ELUFunctor>
 #endif
     }
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams = {alpha};
+        return cv::dnn::getActivationFunc(ACTIV_ELU);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        fusion::detail::expLinearUnit(r, alpha, 1.f);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
 #ifdef HAVE_INF_ENGINE
@@ -1432,7 +1660,6 @@ struct ELUFunctor : public BaseDefaultFunctor<ELUFunctor>
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -1475,14 +1702,6 @@ struct ELUFunctor : public BaseDefaultFunctor<ELUFunctor>
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = select(input >= 0.0f, input, alpha * (exp(input) - 1));
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
                                 const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -1523,6 +1742,14 @@ struct AbsValFunctor : public BaseDefaultFunctor<AbsValFunctor>
 {
     typedef AbsLayer Layer;
 
+    bool applyCore(const Mat& src, Mat& dst) const { return applyCoreExpr("abs({0})", src, dst); }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        fusion::detail::abs(r, LayerMath::INPUT_VALUE);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
 #ifdef HAVE_INF_ENGINE
@@ -1531,7 +1758,6 @@ struct AbsValFunctor : public BaseDefaultFunctor<AbsValFunctor>
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -1546,14 +1772,6 @@ struct AbsValFunctor : public BaseDefaultFunctor<AbsValFunctor>
         return make_cuda_node<cuda4dnn::AbsValOp>(target, stream);
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = abs(input);
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
@@ -1589,15 +1807,42 @@ struct AbsValFunctor : public BaseDefaultFunctor<AbsValFunctor>
 template<>
 const char* const AbsValFunctor::BaseDefaultFunctor<AbsValFunctor>::ocl_kernel_name = "AbsValForward";
 
+template<>
+struct ElementWiseIntDispatch<AbsValFunctor>
+{
+    static inline bool supports(const AbsValFunctor&, int depth) { return isIntegerDepth(depth); }
+
+    static inline bool apply(const AbsValFunctor&, const Mat& src, Mat& dst)
+    {
+        if (src.type() != dst.type())
+            return false;
+
+        // |x| leaves an unsigned value unchanged.
+        if (isUnsignedDepth(src.depth()))
+        {
+            src.copyTo(dst);
+            return true;
+        }
+        return intUnaryDispatch<IntAbsOp>(src, dst);
+    }
+};
+
 struct BNLLFunctor : public BaseDefaultFunctor<BNLLFunctor>
 {
     typedef BNLLLayer Layer;
+
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_BNLL);
+    }
 
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -1605,6 +1850,27 @@ struct BNLLFunctor : public BaseDefaultFunctor<BNLLFunctor>
     {
         // https://github.com/BVLC/caffe/blame/1.0/src/caffe/layers/bnll_layer.cpp#L17
         return x > 0 ? x + log(1.f + exp(-x)) : log(1.f + exp(x));
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f), z = vx_setzero_f32();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                // stable single-branch form: max(x,0) + log(1 + exp(-|x|))
+                vx_store(dstptr + i, v_add(v_max(x, z), v_log(v_add(one, v_exp(v_sub(z, v_abs(x)))))));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -1635,15 +1901,6 @@ struct BNLLFunctor : public BaseDefaultFunctor<BNLLFunctor>
     }
 #endif // HAVE_CANN
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        // https://github.com/BVLC/caffe/blame/1.0/src/caffe/layers/bnll_layer.cpp#L17
-        top(x, y, c, n) = max(input, 0) + log(1.0f + exp(-abs(input)));
-    }
-#endif  // HAVE_HALIDE
-
     int64 getFLOPSPerElement() const { return 5; }
 };
 
@@ -1656,7 +1913,7 @@ struct CeilFunctor : public BaseDefaultFunctor<CeilFunctor>
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA || backendId == DNN_BACKEND_HALIDE;
+        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
     }
 
     inline float calculate(float x) const
@@ -1692,14 +1949,6 @@ struct CeilFunctor : public BaseDefaultFunctor<CeilFunctor>
     }
 #endif // HAVE_CANN
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = ceil(input);
-    }
-#endif  // HAVE_HALIDE
-
     int64 getFLOPSPerElement() const { return 1; }
 };
 
@@ -1714,7 +1963,6 @@ struct FloorFunctor : public BaseDefaultFunctor<FloorFunctor>
     {
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA   ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -1751,14 +1999,6 @@ struct FloorFunctor : public BaseDefaultFunctor<FloorFunctor>
     }
 #endif // HAVE_CANN
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = floor(input);
-    }
-#endif  // HAVE_HALIDE
-
     int64 getFLOPSPerElement() const { return 1; }
 };
 
@@ -1769,14 +2009,38 @@ struct LogFunctor : public BaseDefaultFunctor<LogFunctor>
 {
     typedef LogLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_LOG);
+    }
+
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA || backendId == DNN_BACKEND_HALIDE;
+        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
     }
 
     inline float calculate(float x) const
     {
         return log(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            for (; i <= len - vlanes; i += vlanes)
+                vx_store(dstptr + i, v_log(vx_load(srcptr + i)));
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -1785,14 +2049,6 @@ struct LogFunctor : public BaseDefaultFunctor<LogFunctor>
         return make_cuda_node<cuda4dnn::LogOp>(target, stream);
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = log(input);
-    }
-#endif  // HAVE_HALIDE
 
     int64 getFLOPSPerElement() const { return 1; }
 };
@@ -1806,7 +2062,7 @@ struct RoundFunctor : public BaseDefaultFunctor<RoundFunctor>
 
     bool supportBackend(int backendId, int)
     {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA || backendId == DNN_BACKEND_HALIDE;
+        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
     }
 
     inline float calculate(float x) const
@@ -1826,14 +2082,6 @@ struct RoundFunctor : public BaseDefaultFunctor<RoundFunctor>
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = round(input);
-    }
-#endif  // HAVE_HALIDE
-
     int64 getFLOPSPerElement() const { return 2; }
 };
 
@@ -1844,17 +2092,24 @@ struct SqrtFunctor : public BaseDefaultFunctor<SqrtFunctor>
 {
     typedef SqrtLayer Layer;
 
+    bool applyCore(const Mat& src, Mat& dst) const { return applyCoreExpr("sqrt({0})", src, dst); }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA   ||
-               backendId == DNN_BACKEND_CANN   ||
-               backendId == DNN_BACKEND_HALIDE;
+               backendId == DNN_BACKEND_CANN;
     }
 
     inline float calculate(float x) const
     {
         return sqrt(x);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        r.unary(FusionEltwiseOp::SQRT, LayerMath::INPUT_VALUE);
+        return true;
     }
 
 #ifdef HAVE_CUDA
@@ -1864,14 +2119,6 @@ struct SqrtFunctor : public BaseDefaultFunctor<SqrtFunctor>
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = sqrt(input);
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_DNN_NGRAPH
     std::shared_ptr<ov::Node> initNgraphAPI(const ov::Output<ov::Node>& node)
     {
@@ -1879,67 +2126,11 @@ struct SqrtFunctor : public BaseDefaultFunctor<SqrtFunctor>
     }
 #endif  // HAVE_DNN_NGRAPH
 
-#ifdef HAVE_CANN
-    Ptr<BackendNode> initCannOp(const std::string& name,
-                                const std::vector<Ptr<BackendWrapper> > &inputs,
-                                const std::vector<Ptr<BackendNode> >& nodes)
-    {
-        auto input_wrapper = inputs[0].dynamicCast<CannBackendWrapper>();
-
-        auto op = std::make_shared<ge::op::Sqrt>(name);
-
-        auto input_node = nodes[0].dynamicCast<CannBackendNode>()->getOp();
-        op->set_input_x_by_name(*input_node, input_wrapper->name.c_str());
-        auto input_desc = input_wrapper->getTensorDesc();
-        op->update_input_desc_x(*input_desc);
-
-        auto output_desc = std::make_shared<ge::TensorDesc>(ge::Shape(), ge::FORMAT_NCHW, ge::DT_FLOAT);
-        op->update_output_desc_y(*output_desc);
-
-        return Ptr<BackendNode>(new CannBackendNode(op));
-    }
-#endif // HAVE_CANN
-
     int64 getFLOPSPerElement() const { return 1; }
 };
 
 template<>
 const char* const BaseDefaultFunctor<SqrtFunctor>::ocl_kernel_name = "SqrtForward";
-
-struct NotFunctor : public BaseDefaultFunctor<NotFunctor>
-{
-    typedef NotLayer Layer;
-
-    bool supportBackend(int backendId, int)
-    {
-        return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA || backendId == DNN_BACKEND_HALIDE;
-    }
-
-    inline float calculate(float x) const
-    {
-        return floor(1.f - x);
-    }
-
-#ifdef HAVE_CUDA
-    Ptr<BackendNode> initCUDA(int target, csl::Stream stream)
-    {
-        return make_cuda_node<cuda4dnn::NotOp>(target, stream);
-    }
-#endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = floor(1.0f - input);
-    }
-#endif  // HAVE_HALIDE
-
-    int64 getFLOPSPerElement() const { return 2; }
-};
-
-template<>
-const char* const BaseDefaultFunctor<NotFunctor>::ocl_kernel_name = "NotForward";
 
 struct AcosFunctor : public BaseDefaultFunctor<AcosFunctor>
 {
@@ -1972,6 +2163,14 @@ struct AcoshFunctor : public BaseDefaultFunctor<AcoshFunctor>
 {
     typedef AcoshLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_ACOSH);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -1980,6 +2179,26 @@ struct AcoshFunctor : public BaseDefaultFunctor<AcoshFunctor>
     inline float calculate(float x) const
     {
         return acosh(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f);
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_log(v_add(x, v_sqrt(v_sub(v_mul(x, x), one)))));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2026,6 +2245,14 @@ struct AsinhFunctor : public BaseDefaultFunctor<AsinhFunctor>
 {
     typedef AsinhLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_ASINH);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2034,6 +2261,28 @@ struct AsinhFunctor : public BaseDefaultFunctor<AsinhFunctor>
     inline float calculate(float x) const
     {
         return asinh(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f), z = vx_setzero_f32();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                v_float32 ax = v_abs(x);
+                v_float32 r = v_log(v_add(ax, v_sqrt(v_fma(ax, ax, one))));
+                vx_store(dstptr + i, v_select(v_lt(x, z), v_sub(z, r), r));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2080,6 +2329,14 @@ struct AtanhFunctor : public BaseDefaultFunctor<AtanhFunctor>
 {
     typedef AtanhLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_ATANH);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2088,6 +2345,26 @@ struct AtanhFunctor : public BaseDefaultFunctor<AtanhFunctor>
     inline float calculate(float x) const
     {
         return atanh(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f), half = vx_setall_f32(0.5f);
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_mul(half, v_log(v_div(v_add(one, x), v_sub(one, x)))));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2107,6 +2384,14 @@ struct CosFunctor : public BaseDefaultFunctor<CosFunctor>
 {
     typedef CosLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_COS);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2115,6 +2400,25 @@ struct CosFunctor : public BaseDefaultFunctor<CosFunctor>
     inline float calculate(float x) const
     {
         return cos(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_cos(x));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2134,6 +2438,14 @@ struct CoshFunctor : public BaseDefaultFunctor<CoshFunctor>
 {
     typedef CoshLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_COSH);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2142,6 +2454,26 @@ struct CoshFunctor : public BaseDefaultFunctor<CoshFunctor>
     inline float calculate(float x) const
     {
         return cosh(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 half = vx_setall_f32(0.5f), z = vx_setzero_f32();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_mul(half, v_add(v_exp(x), v_exp(v_sub(z, x)))));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2161,6 +2493,20 @@ struct ErfFunctor : public BaseDefaultFunctor<ErfFunctor>
 {
     typedef ErfLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_ERF);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        r.unary(FusionEltwiseOp::ERF, LayerMath::INPUT_VALUE);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2169,6 +2515,22 @@ struct ErfFunctor : public BaseDefaultFunctor<ErfFunctor>
     inline float calculate(float x) const
     {
         return erf(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            for (; i <= len - vlanes; i += vlanes)
+                vx_store(dstptr + i, v_erf(vx_load(srcptr + i)));
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2195,6 +2557,24 @@ struct HardSwishFunctor : public BaseDefaultFunctor<HardSwishFunctor>
 #else
         vlanes = 1;
 #endif
+    }
+
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_HARDSWISH);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int sixth  = r.constant(1.f / 6.f);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, sixth);
+        const int half   = r.constant(0.5f);
+        const int biased = r.binary(FusionEltwiseOp::ADD, scaled, half);
+        const int gate   = r.clamp(biased, 0.f, 1.f);
+        r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, gate);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -2272,6 +2652,14 @@ struct SinFunctor : public BaseDefaultFunctor<SinFunctor>
 {
     typedef SinLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_SIN);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2280,6 +2668,25 @@ struct SinFunctor : public BaseDefaultFunctor<SinFunctor>
     inline float calculate(float x) const
     {
         return sin(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_sin(x));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2299,6 +2706,14 @@ struct SinhFunctor : public BaseDefaultFunctor<SinhFunctor>
 {
     typedef SinhLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_SINH);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2307,6 +2722,26 @@ struct SinhFunctor : public BaseDefaultFunctor<SinhFunctor>
     inline float calculate(float x) const
     {
         return sinh(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 half = vx_setall_f32(0.5f), z = vx_setzero_f32();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_mul(half, v_sub(v_exp(x), v_exp(v_sub(z, x)))));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2326,6 +2761,14 @@ struct SoftplusFunctor : public BaseDefaultFunctor<SoftplusFunctor>
 {
     typedef SoftplusLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_SOFTPLUS);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2334,6 +2777,26 @@ struct SoftplusFunctor : public BaseDefaultFunctor<SoftplusFunctor>
     inline float calculate(float x) const
     {
         return log1p(exp(x));
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 one = vx_setall_f32(1.f);
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_log(v_add(one, v_exp(x))));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2352,6 +2815,16 @@ const char* const BaseDefaultFunctor<SoftplusFunctor>::ocl_kernel_name = "Softpl
 struct SoftsignFunctor : public BaseDefaultFunctor<SoftsignFunctor>
 {
     typedef SoftsignLayer Layer;
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int magnitude = fusion::detail::abs(r, LayerMath::INPUT_VALUE);
+        const int one       = r.constant(1.f);
+        const int denom     = r.binary(FusionEltwiseOp::ADD, one, magnitude);
+        const int inv       = r.unary(FusionEltwiseOp::RECIP, denom);
+        r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, inv);
+        return true;
+    }
 
     bool supportBackend(int backendId, int)
     {
@@ -2380,6 +2853,14 @@ struct TanFunctor : public BaseDefaultFunctor<TanFunctor>
 {
     typedef TanLayer Layer;
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams.clear();
+        return cv::dnn::getActivationFunc(ACTIV_TAN);
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2388,6 +2869,25 @@ struct TanFunctor : public BaseDefaultFunctor<TanFunctor>
     inline float calculate(float x) const
     {
         return tan(x);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_div(v_sin(x), v_cos(x)));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
 #ifdef HAVE_CUDA
@@ -2416,6 +2916,15 @@ struct CeluFunctor : public BaseDefaultFunctor<CeluFunctor>
 #else
         vlanes = 1;
 #endif
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        // A negative alpha flips which side of zero the exponential term lands on.
+        if (!(alpha > 0.f))
+            return false;
+        fusion::detail::expLinearUnit(r, alpha, 1.f / alpha);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -2478,6 +2987,23 @@ struct HardSigmoidFunctor : public BaseDefaultFunctor<HardSigmoidFunctor>
 
     explicit HardSigmoidFunctor(float alpha_ = 0.2f, float beta_ = 0.5f) : alpha(alpha_), beta(beta_) {}
 
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F) return nullptr;
+        activParams = {alpha, beta};
+        return cv::dnn::getActivationFunc(ACTIV_HARDSIGMOID);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int a      = r.constant(alpha);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, LayerMath::INPUT_VALUE, a);
+        const int b      = r.constant(beta);
+        const int biased = r.binary(FusionEltwiseOp::ADD, scaled, b);
+        r.clamp(biased, 0.f, 1.f);
+        return true;
+    }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA;
@@ -2523,6 +3049,14 @@ struct SeluFunctor : public BaseDefaultFunctor<SeluFunctor>
 #else
         vlanes = 1;
 #endif
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        const int elu = fusion::detail::expLinearUnit(r, alpha, 1.f);
+        const int g   = r.constant(gamma);
+        r.binary(FusionEltwiseOp::MUL, elu, g);
+        return true;
     }
 
     bool supportBackend(int backendId, int)
@@ -2619,6 +3153,18 @@ struct PowerFunctor : public BaseFunctor
 {
     typedef PowerLayer Layer;
 
+    bool applyCore(const Mat& src, Mat& dst) const
+    {
+        std::string x = "{0}";
+        if (scale != 1.f)
+            x = "(" + x + "*(" + exprConst(scale) + "))";
+        if (shift != 0.f)
+            x = "(" + x + "+(" + exprConst(shift) + "))";
+        if (power != 1.f)
+            x = x + "**(" + exprConst(power) + ")";
+        return applyCoreExpr(x, src, dst);
+    }
+
     float power, scale, shift;
     float originPower, originScale, originShift;
 
@@ -2634,8 +3180,7 @@ struct PowerFunctor : public BaseFunctor
 #endif
         {
             return backendId == DNN_BACKEND_OPENCV ||
-                   backendId == DNN_BACKEND_CUDA ||
-                   backendId == DNN_BACKEND_HALIDE;
+                   backendId == DNN_BACKEND_CUDA;
         }
     }
 
@@ -2712,23 +3257,6 @@ struct PowerFunctor : public BaseFunctor
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Expr topExpr = (scale == 1.0f ? input : input * scale);
-        if (shift)
-        {
-            topExpr += shift;
-        }
-        if (power != 1.0f)
-        {
-            topExpr = std::pow(topExpr, power);
-        }
-        top(x, y, c, n) = topExpr;
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
                                 const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -2796,9 +3324,99 @@ struct PowerFunctor : public BaseFunctor
     int64 getFLOPSPerElement() const { return power == 1 ? 2 : 10; }
 };
 
+// This is required for ONNX Neg on integer tensors produced by Shape/Size subgraphs.
+template<>
+struct ElementWiseIntDispatch<PowerFunctor>
+{
+    // Only the degenerate form is representable in integers, so support depends on the
+    // functor's parameters and not on the depth alone.
+    static inline bool integerScale(const PowerFunctor& func, int64_t& scale)
+    {
+        if (func.power != 1.f)
+            return false;
+        if (func.shift != 0.f)
+            return false;
+
+        // scale must be an integer value (Neg uses scale=-1)
+        const double scale_d = (double)func.scale;
+        if (std::floor(scale_d) != scale_d)
+            return false;
+        scale = (int64_t)scale_d;
+        return true;
+    }
+
+    static inline bool supports(const PowerFunctor& func, int depth)
+    {
+        int64_t scale;
+        return (depth == CV_32S || depth == CV_64S) && integerScale(func, scale);
+    }
+
+    static inline bool apply(const PowerFunctor& func, const Mat& src, Mat& dst)
+    {
+        if (src.type() != dst.type())
+            return false;
+        const int depth = src.depth();
+        if (depth != CV_32S && depth != CV_64S)
+            return false;
+
+        int64_t scale;
+        if (!integerScale(func, scale))
+            return false;
+
+        const size_t n = src.total();
+        if (depth == CV_32S)
+        {
+            const int32_t* sp = src.ptr<int32_t>();
+            int32_t* dp = dst.ptr<int32_t>();
+            for (size_t i = 0; i < n; ++i)
+                dp[i] = (int32_t)((int64_t)sp[i] * scale);
+            return true;
+        }
+        else // CV_64S
+        {
+            const int64_t* sp = src.ptr<int64_t>();
+            int64_t* dp = dst.ptr<int64_t>();
+            // Unsigned so the wrap at the type minimum is defined rather than overflow.
+            for (size_t i = 0; i < n; ++i)
+                dp[i] = (int64_t)((uint64_t)sp[i] * (uint64_t)scale);
+            return true;
+        }
+    }
+};
+
 struct ExpFunctor : public BaseDefaultFunctor<ExpFunctor>
 {
     typedef ExpLayer Layer;
+
+    // with a base, scale or shift the SIMD kernel of this layer is as fast
+    bool applyCore(const Mat& src, Mat& dst) const
+    {
+        return normScale == 1.f && normShift == 0.f && applyCoreExpr("exp({0})", src, dst);
+    }
+
+    ActivationFunc getActivationFunc(int depth, std::vector<float>& activParams) const
+    {
+        if (depth != CV_32F)
+            return nullptr;
+        activParams = {normScale, normShift};
+        return cv::dnn::getActivationFunc(ACTIV_EXP);
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        int x = LayerMath::INPUT_VALUE;
+        if (normScale != 1.f) {
+            const int s = r.constant(normScale);
+            x = r.binary(FusionEltwiseOp::MUL, x, s);
+        }
+        if (normShift != 0.f) {
+            const int s = r.constant(normShift);
+            x = r.binary(FusionEltwiseOp::ADD, x, s);
+        }
+        r.unary(FusionEltwiseOp::EXP, x);
+        return true;
+    }
+
     float base, scale, shift;
     float normScale, normShift;
 
@@ -2819,12 +3437,32 @@ struct ExpFunctor : public BaseDefaultFunctor<ExpFunctor>
     bool supportBackend(int backendId, int targetId)
     {
         return backendId == DNN_BACKEND_OPENCV || backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE || backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
+               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
     }
 
     inline float calculate(float x) const
     {
         return exp(normScale * x + normShift);
+    }
+
+    void apply(const float* srcptr, float* dstptr, int stripeStart, int len, size_t planeSize, int cn0, int cn1) const
+    {
+        CV_UNUSED(stripeStart);
+        for (int cn = cn0; cn < cn1; cn++, srcptr += planeSize, dstptr += planeSize)
+        {
+            int i = 0;
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            const int vlanes = VTraits<v_float32>::vlanes();
+            v_float32 vsc = vx_setall_f32(normScale), vsh = vx_setall_f32(normShift);
+            for (; i <= len - vlanes; i += vlanes)
+            {
+                v_float32 x = vx_load(srcptr + i);
+                vx_store(dstptr + i, v_exp(v_fma(x, vsc, vsh)));
+            }
+#endif
+            for (; i < len; i++)
+                dstptr[i] = calculate(srcptr[i]);
+        }
     }
 
     inline void setKernelParams(ocl::Kernel& kernel) const
@@ -2839,14 +3477,6 @@ struct ExpFunctor : public BaseDefaultFunctor<ExpFunctor>
         return make_cuda_node<cuda4dnn::ExpOp>(target, stream, normScale, normShift);
     }
 #endif
-
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        top(x, y, c, n) = exp(normScale * input + normShift);
-    }
-#endif  // HAVE_HALIDE
 
 #ifdef HAVE_DNN_NGRAPH
     std::shared_ptr<ov::Node> initNgraphAPI(const ov::Output<ov::Node>& node)
@@ -2870,6 +3500,19 @@ const char* const ExpFunctor::BaseDefaultFunctor<ExpFunctor>::ocl_kernel_name = 
 struct ChannelsPReLUFunctor : public BaseFunctor
 {
     typedef ChannelsPReLULayer Layer;
+
+    bool unfoldOp(LayerMath& r, const ConstOperand& side) const
+    {
+        if (side.count != 1 || !side.at(0).isBuffer())
+            return false;
+        const int zero   = r.constant(0.f);
+        const int pos    = r.binary(FusionEltwiseOp::MAX, LayerMath::INPUT_VALUE, zero);
+        const int neg    = r.binary(FusionEltwiseOp::MIN, LayerMath::INPUT_VALUE, zero);
+        const int slopes = r.perChannelConstant(side.at(0).bufferId);
+        const int scaled = r.binary(FusionEltwiseOp::MUL, neg, slopes);
+        r.binary(FusionEltwiseOp::ADD, pos, scaled);
+        return true;
+    }
     Mat scale;
 #ifdef HAVE_OPENCL
     UMat scale_umat;
@@ -2888,7 +3531,6 @@ struct ChannelsPReLUFunctor : public BaseFunctor
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -2971,15 +3613,6 @@ struct ChannelsPReLUFunctor : public BaseFunctor
     }
 #endif
 
-#ifdef HAVE_HALIDE
-    void attachHalide(const Halide::Expr& input, Halide::Func& top)
-    {
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        auto weights = wrapToHalideBuffer(scale, {(int)scale.total()});
-        top(x, y, c, n) = select(input >= 0.0f, input, weights(c) * input);
-    }
-#endif  // HAVE_HALIDE
-
 #ifdef HAVE_CANN
     Ptr<BackendNode> initCannOp(const std::string& name,
                                 const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -3030,6 +3663,10 @@ struct ChannelsPReLUFunctor : public BaseFunctor
 
 struct PReLUFunctor : public ChannelsPReLUFunctor
 {
+    //! The slope is per element here, which PER_CHANNEL_CONST cannot express; declining
+    //! keeps the inherited per-channel form from applying.
+    bool unfoldOp(LayerMath&, const ConstOperand&) const { return false; }
+
     explicit PReLUFunctor(const Mat& scale_=Mat()) : ChannelsPReLUFunctor(scale_)
     {
 #ifdef HAVE_OPENCL
@@ -3125,6 +3762,17 @@ struct SignFunctor : public BaseDefaultFunctor<SignFunctor>
 template<>
 const char* const SignFunctor::BaseDefaultFunctor<SignFunctor>::ocl_kernel_name = "SignForward";
 
+template<>
+struct ElementWiseIntDispatch<SignFunctor>
+{
+    static inline bool supports(const SignFunctor&, int depth) { return isIntegerDepth(depth); }
+
+    static inline bool apply(const SignFunctor&, const Mat& src, Mat& dst)
+    {
+        return intUnaryDispatch<IntSignOp>(src, dst);
+    }
+};
+
 
 struct ShrinkFunctor : public BaseDefaultFunctor<ShrinkFunctor>
 {
@@ -3162,6 +3810,8 @@ struct ReciprocalFunctor : public BaseDefaultFunctor<ReciprocalFunctor>
 {
     typedef ReciprocalLayer Layer;
 
+    bool applyCore(const Mat& src, Mat& dst) const { return applyCoreExpr("1/{0}", src, dst); }
+
     bool supportBackend(int backendId, int)
     {
         return backendId == DNN_BACKEND_OPENCV ||
@@ -3171,6 +3821,12 @@ struct ReciprocalFunctor : public BaseDefaultFunctor<ReciprocalFunctor>
     inline float calculate(float x) const
     {
         return 1.f/x;
+    }
+
+    bool unfoldOp(LayerMath& r, const ConstOperand&) const
+    {
+        r.unary(FusionEltwiseOp::RECIP, LayerMath::INPUT_VALUE);
+        return true;
     }
 
 #ifdef HAVE_CUDA
@@ -3235,7 +3891,8 @@ Ptr<TanHLayer> TanHLayer::create(const LayerParams& params)
 
 Ptr<SwishLayer> SwishLayer::create(const LayerParams& params)
 {
-    Ptr<SwishLayer> l(new ElementWiseLayer<SwishFunctor>());
+    float alpha = params.get<float>("alpha", 1.f);
+    Ptr<SwishLayer> l(new ElementWiseLayer<SwishFunctor>(SwishFunctor(alpha)));
     l->setParamsFrom(params);
 
     return l;
@@ -3319,14 +3976,6 @@ Ptr<RoundLayer> RoundLayer::create(const LayerParams& params)
 Ptr<SqrtLayer> SqrtLayer::create(const LayerParams& params)
 {
     Ptr<SqrtLayer> l(new ElementWiseLayer<SqrtFunctor>());
-    l->setParamsFrom(params);
-
-    return l;
-}
-
-Ptr<NotLayer> NotLayer::create(const LayerParams& params)
-{
-    Ptr<NotLayer> l(new ElementWiseLayer<NotFunctor>());
     l->setParamsFrom(params);
 
     return l;
@@ -3524,8 +4173,187 @@ Ptr<ExpLayer> ExpLayer::create(const LayerParams& params)
     return l;
 }
 
+// Block-layout (NxC1xHxWxC0) aware override of per-channel PReLU.
+class ChannelsPReLUImpl CV_FINAL : public ElementWiseLayer<ChannelsPReLUFunctor>
+{
+public:
+    // fusionOpsFor() keys on the dynamic type, which the base constructor cannot register.
+    explicit ChannelsPReLUImpl(const ChannelsPReLUFunctor& f = ChannelsPReLUFunctor())
+        : ElementWiseLayer<ChannelsPReLUFunctor>(f)
+    {
+        registerFusionOpsOnce<ChannelsPReLUImpl>(
+            { &ElementWiseLayer<ChannelsPReLUFunctor>::unfoldOp, nullptr, false, nullptr,
+              &ChannelsPReLUImpl::ownedBuffersOp });
+    }
+
+    //! setSlope() moved the slope into the functor, so it has no Arg for the pass to read.
+    static bool ownedBuffersOp(const Layer* self, std::vector<Mat>& out)
+    {
+        const Mat& s = static_cast<const ChannelsPReLUImpl*>(self)->func.scale;
+        if (s.empty() || s.type() != CV_32F || !s.isContinuous())
+            return false;
+        out.push_back(s);
+        return true;
+    }
+
+    void setSlope(const Mat& slope) CV_OVERRIDE
+    {
+        slope.reshape(1, (int)slope.total()).convertTo(func.scale, CV_32F);
+#ifdef HAVE_OPENCL
+        func.scale_umat.release();
+#endif
+    }
+
+    void forward(InputArrayOfArrays inputs_arr,
+                 OutputArrayOfArrays outputs_arr,
+                 OutputArrayOfArrays internals_arr) CV_OVERRIDE
+    {
+        CV_TRACE_FUNCTION();
+
+        std::vector<Mat> inputs, outputs;
+        inputs_arr.getMatVector(inputs);
+        outputs_arr.getMatVector(outputs);
+        if (!inputs.empty() && inputs[0].shape().layout == DATA_LAYOUT_BLOCK)
+        {
+            CV_Assert(inputs.size() == outputs.size());
+            for (size_t i = 0; i < inputs.size(); ++i)
+                forwardBlock(inputs[i], outputs[i]);
+            return;
+        }
+        ElementWiseLayer<ChannelsPReLUFunctor>::forward(inputs_arr, outputs_arr, internals_arr);
+    }
+
+private:
+    void forwardBlock(const Mat& src, Mat& dst) const
+    {
+        CV_Assert(src.type() == CV_32F && dst.type() == CV_32F);
+        CV_Assert(src.dims == 5 && dst.dims == 5);
+        CV_Assert(src.isContinuous() && dst.isContinuous());
+
+        const int N  = src.size[0];
+        const int C1 = src.size[1];
+        const int H  = src.size[2];
+        const int W  = src.size[3];
+        const int C0 = src.size[4];
+        const int Ci = (int)src.shape().C;
+
+        const float* scaleptr = func.scale.ptr<float>();
+
+        const size_t inStep0 = src.step.p[0] / sizeof(float);
+        const size_t inStep1 = src.step.p[1] / sizeof(float);
+        const size_t inStep2 = src.step.p[2] / sizeof(float);
+        const size_t inStep3 = src.step.p[3] / sizeof(float);
+
+        const size_t outStep0 = dst.step.p[0] / sizeof(float);
+        const size_t outStep1 = dst.step.p[1] / sizeof(float);
+        const size_t outStep2 = dst.step.p[2] / sizeof(float);
+        const size_t outStep3 = dst.step.p[3] / sizeof(float);
+
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+        const int VEC_SZ = VTraits<v_float32>::vlanes();
+        // C0 is the block-layout channel block (8 by default); VEC_SZ is whatever
+        // the target's float vector holds, so the two coincide only on 8-lane
+        // targets. Cover both directions instead: when C0 is a multiple of VEC_SZ
+        // each pixel is walked in VEC_SZ chunks, and when VEC_SZ is a multiple of
+        // C0 the slopes are replicated across the vector and the contiguous
+        // H*W*C0 block is walked in one flat loop.
+        const bool vecChunk = C0 > VEC_SZ && (C0 % VEC_SZ) == 0;
+        const bool vecFlat  = blockCanSpan(C0, VEC_SZ, W, inStep2, inStep3,
+                                           outStep2, outStep3);
+#endif
+
+        parallel_for_(Range(0, N * C1), [&](const Range& r) {
+            const float* inptr0 = src.ptr<float>();
+            float* outptr0 = dst.ptr<float>();
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+            AutoBuffer<float> slopeBuf(std::max(C0, VEC_SZ));
+#else
+            AutoBuffer<float> slopeBuf(C0);
+#endif
+            float* slopes = slopeBuf.data();
+
+            for (int i = r.start; i < r.end; ++i) {
+                const int n  = i / C1;
+                const int c1 = i - n * C1;
+                const int cbase = c1 * C0;
+                const int validC0 = std::min(C0, std::max(0, Ci - cbase));
+
+                for (int c = 0; c < validC0; ++c)
+                    slopes[c] = scaleptr[cbase + c];
+                for (int c = validC0; c < C0; ++c)
+                    slopes[c] = 0.f;
+
+                const float* inbase  = inptr0  + n * inStep0 + c1 * inStep1;
+                float*       outbase = outptr0 + n * outStep0 + c1 * outStep1;
+
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+                if (C0 == VEC_SZ) {
+                    v_float32 vslope = vx_load(slopes);
+                    v_float32 vzero  = vx_setzero_f32();
+                    for (int h = 0; h < H; ++h) {
+                        const float* inrow  = inbase  + h * inStep2;
+                        float*       outrow = outbase + h * outStep2;
+                        for (int w = 0; w < W; ++w) {
+                            v_float32 v = vx_load(inrow + w * inStep3);
+                            v_float32 scaled = v_mul(v, vslope);
+                            v_float32 out = v_select(v_ge(v, vzero), v, scaled);
+                            vx_store(outrow + w * outStep3, out);
+                        }
+                    }
+                    continue;
+                }
+                if (vecChunk) {
+                    v_float32 vzero = vx_setzero_f32();
+                    for (int h = 0; h < H; ++h) {
+                        const float* inrow  = inbase  + h * inStep2;
+                        float*       outrow = outbase + h * outStep2;
+                        for (int w = 0; w < W; ++w) {
+                            const float* in_pos  = inrow  + w * inStep3;
+                            float*       out_pos = outrow + w * outStep3;
+                            for (int c0 = 0; c0 < C0; c0 += VEC_SZ) {
+                                v_float32 v = vx_load(in_pos + c0);
+                                v_float32 scaled = v_mul(v, vx_load(slopes + c0));
+                                v_float32 out = v_select(v_ge(v, vzero), v, scaled);
+                                vx_store(out_pos + c0, out);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if (vecFlat) {
+                    blockedSpanApply(inbase, outbase, (int64_t)H * W * C0, C0, VEC_SZ,
+                                     slopes, slopes, BlockedPReLUOp());
+                    continue;
+                }
+#endif
+                for (int h = 0; h < H; ++h) {
+                    const float* inrow  = inbase  + h * inStep2;
+                    float*       outrow = outbase + h * outStep2;
+                    for (int w = 0; w < W; ++w) {
+                        const float* in_pos  = inrow  + w * inStep3;
+                        float*       out_pos = outrow + w * outStep3;
+                        for (int c0 = 0; c0 < validC0; ++c0) {
+                            float v = in_pos[c0];
+                            out_pos[c0] = v >= 0.f ? v : slopes[c0] * v;
+                        }
+                        for (int c0 = validC0; c0 < C0; ++c0)
+                            out_pos[c0] = 0.f;
+                    }
+                }
+            }
+        });
+    }
+};
+
 Ptr<Layer> ChannelsPReLULayer::create(const LayerParams& params)
 {
+    if (params.blobs.empty())
+    {
+        // Slope comes as a second input; constArgs() fills the scale in later.
+        Ptr<ChannelsPReLUImpl> l(new ChannelsPReLUImpl(ChannelsPReLUFunctor()));
+        l->setParamsFrom(params);
+        return l;
+    }
     CV_Assert(params.blobs.size() == 1);
     Mat scale = params.blobs[0];
     float slope = *scale.ptr<float>();
@@ -3545,7 +4373,7 @@ Ptr<Layer> ChannelsPReLULayer::create(const LayerParams& params)
     }
     else
     {
-        l = new ElementWiseLayer<ChannelsPReLUFunctor>(ChannelsPReLUFunctor(scale));
+        l = new ChannelsPReLUImpl(ChannelsPReLUFunctor(scale));
     }
     l->setParamsFrom(params);
 

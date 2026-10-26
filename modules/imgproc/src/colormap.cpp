@@ -735,7 +735,7 @@ namespace colormap
         if(src.type() != CV_8UC1  &&  src.type() != CV_8UC3)
             CV_Error(Error::StsBadArg, "cv::ColorMap only supports source images of type CV_8UC1 or CV_8UC3");
 
-        CV_CheckEQ(src.dims, 2, "Not supported");
+        CV_CheckLE(src.dims, 2, "Not supported");
 
         CV_Assert(_lut.isContinuous());
         const int lut_type = _lut.type();
@@ -749,6 +749,8 @@ namespace colormap
             cv::cvtColor(src, srcGray, cv::COLOR_BGR2GRAY);//BGR because of historical cv::LUT() usage
 
         _dst.create(src.size(), lut_type);
+        if (src.empty())
+            return;
         Mat dstMat = _dst.getMat();
 
         //we do not use cv::LUT() which requires src.channels() == dst.channels()
@@ -804,7 +806,7 @@ namespace colormap
 
     void applyColorMap(InputArray src, OutputArray dst, int colormap)
     {
-        colormap::ColorMap* cm =
+        std::unique_ptr<colormap::ColorMap> cm(
             colormap == COLORMAP_AUTUMN ? (colormap::ColorMap*)(new colormap::Autumn) :
             colormap == COLORMAP_BONE ? (colormap::ColorMap*)(new colormap::Bone) :
             colormap == COLORMAP_CIVIDIS ? (colormap::ColorMap*)(new colormap::Cividis) :
@@ -826,14 +828,12 @@ namespace colormap
             colormap == COLORMAP_TWILIGHT ? (colormap::ColorMap*)(new colormap::Twilight) :
             colormap == COLORMAP_TWILIGHT_SHIFTED ? (colormap::ColorMap*)(new colormap::TwilightShifted) :
             colormap == COLORMAP_VIRIDIS ? (colormap::ColorMap*)(new colormap::Viridis) :
-            colormap == COLORMAP_WINTER ? (colormap::ColorMap*)(new colormap::Winter) : 0;
+            colormap == COLORMAP_WINTER ? (colormap::ColorMap*)(new colormap::Winter) : 0);
 
         if( !cm )
             CV_Error( Error::StsBadArg, "Unknown colormap id; use one of COLORMAP_*");
 
         (*cm)(src, dst);
-
-        delete cm;
     }
 
     void applyColorMap(InputArray src, OutputArray dst, InputArray userColor)

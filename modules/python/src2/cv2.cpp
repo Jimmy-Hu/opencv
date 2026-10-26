@@ -2,6 +2,14 @@
 // https://numpy.org/doc/1.17/reference/c-api.array.html#importing-the-api
 #define PY_ARRAY_UNIQUE_SYMBOL opencv_ARRAY_API
 
+#if defined(__clang__)
+#pragma clang diagnostic ignored "-Wunknown-warning-option"
+#pragma clang diagnostic ignored "-Wcast-function-type-strict"
+#elif defined(__GNUC__)
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic ignored "-Wcast-function-type-strict"
+#endif
+
 #include "cv2.hpp"
 
 #include "opencv2/opencv_modules.hpp"
@@ -9,8 +17,6 @@
 #include "opencv2/core/utils/logger.hpp"
 
 #include "pyopencv_generated_include.h"
-#include "opencv2/core/types_c.h"
-
 
 #include "cv2_util.hpp"
 #include "cv2_numpy.hpp"
@@ -48,6 +54,9 @@ typedef std::vector<Scalar> vector_Scalar;
 #ifdef HAVE_OPENCV_OBJDETECT
 typedef std::vector<aruco::Dictionary> vector_Dictionary;
 #endif // HAVE_OPENCV_OBJDETECT
+#ifdef HAVE_OPENCV_GEOMETRY
+typedef std::vector<MSTEdge> vector_MSTEdge;
+#endif // HAVE_OPENCV_GEOMETRY
 
 typedef std::vector<std::vector<char> > vector_vector_char;
 typedef std::vector<std::vector<Point> > vector_vector_Point;
@@ -545,11 +554,26 @@ static bool init_body(PyObject * m)
     PUBLISH(CV_16SC2);
     PUBLISH(CV_16SC3);
     PUBLISH(CV_16SC4);
+    PUBLISH(CV_32U);
+    PUBLISH(CV_32UC1);
+    PUBLISH(CV_32UC2);
+    PUBLISH(CV_32UC3);
+    PUBLISH(CV_32UC4);
     PUBLISH(CV_32S);
     PUBLISH(CV_32SC1);
     PUBLISH(CV_32SC2);
     PUBLISH(CV_32SC3);
     PUBLISH(CV_32SC4);
+    PUBLISH(CV_64U);
+    PUBLISH(CV_64UC1);
+    PUBLISH(CV_64UC2);
+    PUBLISH(CV_64UC3);
+    PUBLISH(CV_64UC4);
+    PUBLISH(CV_64S);
+    PUBLISH(CV_64SC1);
+    PUBLISH(CV_64SC2);
+    PUBLISH(CV_64SC3);
+    PUBLISH(CV_64SC4);
     PUBLISH(CV_32F);
     PUBLISH(CV_32FC1);
     PUBLISH(CV_32FC2);
@@ -565,6 +589,11 @@ static bool init_body(PyObject * m)
     PUBLISH(CV_16FC2);
     PUBLISH(CV_16FC3);
     PUBLISH(CV_16FC4);
+    PUBLISH(CV_Bool);
+    PUBLISH(CV_BoolC1);
+    PUBLISH(CV_BoolC2);
+    PUBLISH(CV_BoolC3);
+    PUBLISH(CV_BoolC4);
 #undef PUBLISH_
 #undef PUBLISH
 

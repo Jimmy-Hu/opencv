@@ -13,7 +13,7 @@
 
 #include <opencv2/opencv_modules.hpp>
 #include <opencv2/imgproc.hpp>
-#include <opencv2/calib3d.hpp>
+#include <opencv2/geometry.hpp>
 #include <opencv2/flann.hpp>
 #if defined (HAVE_OPENCV_XFEATURES2D)
 #include <opencv2/xfeatures2d.hpp>
@@ -182,7 +182,7 @@ double get_rotation_error(const cv::Mat &R_true, const cv::Mat &R)
 {
     cv::Mat error_vec, error_mat;
     error_mat = -R_true * R.t();
-    cv::Rodrigues(error_mat, error_vec);
+    Rodrigues(error_mat, error_vec);
 
     return cv::norm(error_vec);
 }
@@ -308,18 +308,39 @@ void createFeatures(const std::string &featureName, int numKeypoints, cv::Ptr<cv
     }
     else if (featureName == "KAZE")
     {
-        detector = cv::KAZE::create();
-        descriptor = cv::KAZE::create();
+#if defined (HAVE_OPENCV_XFEATURES2D)
+        detector = cv::xfeatures2d::KAZE::create();
+        descriptor = cv::xfeatures2d::KAZE::create();
+#else
+        std::cout << "xfeatures2d module is not available." << std::endl;
+        std::cout << "Default to ORB." << std::endl;
+        detector = cv::ORB::create(numKeypoints);
+        descriptor = cv::ORB::create(numKeypoints);
+#endif
     }
     else if (featureName == "AKAZE")
     {
-        detector = cv::AKAZE::create();
-        descriptor = cv::AKAZE::create();
+#if defined (HAVE_OPENCV_XFEATURES2D)
+        detector = cv::xfeatures2d::AKAZE::create();
+        descriptor = cv::xfeatures2d::AKAZE::create();
+#else
+        std::cout << "xfeatures2d module is not available." << std::endl;
+        std::cout << "Default to ORB." << std::endl;
+        detector = cv::ORB::create(numKeypoints);
+        descriptor = cv::ORB::create(numKeypoints);
+#endif
     }
     else if (featureName == "BRISK")
     {
-        detector = cv::BRISK::create();
-        descriptor = cv::BRISK::create();
+#if defined (HAVE_OPENCV_XFEATURES2D)
+        detector = cv::xfeatures2d::BRISK::create();
+        descriptor = cv::xfeatures2d::BRISK::create();
+#else
+        std::cout << "xfeatures2d module is not available." << std::endl;
+        std::cout << "Default to ORB." << std::endl;
+        detector = cv::ORB::create(numKeypoints);
+        descriptor = cv::ORB::create(numKeypoints);
+#endif
     }
     else if (featureName == "SIFT")
     {
@@ -341,7 +362,7 @@ void createFeatures(const std::string &featureName, int numKeypoints, cv::Ptr<cv
     else if (featureName == "BINBOOST")
     {
 #if defined (HAVE_OPENCV_XFEATURES2D)
-        detector = cv::KAZE::create();
+        detector = cv::xfeatures2d::KAZE::create();
         descriptor = cv::xfeatures2d::BoostDesc::create();
 #else
         std::cout << "xfeatures2d module is not available." << std::endl;
@@ -353,7 +374,7 @@ void createFeatures(const std::string &featureName, int numKeypoints, cv::Ptr<cv
     else if (featureName == "VGG")
     {
 #if defined (HAVE_OPENCV_XFEATURES2D)
-        detector = cv::KAZE::create();
+        detector = cv::xfeatures2d::KAZE::create();
         descriptor = cv::xfeatures2d::VGG::create();
 #else
         std::cout << "xfeatures2d module is not available." << std::endl;

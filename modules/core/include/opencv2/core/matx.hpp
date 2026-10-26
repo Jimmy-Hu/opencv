@@ -58,6 +58,12 @@
 namespace cv
 {
 
+CV__DEBUG_NS_BEGIN
+
+class CV_EXPORTS _OutputArray;
+
+CV__DEBUG_NS_END
+
 //! @addtogroup core_basic
 //! @{
 
@@ -215,6 +221,10 @@ public:
     template<int l> Matx(const Matx<_Tp, m, l>& a, const Matx<_Tp, l, n>& b, Matx_MatMulOp);
     Matx(const Matx<_Tp, n, m>& a, Matx_TOp);
 
+    //! copy & convert
+    void copyTo(const _OutputArray& dst) const;
+    void convertTo(const _OutputArray& dst, int type, double scale=1., double shift=0.) const;
+
     _Tp val[m*n]; ///< matrix elements
 };
 
@@ -256,82 +266,82 @@ typedef Matx<double, 4, 4> Matx44d;
 typedef Matx<float, 6, 6> Matx66f;
 typedef Matx<double, 6, 6> Matx66d;
 
-template<typename _Tp, int m> static inline
+template<typename _Tp, int m> inline
 double determinant(const Matx<_Tp, m, m>& a);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 double trace(const Matx<_Tp, m, n>& a);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 double norm(const Matx<_Tp, m, n>& M);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 double norm(const Matx<_Tp, m, n>& M, int normType);
 
-template<typename _Tp1, typename _Tp2, int m, int n> static inline
+template<typename _Tp1, typename _Tp2, int m, int n> inline
 Matx<_Tp1, m, n>& operator += (Matx<_Tp1, m, n>& a, const Matx<_Tp2, m, n>& b);
 
-template<typename _Tp1, typename _Tp2, int m, int n> static inline
+template<typename _Tp1, typename _Tp2, int m, int n> inline
 Matx<_Tp1, m, n>& operator -= (Matx<_Tp1, m, n>& a, const Matx<_Tp2, m, n>& b);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator + (const Matx<_Tp, m, n>& a, const Matx<_Tp, m, n>& b);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator - (const Matx<_Tp, m, n>& a, const Matx<_Tp, m, n>& b);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n>& operator *= (Matx<_Tp, m, n>& a, int alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n>& operator *= (Matx<_Tp, m, n>& a, float alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n>& operator *= (Matx<_Tp, m, n>& a, double alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator * (const Matx<_Tp, m, n>& a, int alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator * (const Matx<_Tp, m, n>& a, float alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator * (const Matx<_Tp, m, n>& a, double alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator * (int alpha, const Matx<_Tp, m, n>& a);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator * (float alpha, const Matx<_Tp, m, n>& a);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator * (double alpha, const Matx<_Tp, m, n>& a);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n>& operator /= (Matx<_Tp, m, n>& a, float alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n>& operator /= (Matx<_Tp, m, n>& a, double alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator / (const Matx<_Tp, m, n>& a, float alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator / (const Matx<_Tp, m, n>& a, double alpha);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Matx<_Tp, m, n> operator - (const Matx<_Tp, m, n>& a);
 
-template<typename _Tp, int m, int n, int l> static inline
+template<typename _Tp, int m, int n, int l> inline
 Matx<_Tp, m, n> operator * (const Matx<_Tp, m, l>& a, const Matx<_Tp, l, n>& b);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 Vec<_Tp, m> operator * (const Matx<_Tp, m, n>& a, const Vec<_Tp, n>& b);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 bool operator == (const Matx<_Tp, m, n>& a, const Matx<_Tp, m, n>& b);
 
-template<typename _Tp, int m, int n> static inline
+template<typename _Tp, int m, int n> inline
 bool operator != (const Matx<_Tp, m, n>& a, const Matx<_Tp, m, n>& b);
 
 
@@ -455,6 +465,12 @@ typedef Vec<int, 4> Vec4i;
 typedef Vec<int, 6> Vec6i;
 typedef Vec<int, 8> Vec8i;
 
+typedef Vec<int64_t, 2> Vec2l;
+typedef Vec<int64_t, 3> Vec3l;
+typedef Vec<int64_t, 4> Vec4l;
+typedef Vec<int64_t, 6> Vec6l;
+typedef Vec<int64_t, 8> Vec8l;
+
 typedef Vec<float, 2> Vec2f;
 typedef Vec<float, 3> Vec3f;
 typedef Vec<float, 4> Vec4f;
@@ -469,64 +485,64 @@ typedef Vec<double, 6> Vec6d;
 template<typename _Tp, int cn> inline
 Vec<_Tp, cn> normalize(const Vec<_Tp, cn>& v);
 
-template<typename _Tp1, typename _Tp2, int cn> static inline
+template<typename _Tp1, typename _Tp2, int cn> inline
 Vec<_Tp1, cn>& operator += (Vec<_Tp1, cn>& a, const Vec<_Tp2, cn>& b);
 
-template<typename _Tp1, typename _Tp2, int cn> static inline
+template<typename _Tp1, typename _Tp2, int cn> inline
 Vec<_Tp1, cn>& operator -= (Vec<_Tp1, cn>& a, const Vec<_Tp2, cn>& b);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator + (const Vec<_Tp, cn>& a, const Vec<_Tp, cn>& b);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator - (const Vec<_Tp, cn>& a, const Vec<_Tp, cn>& b);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn>& operator *= (Vec<_Tp, cn>& a, int alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn>& operator *= (Vec<_Tp, cn>& a, float alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn>& operator *= (Vec<_Tp, cn>& a, double alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn>& operator /= (Vec<_Tp, cn>& a, int alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn>& operator /= (Vec<_Tp, cn>& a, float alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn>& operator /= (Vec<_Tp, cn>& a, double alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator * (const Vec<_Tp, cn>& a, int alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator * (int alpha, const Vec<_Tp, cn>& a);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator * (const Vec<_Tp, cn>& a, float alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator * (float alpha, const Vec<_Tp, cn>& a);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator * (const Vec<_Tp, cn>& a, double alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator * (double alpha, const Vec<_Tp, cn>& a);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator / (const Vec<_Tp, cn>& a, int alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator / (const Vec<_Tp, cn>& a, float alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator / (const Vec<_Tp, cn>& a, double alpha);
 
-template<typename _Tp, int cn> static inline
+template<typename _Tp, int cn> inline
 Vec<_Tp, cn> operator - (const Vec<_Tp, cn>& a);
 
 template<typename _Tp> inline

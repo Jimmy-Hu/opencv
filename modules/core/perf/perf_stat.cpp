@@ -4,6 +4,25 @@ namespace opencv_test
 {
 using namespace perf;
 
+// The 32-bit integer depths are not in TYPICAL_MAT_TYPES, so they were not measured; they are the
+// ones whose scalar accumulation step this touches.
+PERF_TEST_P(Size_MatType, sum_wide,
+            testing::Combine(testing::Values(TYPICAL_MAT_SIZES),
+                             testing::Values(CV_32SC1, CV_32UC1, CV_32SC3)))
+{
+    Size sz = get<0>(GetParam());
+    int type = get<1>(GetParam());
+
+    Mat arr(sz, type);
+    Scalar s;
+
+    declare.in(arr, WARMUP_RNG).out(s);
+
+    TEST_CYCLE() s = sum(arr);
+
+    SANITY_CHECK_NOTHING();
+}
+
 PERF_TEST_P(Size_MatType, sum, TYPICAL_MATS)
 {
     Size sz = get<0>(GetParam());
@@ -113,6 +132,28 @@ PERF_TEST_P(Size_MatType, hasNonZero, testing::Combine( testing::Values( TYPICAL
 
     int runs = (sz.width <= 640) ? 8 : 1;
     TEST_CYCLE_MULTIRUN(runs) /*hnz =*/ hasNonZero(src);
+
+    SANITY_CHECK_NOTHING();
+}
+
+typedef tuple<Size, double> Size_Density_t;
+typedef perf::TestBaseWithParam<Size_Density_t> Size_Density;
+
+PERF_TEST_P(Size_Density, findNonZero, testing::Combine(
+                testing::Values(TYPICAL_MAT_SIZES),
+                testing::Values(0.0, 0.001, 0.01, 0.1, 0.5)))
+{
+    Size sz = get<0>(GetParam());
+    double density = get<1>(GetParam());
+
+    Mat r(sz, CV_32FC1);
+    randu(r, 0, 1);
+    Mat src = r < density;   // CV_8UC1: 255 where r < density, 0 elsewhere
+    std::vector<Point> idx;
+
+    declare.in(src);
+
+    TEST_CYCLE() findNonZero(src, idx);
 
     SANITY_CHECK_NOTHING();
 }

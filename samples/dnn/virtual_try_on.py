@@ -2,7 +2,7 @@
 '''
 You can download the Geometric Matching Module model from https://www.dropbox.com/s/tyhc73xa051grjp/cp_vton_gmm.onnx?dl=0
 You can download the Try-On Module model from https://www.dropbox.com/s/q2x97ve2h53j66k/cp_vton_tom.onnx?dl=0
-You can download the cloth segmentation model from https://www.dropbox.com/s/qag9vzambhhkvxr/lip_jppnet_384.pb?dl=0
+You can download the cloth segmentation model from https://huggingface.co/opencv/opencv_contribution/tree/main/human_parsing_jppnet
 You can find the OpenPose proto in opencv_extra/testdata/dnn/openpose_pose_coco.prototxt
 and get .caffemodel using opencv_extra/testdata/dnn/download_models.py
 '''
@@ -16,7 +16,7 @@ from numpy import linalg
 from common import findFile
 from human_parsing import parse_human
 
-backends = (cv.dnn.DNN_BACKEND_DEFAULT, cv.dnn.DNN_BACKEND_HALIDE, cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_BACKEND_OPENCV,
+backends = (cv.dnn.DNN_BACKEND_DEFAULT, cv.dnn.DNN_BACKEND_INFERENCE_ENGINE, cv.dnn.DNN_BACKEND_OPENCV,
             cv.dnn.DNN_BACKEND_VKCOM, cv.dnn.DNN_BACKEND_CUDA)
 targets = (cv.dnn.DNN_TARGET_CPU, cv.dnn.DNN_TARGET_OPENCL, cv.dnn.DNN_TARGET_OPENCL_FP16, cv.dnn.DNN_TARGET_MYRIAD, cv.dnn.DNN_TARGET_HDDL,
            cv.dnn.DNN_TARGET_VULKAN, cv.dnn.DNN_TARGET_CUDA, cv.dnn.DNN_TARGET_CUDA_FP16)
@@ -27,13 +27,12 @@ parser.add_argument('--input_image', '-i', required=True, help='Path to image wi
 parser.add_argument('--input_cloth', '-c', required=True, help='Path to target cloth image')
 parser.add_argument('--gmm_model', '-gmm', default='cp_vton_gmm.onnx', help='Path to Geometric Matching Module .onnx model.')
 parser.add_argument('--tom_model', '-tom', default='cp_vton_tom.onnx', help='Path to Try-On Module .onnx model.')
-parser.add_argument('--segmentation_model', default='lip_jppnet_384.pb', help='Path to cloth segmentation .pb model.')
+parser.add_argument('--segmentation_model', default='human_parsing_jppnet_2026sep.onnx', help='Path to cloth segmentation .onnx model.')
 parser.add_argument('--openpose_proto', default='openpose_pose_coco.prototxt', help='Path to OpenPose .prototxt model was trained on COCO dataset.')
 parser.add_argument('--openpose_model', default='openpose_pose_coco.caffemodel', help='Path to OpenPose .caffemodel model was trained on COCO dataset.')
 parser.add_argument('--backend', choices=backends, default=cv.dnn.DNN_BACKEND_DEFAULT, type=int,
                     help="Choose one of computation backends: "
                             "%d: automatically (by default), "
-                            "%d: Halide language (http://halide-lang.org/), "
                             "%d: Intel's Deep Learning Inference Engine (https://software.intel.com/openvino-toolkit), "
                             "%d: OpenCV implementation, "
                             "%d: VKCOM, "
@@ -134,8 +133,8 @@ class BilinearFilter(object):
 class CpVton(object):
     def __init__(self, gmm_model, tom_model, backend, target):
         super(CpVton, self).__init__()
-        self.gmm_net = cv.dnn.readNet(gmm_model)
-        self.tom_net = cv.dnn.readNet(tom_model)
+        self.gmm_net = cv.dnn.readNetFromONNX(gmm_model)
+        self.tom_net = cv.dnn.readNetFromONNX(tom_model)
         self.gmm_net.setPreferableBackend(backend)
         self.gmm_net.setPreferableTarget(target)
         self.tom_net.setPreferableBackend(backend)

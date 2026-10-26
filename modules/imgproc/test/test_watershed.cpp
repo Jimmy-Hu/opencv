@@ -42,89 +42,69 @@
 
 #include "test_precomp.hpp"
 
-#if 0
 namespace opencv_test { namespace {
 
-class CV_WatershedTest : public cvtest::BaseTest
+// Seeds are eroded copies of the stored reference regions, so watershed has to re-grow the
+// boundaries. The neighbouring watershed/comp.xml is not used: it is an
+// "opencv-sequence-tree" holding CvSeq contours and needs the removed C API to read.
+TEST(Imgproc_Watershed, regression)
 {
-public:
-    CV_WatershedTest();
-    ~CV_WatershedTest();
-protected:
-    void run(int);
-};
+    const string folder = string(cvtest::TS::ptr()->get_data_path());
+    const string expPath = folder + "watershed/wshed_exp.png";
 
-CV_WatershedTest::CV_WatershedTest() {}
-CV_WatershedTest::~CV_WatershedTest() {}
+    Mat image = imread(folder + "inpaint/orig.png", IMREAD_COLOR);
+    Mat expLabels8 = imread(expPath, IMREAD_GRAYSCALE);
+    ASSERT_FALSE(image.empty()) << "Could not read " << folder << "inpaint/orig.png";
+    ASSERT_FALSE(expLabels8.empty()) << "Could not read " << expPath;
+    ASSERT_EQ(image.size(), expLabels8.size());
 
-void CV_WatershedTest::run( int /* start_from */)
-{
-    string exp_path = string(ts->get_data_path()) + "watershed/wshed_exp.png";
-    Mat exp = imread(exp_path, IMREAD_GRAYSCALE);
-    Mat orig = imread(string(ts->get_data_path()) + "inpaint/orig.png");
-    FileStorage fs(string(ts->get_data_path()) + "watershed/comp.xml", FileStorage::READ);
+    // wshed_exp.png stores the expected labels offset by +1, so that the -1 used for
+    // watershed boundaries survives being written to an 8-bit PNG.
+    Mat expected;
+    expLabels8.convertTo(expected, CV_32S);
+    expected -= 1;                       // -1 = boundary, 1..nLabels = regions
 
-    if (orig.empty() || !fs.isOpened())
+    double maxLabel = 0;
+    minMaxLoc(expected, 0, &maxLabel);
+    const int nLabels = cvRound(maxLabel);
+    ASSERT_GT(nLabels, 1) << "reference image does not contain several regions";
+
+    Mat markers = Mat::zeros(expected.size(), CV_32S);
+    Mat kernel = getStructuringElement(MORPH_ELLIPSE, Size(15, 15));
+    for (int label = 1; label <= nLabels; label++)
     {
-        ts->set_failed_test_info( cvtest::TS::FAIL_INVALID_TEST_DATA );
-        return;
+        Mat seed;
+        erode(expected == label, seed, kernel);
+        ASSERT_GT(countNonZero(seed), 0) << "region " << label << " vanished when eroded";
+        markers.setTo(label, seed);
     }
 
-    CvSeq* cnts = (CvSeq*)fs["contours"].readObj();
+    Mat result = markers.clone();
+    watershed(image, result);
 
-    Mat markers(orig.size(), CV_32SC1);
-    markers = Scalar(0);
-    IplImage iplmrks = cvIplImage(markers);
+    ASSERT_EQ(expected.size(), result.size());
+    ASSERT_EQ(CV_32S, result.type());
 
-    vector<unsigned char> colors(1);
-    for(int i = 0; cnts != 0; cnts = cnts->h_next, ++i )
-    {
-        cvDrawContours( &iplmrks, cnts, cvScalar(Scalar::all(i + 1)), cvScalar(Scalar::all(i + 1)), -1, CV_FILLED);
-        Point* p = (Point*)cvGetSeqElem(cnts, 0);
+    EXPECT_EQ(0, countNonZero(result == 0)) << "watershed left pixels unlabelled";
 
-        //expected image was added with 1 in order to save to png
-        //so now we subtract 1 to get real color
-        if(!exp.empty())
-            colors.push_back(exp.ptr(p->y)[p->x] - 1);
-    }
-    fs.release();
-    const int compNum = (int)(colors.size() - 1);
+    double minVal = 0, maxVal = 0;
+    minMaxLoc(result, &minVal, &maxVal);
+    EXPECT_GE(minVal, -1);
+    EXPECT_LE(maxVal, nLabels) << "watershed produced a label that was never seeded";
 
-    watershed(orig, markers);
+    // Measured: ~99.6% for a correct implementation, ~78.7% if watershed does nothing.
+    Mat interior = expected > 0;
+    const int totalPx = countNonZero(interior);
+    ASSERT_GT(totalPx, 0);
+    Mat agreeMask;
+    bitwise_and(result == expected, interior, agreeMask);
+    const double agreement = (double)countNonZero(agreeMask) / totalPx;
+    EXPECT_GT(agreement, 0.95)
+        << "only " << agreement * 100 << "% of interior pixels match " << expPath;
 
-    for(int j = 0; j < markers.rows; ++j)
-    {
-        int* line = markers.ptr<int>(j);
-        for(int i = 0; i < markers.cols; ++i)
-        {
-            int& pixel = line[i];
-
-            if (pixel == -1) // border
-                continue;
-
-            if (pixel <= 0 || pixel > compNum)
-                continue; // bad result, doing nothing and going to get error latter;
-
-            // repaint in saved color to compare with expected;
-            if(!exp.empty())
-                pixel = colors[pixel];
-        }
-    }
-
-    Mat markers8U;
-    markers.convertTo(markers8U, CV_8U, 1, 1);
-
-    if( exp.empty() || orig.size() != exp.size() )
-    {
-        imwrite(exp_path, markers8U);
-        exp = markers8U;
-    }
-
-    ASSERT_EQ(0, cvtest::norm(markers8U, exp, NORM_INF));
+    Mat again = markers.clone();
+    watershed(image, again);
+    EXPECT_EQ(0, countNonZero(again != result)) << "watershed is not deterministic";
 }
 
-TEST(Imgproc_Watershed, regression) { CV_WatershedTest test; test.safe_run(); }
-
 }} // namespace
-
-#endif

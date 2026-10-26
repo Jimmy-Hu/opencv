@@ -40,11 +40,13 @@ try:
 except AttributeError:
     print("SIFT not available")
 try:
-    FEATURES_FIND_CHOICES['brisk'] = cv.BRISK_create
+    cv.xfeatures2d_BRISK.create() # check if the function can be called
+    FEATURES_FIND_CHOICES['brisk'] = cv.xfeatures2d_BRISK.create
 except AttributeError:
     print("BRISK not available")
 try:
-    FEATURES_FIND_CHOICES['akaze'] = cv.AKAZE_create
+    cv.xfeatures2d_AKAZE.create() # check if the function can be called
+    FEATURES_FIND_CHOICES['akaze'] = cv.xfeatures2d_AKAZE.create
 except AttributeError:
     print("AKAZE not available")
 
@@ -274,7 +276,6 @@ def get_compensator(args):
 def main():
     args = parser.parse_args()
     img_names = args.img_names
-    print(img_names)
     work_megapix = args.work_megapix
     seam_megapix = args.seam_megapix
     compose_megapix = args.compose_megapix
@@ -439,7 +440,7 @@ def main():
     sizes = []
     blender = None
     timelapser = None
-    # https://github.com/opencv/opencv/blob/4.x/samples/cpp/stitching_detailed.cpp#L725 ?
+    # https://github.com/opencv/opencv/blob/5.x/samples/cpp/stitching_detailed.cpp#L725 ?
     for idx, name in enumerate(img_names):
         full_img = cv.imread(name)
         if not is_compose_scale_set:

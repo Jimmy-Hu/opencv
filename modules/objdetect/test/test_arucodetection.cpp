@@ -4,7 +4,7 @@
 
 #include "test_precomp.hpp"
 #include "opencv2/objdetect/aruco_detector.hpp"
-#include "opencv2/calib3d.hpp"
+#include "opencv2/geometry.hpp"
 
 namespace cv {
     namespace aruco {
@@ -1497,5 +1497,17 @@ INSTANTIATE_TEST_CASE_P(
             aruco::CORNER_REFINE_CONTOUR,
             aruco::CORNER_REFINE_APRILTAG
         ));
+
+TEST(ArucoDictionary, getByteListFromBits_invalid)
+{
+    Mat empty;
+    EXPECT_THROW(aruco::Dictionary::getByteListFromBits(empty), cv::Exception);
+
+    Mat nonSquare(3, 5, CV_8UC1, Scalar(0));
+    EXPECT_THROW(aruco::Dictionary::getByteListFromBits(nonSquare), cv::Exception);
+
+    Mat non8u(4, 4, CV_32F, Scalar(0));
+    EXPECT_THROW(aruco::Dictionary::getByteListFromBits(non8u), cv::Exception);
+}
 
 }} // namespace

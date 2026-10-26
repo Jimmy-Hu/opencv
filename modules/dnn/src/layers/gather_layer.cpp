@@ -33,14 +33,31 @@ public:
     {
         CV_CheckEQ(inputs.size(), 2ull, "");
         MatShape inpShape = inputs[0];
-        const int axis = normalize_axis(m_axis, inpShape);
+        if (inpShape.size() == 0 ){
+            outputs.assign(1, inpShape);
+            return false;
+        }
 
-        inpShape.erase(inpShape.begin() + axis);
+        const int axis = normalize_axis(m_axis, inpShape);
+        if (!inpShape.empty())
+            inpShape.erase(inpShape.begin() + axis);
         auto end = m_real_ndims == -1 ? inputs[1].end() : inputs[1].begin() + m_real_ndims;
         inpShape.insert(inpShape.begin() + axis, inputs[1].begin(), end);
-
         outputs.assign(1, inpShape);
         return false;
+    }
+
+    virtual  void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_CheckEQ(inputs.size(), (size_t)2, "");
+        CV_CheckType(inputs[0], inputs[0] == CV_32F || inputs[0] == CV_32S || inputs[0] == CV_64S || inputs[0] == CV_16F || inputs[0] == CV_8U || inputs[0] == CV_8S || inputs[0] == CV_Bool ||
+                                inputs[0] == CV_8F_E4M3FN || inputs[0] == CV_8F_E4M3FNUZ, "");
+        CV_CheckType(inputs[1], inputs[1] == CV_64S || inputs[1] == CV_32S, "");
+        outputs.assign(1, inputs[0]);
     }
 
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
@@ -56,45 +73,31 @@ public:
 
         CV_CheckEQ(inputs.size(), (size_t)2, "");
         CV_CheckEQ(outputs.size(), (size_t)1, "");
+        CV_CheckTypeEQ(inputs[0].type(), outputs[0].type(), "");
 
-        const Mat& inp = inputs[0];
-
-        int indicesType = inputs[1].type();
-        CV_CheckType(indicesType, indicesType == CV_32FC1 || indicesType == CV_16FC1, "");
-        Mat indices32S;
-        if (indicesType == CV_16F/*FP16*/)
-        {
-            Mat indicesF32;
-            inputs[1].convertTo(indicesF32, CV_32F);
-            indicesF32.convertTo(indices32S, CV_32S);
-        }
+        if (inputs[1].type() == CV_32SC1)
+            forward_impl<int32_t>(inputs[0], inputs[1], outputs[0]);
+        else if (inputs[1].type() == CV_64SC1)
+            forward_impl<int64_t>(inputs[0], inputs[1], outputs[0]);
         else
-        {
-            inputs[1].convertTo(indices32S, CV_32S);
-        }
-        const size_t indices_total = indices32S.total();
-        indices32S = indices32S.reshape(1, indices_total);
+            CV_CheckType(inputs[1].type(), inputs[1].type() == CV_32SC1 || inputs[1].type() == CV_64SC1, "");
+    }
 
-        Mat& out = outputs[0];
+    template<typename T_INDEX>
+    void forward_impl(const Mat& inp, const Mat& indices, Mat& out)
+    {
 
-        CV_CheckTypeEQ(inp.type(), out.type(), "");
-        CV_CheckTypeEQ(indices32S.type(), CV_32SC1, "");
-
+        const size_t indices_total = indices.total();
         const int axis = normalize_axis(m_axis, shape(inp));
 
         // FIXIT: why should we work with non-normalized input? it should be handled in importer or layers's output generator
         const int axis_size = (int)inp.size[axis];
-        for (size_t j = 0 ; j < indices_total; ++j)
-        {
-            int& idx = indices32S.at<int>(j);
-            idx = normalize_axis(idx, axis_size);  // validate and normalize indices
-        }
 
         const size_t outer_size = axis == 0 ? inp.total() : inp.step1(axis - 1);
         const size_t outer_dims = inp.total() / outer_size;
         const size_t inner_size = inp.step1(axis);
 
-        const int* idx = indices32S.ptr<int>();
+        const T_INDEX* idx = indices.ptr<T_INDEX>();
         const char* src = inp.ptr<const char>();
         char* dst = out.ptr<char>();
         CV_CheckEQ(out.total(), outer_dims * indices_total * inner_size, "");
@@ -107,7 +110,7 @@ public:
             const size_t src_offset = i * outer_size;
             for (size_t j = 0 ; j < indices_total; ++j)
             {
-                const int index = idx[j];
+                const int index = normalize_axis(idx[j], axis_size);
                 CV_DbgCheck(index, index >= 0 && index < axis_size, "");
                 const size_t new_offset = src_offset + index * inner_size;
                 std::memcpy(dst, src + new_offset * es, inner_bytes);
@@ -123,7 +126,7 @@ public:
         auto axisNode = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{}, &m_axis);
         auto gather = std::make_shared<ov::op::v8::Gather>(
             nodes[0].dynamicCast<InfEngineNgraphNode>()->node,
-            std::make_shared<ov::op::v0::Convert>(nodes[1].dynamicCast<InfEngineNgraphNode>()->node, ov::element::i32),
+            nodes[1].dynamicCast<InfEngineNgraphNode>()->node,
             axisNode);
         return Ptr<BackendNode>(new InfEngineNgraphNode(gather));
     }

@@ -43,7 +43,6 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_vkcom.hpp"
@@ -53,6 +52,7 @@
 
 #ifdef HAVE_OPENCL
 #include "opencl_kernels_dnn.hpp"
+#include "../ocl4dnn/include/common.hpp"
 #endif
 
 #ifdef HAVE_CUDA
@@ -77,6 +77,8 @@ public:
         zeropoint = params.get<int>("zeropoints", 0);
         scale = params.get<float>("scales", 1.0f);
     }
+
+    bool isDataShuffling() const CV_OVERRIDE { return true; }
 
     virtual bool getMemoryShapes(const std::vector<MatShape> &inputs,
                                  const int requiredOutputs,
@@ -109,11 +111,25 @@ public:
                 }
             }
 
-            axisSum += curShape[cAxis];
+            axisSum += curShape.dims >= cAxis ? curShape[cAxis] : 1;
         }
+        outputs[0].dims = std::max(outputs[0].dims, 1);
         outputs[0][cAxis] = axisSum;
         return false;
     }
+
+    virtual  void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_Assert(inputs.size());
+        for (int i = 1; i < inputs.size(); i++)
+            CV_CheckTypeEQ(inputs[i], inputs[0], "All input types should be equal");
+        outputs.assign(1, inputs[0]);
+    }
+
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
     {
@@ -138,7 +154,6 @@ public:
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               (backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1 && !padding) ||  // By channels
                (backendId == DNN_BACKEND_WEBNN && !padding) ||
                (backendId == DNN_BACKEND_CANN && !padding);
     }
@@ -221,8 +236,6 @@ public:
     {
         std::vector<UMat> inputs;
         std::vector<UMat> outputs;
-
-        bool use_half = (inps.depth() == CV_16F);
         inps.getUMatVector(inputs);
         outs.getUMatVector(outputs);
 
@@ -231,13 +244,14 @@ public:
             return false;
 
         int bottom_concat_axis;
-        int concat_size = total(shape(inputs[0]), cAxis + 1);
+        int concat_size = (int)total(shape(inputs[0]), cAxis + 1);
         int top_concat_axis = outputs[0].size[cAxis];
-        int num_concats = total(shape(inputs[0]), 0, cAxis);
+        int num_concats = (int)total(shape(inputs[0]), 0, cAxis);
         int offset_concat_axis = 0;
         UMat& outMat = outputs[0];
-        String buildopt = format(" -DDtype=%s", (use_half) ? "half" : "float");
-        String kname = format("concat_%s", use_half ? "half" : "float");
+        String matType = matTypeToOclType(inputs[0].type());
+        String buildopt = " -DDtype=" + matType;
+        String kname = "concat_" + matType;
 
         for (size_t i = 0; i < inputs.size(); i++)
         {
@@ -273,8 +287,7 @@ public:
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
 
-        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget) &&
-                   inputs_arr.depth() != CV_8S,
+        CV_OCL_RUN(IS_DNN_OPENCL_TARGET(preferableTarget),
                    forward_ocl(inputs_arr, outputs_arr, internals_arr))
 
         std::vector<Mat> inputs, outputs;
@@ -287,7 +300,7 @@ public:
         if (padding)
             outMat.setTo(paddingValue);
 
-        if( cAxis == 1 && outMat.dims == 4 && !padding)
+        if(cAxis == 1 && outMat.dims == 4 && !padding && (inputs[0].depth() == CV_32F || inputs[0].depth() == CV_8S))
         {
             int nstripes = getNumThreads();
             if (outMat.type() == CV_8S)
@@ -328,32 +341,12 @@ public:
 
         auto input_wrapper = inputs[0].dynamicCast<CUDABackendWrapper>();
         auto concat_axis = normalize_axis(axis, input_wrapper->getRank());
-        return make_cuda_node<cuda4dnn::ConcatOp>(preferableTarget, std::move(context->stream), concat_axis, padding);
+        if (inputs[0]->getHostMatDepth() == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::ConcatOp>(std::move(context->stream), concat_axis, padding);
+        else
+            return make_cuda_node_with_type<cuda4dnn::ConcatOp>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), concat_axis, padding);
     }
 #endif
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        std::vector<Halide::Buffer<> > inputBuffers = halideBuffers(input);
-
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        int offset = inputBuffers[0].channels();
-        Halide::Expr topExpr = select(c < offset,
-                                      inputBuffers[0](x, y, c, n),
-                                      inputBuffers[1](x, y, c - offset, n));
-        for (int i = 2; i < input.size(); ++i)
-        {
-            offset += inputBuffers[i - 1].channels();
-            topExpr = select(c < offset, topExpr,
-                             inputBuffers[i](x, y, c - offset, n));
-        }
-        top(x, y, c, n) = topExpr;
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
 
 #ifdef HAVE_CANN
     virtual Ptr<BackendNode> initCann(const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -515,14 +508,6 @@ public:
         return tvBackendNode;
     }
 #endif // HAVE_TIMVX
-
-    virtual bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                             const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        if (padding)
-            params.set("padding_value", zeropoints[1][0]);
-        return true;
-    }
 
 #ifdef HAVE_WEBNN
     virtual Ptr<BackendNode> initWebnn(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE

@@ -50,7 +50,7 @@ namespace cv {
         virtual ~VideoCapture_WinRT() {}
 
         // from base class IVideoCapture
-        virtual double getProperty(int) { return 0; }
+        virtual double getProperty(int) { return CAP_PROP_UNKNOWN; }
         virtual bool setProperty(int, double);
         virtual bool grabFrame();
         virtual bool retrieveFrame(int channel, cv::OutputArray outArray);
@@ -62,7 +62,7 @@ namespace cv {
     protected:
 
         bool                    started;
-        CvSize                  size;
+        Size                    size;
         int                     bytesPerPixel;
         unsigned long           frameCurrent;
         std::atomic<bool>       isFrameNew;

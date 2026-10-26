@@ -22,6 +22,7 @@ struct FastGemmOpt {
     bool use_avx2;
     bool use_neon;
     bool use_lasx;
+    bool use_rvv;
     bool multi_thread;
 
     FastGemmOpt() {
@@ -29,6 +30,7 @@ struct FastGemmOpt {
         use_avx2 = false;
         use_neon = false;
         use_lasx = false;
+        use_rvv = false;
         multi_thread = false;
     }
 
@@ -37,12 +39,14 @@ struct FastGemmOpt {
         use_avx2 = checkHardwareSupport(CPU_AVX2);
         use_neon = checkHardwareSupport(CPU_NEON);
         use_lasx = checkHardwareSupport(CPU_LASX);
+        use_rvv = checkHardwareSupport(CPU_RVV);
         multi_thread = true;
     }
 
     bool all() {
-        return use_avx || use_avx2 || use_neon || use_lasx;
+        return use_avx || use_avx2 || use_neon || use_lasx || use_rvv;
     }
+
 };
 
 struct MatMulHelper {
@@ -54,6 +58,10 @@ struct MatMulHelper {
     std::vector<size_t> B_rows;
     std::vector<size_t> C_rows;
     size_t batch;
+    // Number of matrices actually stored in B.  When B is broadcast over the output
+    // batch dims this is smaller than `batch`, and the packed-B stride must be derived
+    // from this value, not from `batch`.
+    size_t B_batch;
 
     int lda0, lda1;
     int ldb0, ldb1;
@@ -71,6 +79,7 @@ struct MatMulHelper {
         C_rows = {0};
 
         batch = 0;
+        B_batch = 0;
     }
 
     bool empty() const {
@@ -100,6 +109,7 @@ struct MatMulHelper {
         auto batch_ndims = C_ndims - 2;
 
         batch = total(C_shape, 0, batch_ndims);
+        B_batch = total(B_shape, 0, static_cast<int>(B_ndims) - 2);
 
         A_offsets.resize(batch, 0);
         B_offsets.resize(batch, 0);
@@ -121,6 +131,9 @@ struct MatMulHelper {
             B_steps[i] = B_steps[i + 1] * B_broadcast_shape[i + 1];
         }
         size_t t, idx;
+        // M*K or N*K can be 0 (empty A/B); row indices are 0 and unread for K == 0 -
+        // matmul_layer.cpp's forward_ocl() (the only reader) bails out before using them.
+        const size_t A_step = (size_t)M * K, B_step = (size_t)N * K;
         for (size_t i = 0; i < batch; i++) {
             C_offsets[i] = i * C_step;
             C_rows[i] = i;
@@ -136,14 +149,16 @@ struct MatMulHelper {
             }
             A_offsets[i] = A_offset;
             B_offsets[i] = B_offset;
-            A_rows[i] = A_offset / (M * K);
-            B_rows[i] = B_offset / (N * K);
+            A_rows[i] = A_step > 0 ? A_offset / A_step : 0;
+            B_rows[i] = B_step > 0 ? B_offset / B_step : 0;
         }
     }
 
     // only run after compute
     void updatePackedBOffsets(size_t packed_B_size) {
-        size_t packed_B_inner_size = packed_B_size / batch;
+        // packed_B holds one packed (N, K) matrix per batch slice of B; B_batch is that
+        // slice count, which can be smaller than `batch` when B is broadcast.
+        size_t packed_B_inner_size = B_batch > 0 ? packed_B_size / B_batch : 0;
         packed_B_offsets.resize(B_offsets.size());
         for (size_t i = 0; i < packed_B_offsets.size(); i++) {
             packed_B_offsets[i] = (B_offsets[i] / (N * K)) * packed_B_inner_size;
@@ -154,6 +169,12 @@ struct MatMulHelper {
 size_t fastGemmPackBSize(size_t N, size_t K, const FastGemmOpt &opt);
 
 void fastGemmPackB(const Mat &m, std::vector<float> &packed_B, bool trans, FastGemmOpt &opt);
+
+int fastGemmMC(const FastGemmOpt &opt);
+int fastGemmNC(const FastGemmOpt &opt);
+int fastGemmKC(const FastGemmOpt &opt);
+int fastGemmNR(const FastGemmOpt &opt);
+
 void fastGemmPackB(bool trans, size_t N, size_t K, const float *B, size_t ldb, float *packed_B, const FastGemmOpt &opt);
 
 void fastGemm(bool trans_a, int M, int N, int K,
@@ -175,6 +196,30 @@ void fastGemmBatch(size_t batch, const size_t *A_offsets, const size_t *B_offset
                    const float *packed_B, float beta, float *C, int ldc, FastGemmOpt &opt);
 void fastGemmBatch(bool trans_a, bool trans_b, float alpha, const Mat &A,
                    const Mat &B, float beta, Mat &C, FastGemmOpt &opt);
+void fastGemmBatch(size_t batch,
+                   const std::vector<size_t> &A_offsets, const std::vector<size_t> &B_offsets, const std::vector<size_t> &C_offsets,
+                   int M, int N, int K, float alpha, const Mat&A, int lda0, int lda1,
+                   const Mat&B, int ldb0, int ldb1, float beta, Mat&C, int ldc, FastGemmOpt &opt);
+
+bool fastGemmThinEligible(int M, int N, int K);
+size_t fastGemmThinPackBSize(int N, int K);
+void fastGemmThinPackB(int N, int K, const float* B, size_t ldb_K, size_t ldb_N, float* packed_B);
+void fastGemmThin(int M, int N, int K, float alpha,
+                  const float* A, int lda0, int lda1,
+                  const float* packed_B, float beta,
+                  float* C, int ldc, bool multi_thread);
+
+void pagedAttnQKGemm(
+    const Mat& Q, const std::vector<Mat> &K, Mat& A,
+    int T_q, int Nq, int N_k, int T_s, int D, size_t T_k,
+    float sm_scale, const FastGemmOpt &opts
+);
+void pagedAttnAVGemm(
+    const Mat& A,const std::vector<Mat> &V, Mat& Out,
+    int T_q, int Nq, int N_k, int T_s, int D, int T_v,
+    const FastGemmOpt &opt
+);
+
 
 }} // cv::dnn
 

@@ -240,7 +240,7 @@ PARAM_TEST_CASE(CalcHist, bool)
         randomSubMat(src, src_roi, roiSize, srcBorder, CV_8UC1, 0, 256);
 
         Border histBorder = randomBorder(0, useRoi ? MAX_VALUE : 0);
-        randomSubMat(hist, hist_roi, Size(1, 256), histBorder, CV_32SC1, 0, MAX_VALUE);
+        randomSubMat(hist, hist_roi, Size(256, 1), histBorder, CV_32SC1, 0, MAX_VALUE);
 
         UMAT_UPLOAD_INPUT_PARAMETER(src);
         UMAT_UPLOAD_OUTPUT_PARAMETER(hist);
@@ -264,6 +264,34 @@ OCL_TEST_P(CalcHist, Mat)
 
         OCL_EXPECT_MATS_NEAR(hist, 0.0);
     }
+}
+
+TEST(CalcHistMask, CheckMask)
+{
+    Mat gray = imread(cvtest::findDataFile("shared/baboon.png"), IMREAD_GRAYSCALE);
+    ASSERT_FALSE(gray.empty());
+
+    cv::Rect roi(gray.cols/4, gray.rows/4, gray.cols/2, gray.rows/2);
+    Mat mask = Mat::zeros(gray.size(), CV_8UC1);
+    mask(roi).setTo(255);
+
+    Mat mask_bool = Mat::zeros(gray.size(), CV_BoolC1);
+    mask_bool(roi).setTo(1);
+    Mat gray_roi = gray(roi);
+
+    const std::vector<int> channels(1, 0);
+    std::vector<int> histSize(1, 256);
+    std::vector<float> ranges(2);
+    ranges[0] = 0;
+    ranges[1] = 256;
+
+    Mat hist_mask, hist_bool, hist_roi;
+    cv::calcHist(std::vector<Mat>(1, gray_roi), channels, Mat(), hist_roi, histSize, ranges, false);
+    cv::calcHist(std::vector<Mat>(1, gray), channels, mask, hist_mask, histSize, ranges, false);
+    cv::calcHist(std::vector<Mat>(1, gray), channels, mask_bool, hist_bool, histSize, ranges, false);
+
+    EXPECT_MAT_NEAR(hist_roi, hist_mask, 0.0);
+    EXPECT_MAT_NEAR(hist_mask, hist_bool, 0.0);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////

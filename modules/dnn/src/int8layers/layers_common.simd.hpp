@@ -631,6 +631,7 @@ void fastGEMM1T( const int8_t* vec, const int8_t* weights,
 
     _mm256_zeroupper();
 }
+
 #endif // CV_CPU_OPTIMIZATION_DECLARATIONS_ONLY
 
 

@@ -211,6 +211,7 @@ public:
     Ptr<IVideoCapture> createCapture(const Ptr<IStreamReader>& stream, const VideoCaptureParameters& params) const CV_OVERRIDE;
     Ptr<IVideoWriter> createWriter(const std::string& filename, int fourcc, double fps,
                                    const cv::Size& sz, const VideoWriterParameters& params) const CV_OVERRIDE;
+    std::vector<VideoDeviceInfo> enumerateDevices() const CV_OVERRIDE;
 
     std::string getCapturePluginVersion(CV_OUT int& version_ABI, CV_OUT int& version_API)
     {
@@ -540,10 +541,10 @@ public:
     }
     double getProperty(int prop) const CV_OVERRIDE
     {
-        double val = -1;
+        double val = CAP_PROP_UNKNOWN;
         if (plugin_api_->v0.Capture_getProperty)
             if (CV_ERROR_OK != plugin_api_->v0.Capture_getProperty(capture_, prop, &val))
-                val = -1;
+                val = CAP_PROP_UNKNOWN;
         return val;
     }
     bool setProperty(int prop, double val) CV_OVERRIDE
@@ -566,6 +567,12 @@ public:
         cv::_OutputArray* dst = static_cast<cv::_OutputArray*>(userdata);
         if (!dst)
             return CV_ERROR_FAIL;
+        int depth = CV_MAT_DEPTH(type);
+        // [TODO] Remove this condition after rebuilding plugins or add a new
+        // version of plugins. Convert type from the old one to the new one (5 bits)
+        if (depth > 7) {
+            type = CV_MAKETYPE((type & 7), (type >> 3) + 1);
+        }
         cv::Mat(cv::Size(width, height), type, (void*)data, step).copyTo(*dst);
         return CV_ERROR_OK;
     }
@@ -658,10 +665,10 @@ public:
     }
     double getProperty(int prop) const CV_OVERRIDE
     {
-        double val = -1;
+        double val = CAP_PROP_UNKNOWN;
         if (plugin_api_->v0.Writer_getProperty)
             if (CV_ERROR_OK != plugin_api_->v0.Writer_getProperty(writer_, prop, &val))
-                val = -1;
+                val = CAP_PROP_UNKNOWN;
         return val;
     }
     bool setProperty(int prop, double val) CV_OVERRIDE
@@ -675,7 +682,7 @@ public:
     {
         return writer_ != NULL;  // TODO always true
     }
-    void write(cv::InputArray arr) CV_OVERRIDE
+    bool write(cv::InputArray arr) CV_OVERRIDE
     {
         cv::Mat img = arr.getMat();
         CV_DbgAssert(writer_);
@@ -683,8 +690,9 @@ public:
         if (CV_ERROR_OK != plugin_api_->v0.Writer_write(writer_, img.data, (int)img.step[0], img.cols, img.rows, img.channels()))
         {
             CV_LOG_DEBUG(NULL, "Video I/O: Can't write frame by plugin '" << plugin_api_->api_header.api_description << "'");
+            return false;
         }
-        // TODO return bool result?
+        return true;
     }
     int getCaptureDomain() const CV_OVERRIDE
     {
@@ -775,6 +783,24 @@ Ptr<IVideoWriter> PluginBackend::createWriter(const std::string& filename, int f
         CV_LOG_DEBUG(NULL, "Video I/O: can't open writer: " << filename);
     }
     return Ptr<IVideoWriter>();
+}
+
+std::vector<VideoDeviceInfo> PluginBackend::enumerateDevices() const
+{
+    std::vector<VideoDeviceInfo> result;
+    if (capture_api_ && capture_api_->api_header.api_version >= 3 && capture_api_->v3.Capture_enumerate_devices)
+    {
+        struct Context { std::vector<VideoDeviceInfo>* devices; VideoCaptureAPIs backend; };
+        Context ctx{ &result, (VideoCaptureAPIs)capture_api_->v0.id };
+        capture_api_->v3.Capture_enumerate_devices(
+            [](int cam_idx, const char* cam_name, void* userdata) -> CvResult
+            {
+                Context* self = static_cast<Context*>(userdata);
+                self->devices->push_back(makeVideoDeviceInfo(cam_idx, self->backend, cam_name ? cam_name : std::string()));
+                return CV_ERROR_OK;
+            }, &ctx);
+    }
+    return result;
 }
 
 #endif  // OPENCV_HAVE_FILESYSTEM_SUPPORT && defined(ENABLE_PLUGINS)

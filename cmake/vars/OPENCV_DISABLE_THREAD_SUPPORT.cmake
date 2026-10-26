@@ -13,7 +13,6 @@ ocv_update(WITH_VA OFF)
 ocv_update(WITH_VA_INTEL OFF)
 
 # Disable bindings
-ocv_update(BUILD_opencv_python2 OFF)
 ocv_update(BUILD_opencv_python3 OFF)
 ocv_update(BUILD_JAVA OFF)
 ocv_update(BUILD_opencv_java OFF)
@@ -22,7 +21,6 @@ ocv_update(BUILD_opencv_java OFF)
 # <[thread|mutex|condition_variable|future]>` and linkage into
 # `libpthread` to work.
 ocv_update(BUILD_opencv_objdetect OFF)
-ocv_update(BUILD_opencv_gapi OFF)
 ocv_update(BUILD_opencv_dnn OFF)
 
 set(OPJ_USE_THREAD "OFF" CACHE INTERNAL "")

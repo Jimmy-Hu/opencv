@@ -672,11 +672,6 @@ void Net::Impl::fuseLayers(const std::vector<LayerPin>& blobsToKeep_)
         if (preferableBackend != DNN_BACKEND_OPENCV && preferableBackend != DNN_BACKEND_CUDA)
             continue;  // Go to the next layer.
 
-        // the optimization #2. if there is concat layer that concatenates channels
-        // from the inputs together (i.e. axis == 1) then we make the inputs of
-        // the concat layer to write to the concatenation output buffer
-        // (and so we eliminate the concatenation layer, because the channels
-        // are concatenated implicitly).
         Ptr<ConcatLayer> concatLayer = ld.layerInstance.dynamicCast<ConcatLayer>();
         if( !concatLayer.empty() && !concatLayer->padding && ld.outputBlobs.size() == 1 )
         {

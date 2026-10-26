@@ -24,20 +24,20 @@ In this tutorial you will learn how to:
 Code
 ----
 @add_toggle_cpp
-This tutorial's code is shown in the lines below. You can download it from [here](https://github.com/opencv/opencv/tree/4.x/samples/cpp/stitching.cpp).
+This tutorial's code is shown in the lines below. You can download it from [here](https://github.com/opencv/opencv/tree/5.x/samples/cpp/stitching.cpp).
 
 Note: The C++ version includes additional options such as image division (--d3) and more detailed error handling, which are not present in the Python example.
 
-@include samples/cpp/stitching.cpp
+@include samples/cpp/snippets/stitching.cpp
 
 @end_toggle
 
 @add_toggle_python
-This tutorial's code is shown in the lines below. You can download it from [here](https://github.com/opencv/opencv/blob/4.x/samples/python/stitching.py).
+This tutorial's code is shown in the lines below. You can download it from [here](https://github.com/opencv/opencv/blob/5.x/samples/python/stitching.py).
 
 Note: The C++ version includes additional options such as image division (--d3) and more detailed error handling, which are not present in the Python example.
 
-@include samples/python/stitching.py
+@include samples/python/snippets/stitching.py
 
 @end_toggle
 
@@ -47,11 +47,11 @@ Explanation
 The most important code part is:
 
 @add_toggle_cpp
-@snippet cpp/stitching.cpp stitching
+@snippet cpp/snippets/stitching.cpp stitching
 @end_toggle
 
 @add_toggle_python
-@snippet python/stitching.py stitching
+@snippet python/snippets/stitching.py stitching
 @end_toggle
 
 A new instance of stitcher is created and the @ref cv::Stitcher::stitch will
@@ -132,11 +132,11 @@ configuration you can use stitching_detailed source code available in C++ or pyt
 
 <H4>stitching_detailed</H4>
 @add_toggle_cpp
-[stitching_detailed.cpp](https://raw.githubusercontent.com/opencv/opencv/4.x/samples/cpp/stitching_detailed.cpp)
+[stitching_detailed.cpp](https://raw.githubusercontent.com/opencv/opencv/5.x/samples/cpp/stitching_detailed.cpp)
 @end_toggle
 
 @add_toggle_python
-[stitching_detailed.py](https://raw.githubusercontent.com/opencv/opencv/4.x/samples/python/stitching_detailed.py)
+[stitching_detailed.py](https://raw.githubusercontent.com/opencv/opencv/5.x/samples/python/stitching_detailed.py)
 @end_toggle
 
 stitching_detailed program uses command line to get stitching parameter. Many parameters exists. Above examples shows some command line parameters possible :
@@ -183,4 +183,4 @@ newspaper1.jpg newspaper2.jpg --work_megapix 0.6 --features surf --matcher affin
 
 ![](images/affinepano.jpg)
 
-You can find  all images in https://github.com/opencv/opencv_extra/tree/4.x/testdata/stitching
+You can find  all images in https://github.com/opencv/opencv_extra/tree/5.x/testdata/stitching

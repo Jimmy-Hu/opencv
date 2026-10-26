@@ -1100,7 +1100,7 @@ void FarnebackOpticalFlowImpl::calc(InputArray _prev0, InputArray _next0,
 {
     CV_INSTRUMENT_REGION();
 
-    CV_OCL_RUN(_flow0.isUMat() &&
+    CV_OCL_RUN(ocl::isOpenCLActivated() && _flow0.isUMat() &&
                ocl::Image2D::isFormatSupported(CV_32F, 1, false),
                calc_ocl(_prev0,_next0,_flow0))
     Mat prev0 = _prev0.getMat(), next0 = _next0.getMat();
@@ -1117,8 +1117,11 @@ void FarnebackOpticalFlowImpl::calc(InputArray _prev0, InputArray _next0,
 
     // If flag is set, check for integrity; if not set, allocate memory space
     if( flags_ & OPTFLOW_USE_INITIAL_FLOW )
-        CV_Assert( _flow0.size() == prev0.size() && _flow0.channels() == 2 &&
-                   _flow0.depth() == CV_32F );
+    {
+        CV_Assert(!_flow0.empty());
+        CV_Assert(_flow0.size() == prev0.size());
+        CV_Assert(_flow0.type() == CV_32FC2);
+    }
     else
         _flow0.create( prev0.size(), CV_32FC2 );
 

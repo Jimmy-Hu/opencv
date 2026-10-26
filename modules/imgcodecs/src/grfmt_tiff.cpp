@@ -57,6 +57,7 @@
 
 #include "tiff.h"
 #include "tiffio.h"
+#include "tiffvers.h" // For TIFFLIB_VERSION
 
 #ifdef TIFFLIB_AT_LEAST
 #if TIFFLIB_AT_LEAST(4, 5, 0)
@@ -437,17 +438,20 @@ bool TiffDecoder::readHeader()
             }
             case 32:
             {
-                CV_Check((int)sample_format, sample_format == SAMPLEFORMAT_IEEEFP || sample_format == SAMPLEFORMAT_INT, "");
-                int depth = sample_format == SAMPLEFORMAT_IEEEFP ? CV_32F : CV_32S;
+                CV_Check((int)sample_format, sample_format == SAMPLEFORMAT_IEEEFP || sample_format == SAMPLEFORMAT_UINT || sample_format == SAMPLEFORMAT_INT, "");
+                int depth = sample_format == SAMPLEFORMAT_IEEEFP ? CV_32F : sample_format == SAMPLEFORMAT_INT ? CV_32S : CV_32U;
                 m_type = CV_MAKETYPE(depth, wanted_channels);
                 result = true;
                 break;
             }
             case 64:
-                CV_CheckEQ((int)sample_format, SAMPLEFORMAT_IEEEFP, "");
-                m_type = CV_MAKETYPE(CV_64F, wanted_channels);
+            {
+                CV_Check((int)sample_format, sample_format == SAMPLEFORMAT_IEEEFP || sample_format == SAMPLEFORMAT_UINT || sample_format == SAMPLEFORMAT_INT, "");
+                int depth = sample_format == SAMPLEFORMAT_IEEEFP ? CV_64F : sample_format == SAMPLEFORMAT_INT ? CV_64S : CV_64U;
+                m_type = CV_MAKETYPE(depth, wanted_channels);
                 result = true;
                 break;
+            }
             default:
                 CV_Error(cv::Error::StsError, "Invalid bitsperpixel value read from TIFF header! Must be 1, 8, 10, 12, 14, 16, 32 or 64.");
             }
@@ -474,7 +478,7 @@ static void fixOrientationPartial(Mat &img, uint16_t orientation)
         case ORIENTATION_RIGHTTOP:
         case ORIENTATION_LEFTBOT:
             flip(img, img, -1);
-            /* fall through */
+            [[fallthrough]];
 
         case ORIENTATION_LEFTTOP:
         case ORIENTATION_RIGHTBOT:
@@ -682,21 +686,24 @@ bool  TiffDecoder::readData( Mat& img )
     int type = img.type();
     int depth = CV_MAT_DEPTH(type);
 
+    CV_CheckDepth(type, ( depth == CV_8U  || depth == CV_8S ||
+                          depth == CV_16U || depth == CV_16S ||
+                          depth == CV_32U || depth == CV_32S ||
+                          depth == CV_64U || depth == CV_64S ||
+                          depth == CV_32F || depth == CV_64F), "Unsupported depth of image");
+
     CV_Assert(!m_tif.empty());
     TIFF* tif = (TIFF*)m_tif.get();
 
     uint16_t photometric = (uint16_t)-1;
     CV_TIFF_CHECK_CALL(TIFFGetField(tif, TIFFTAG_PHOTOMETRIC, &photometric));
 
-    if (m_hdr && depth >= CV_32F)
+    if (m_hdr && ((depth == CV_32F) || (depth == CV_64F)) )
     {
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_SGILOGDATAFMT, SGILOGDATAFMT_FLOAT));
     }
 
     bool color = img.channels() > 1;
-
-    CV_CheckType(type, depth == CV_8U || depth == CV_8S || depth == CV_16U || depth == CV_16S || depth == CV_32S || depth == CV_32F || depth == CV_64F, "");
-
     if (m_width && m_height)
     {
         int is_tiled = TIFFIsTiled(tif) != 0;
@@ -848,7 +855,7 @@ bool  TiffDecoder::readData( Mat& img )
                     }
                 }
             }
-            else if (dst_bpp == 32 || dst_bpp == 64)
+            else if (depth == CV_32F || depth == CV_64F)
             {
                 CV_Assert(ncn == img.channels());
                 CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP));
@@ -962,7 +969,7 @@ bool  TiffDecoder::readData( Mat& img )
                                         if (m_use_rgb)
                                             std::memcpy( (void*) img_line_buffer,
                                                          (void*) bstart,
-                                                         tile_width * sizeof(uchar) );
+                                                         tile_width * ncn * sizeof(uchar) );
                                         else
                                             icvCvt_BGR2RGB_8u_C3R( bstart, 0,
                                                     img_line_buffer, 0,
@@ -1072,7 +1079,7 @@ bool  TiffDecoder::readData( Mat& img )
                                     {
                                         CV_CheckEQ(wanted_channels, 3, "");
                                         if (m_use_rgb)
-                                            std::memcpy(buffer16, img.ptr<ushort>(img_y + i, x), tile_width * sizeof(ushort));
+                                            std::memcpy(img.ptr<ushort>(img_y + i, x), buffer16, tile_width * ncn * sizeof(ushort));
                                         else
                                             icvCvt_RGB2BGR_16u_C3R(buffer16, 0,
                                                     img.ptr<ushort>(img_y + i, x), 0,
@@ -1131,7 +1138,7 @@ bool  TiffDecoder::readData( Mat& img )
                                 CV_TIFF_CHECK_CALL((int)TIFFReadEncodedTile(tif, tileidx, src_buffer, src_buffer_size) >= 0);
                             }
 
-                            Mat m_tile(Size(tile_width0, tile_height0), CV_MAKETYPE((dst_bpp == 32) ? (depth == CV_32S ? CV_32S : CV_32F) : CV_64F, ncn), src_buffer);
+                            Mat m_tile(Size(tile_width0, tile_height0), CV_MAKETYPE(depth, ncn), src_buffer);
                             Rect roi_tile(0, 0, tile_width, tile_height);
                             Rect roi_img(x, img_y, tile_width, tile_height);
                             if (!m_hdr && ncn == 3 && !m_use_rgb)
@@ -1159,7 +1166,7 @@ bool  TiffDecoder::readData( Mat& img )
                        ( ( dst_bpp != 8 ) && ( !doReadScanline ) ) );
     }
 
-    if (m_hdr && depth >= CV_32F)
+    if (m_hdr && ((depth == CV_32F) || (depth == CV_64F)) )
     {
         CV_Assert(photometric == PHOTOMETRIC_LOGLUV);
         if (m_use_rgb)
@@ -1176,7 +1183,7 @@ TiffEncoder::TiffEncoder()
 {
     m_description = "TIFF Files (*.tiff;*.tif)";
     m_buf_supported = true;
-    m_supported_encode_key = {IMWRITE_TIFF_RESUNIT, IMWRITE_TIFF_XDPI, IMWRITE_TIFF_YDPI, IMWRITE_TIFF_COMPRESSION, IMWRITE_TIFF_ROWSPERSTRIP, IMWRITE_TIFF_PREDICTOR};
+    m_supported_encode_key = {IMWRITE_TIFF_RESUNIT, IMWRITE_TIFF_XDPI, IMWRITE_TIFF_YDPI, IMWRITE_TIFF_COMPRESSION, IMWRITE_TIFF_ROWSPERSTRIP, IMWRITE_TIFF_PREDICTOR, IMWRITE_TIFF_COMPRESSION_LEVEL};
 }
 
 TiffEncoder::~TiffEncoder()
@@ -1191,7 +1198,11 @@ ImageEncoder TiffEncoder::newEncoder() const
 
 bool TiffEncoder::isFormatSupported( int depth ) const
 {
-    return depth == CV_8U || depth == CV_8S || depth == CV_16U || depth == CV_16S || depth == CV_32S || depth == CV_32F || depth == CV_64F;
+    return depth == CV_8U  || depth == CV_8S  ||
+           depth == CV_16U || depth == CV_16S ||
+           depth == CV_32U || depth == CV_32S ||
+           depth == CV_64U || depth == CV_64S ||
+           depth == CV_32F || depth == CV_64F;
 }
 
 class TiffEncoderBufHelper
@@ -1317,6 +1328,8 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
     const int predictor_default_32F = IMWRITE_TIFF_PREDICTOR_FLOATINGPOINT;
     const int predictor_default = IMWRITE_TIFF_PREDICTOR_HORIZONTAL;
     int compression = -1;
+    int compressionLevel = -1;
+    std::pair<int, int> compressionLevelValidRange = {-1, -1};
     int predictor = -1;
     int resUnit = -1, dpiX = -1, dpiY = -1;
 
@@ -1359,6 +1372,62 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
                 CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION must be one of ImwriteTiffCompressionFlags. It is fallbacked to IMWRITE_TIFF_COMPRESSION_LZW", compression));
                 compression = IMWRITE_TIFF_COMPRESSION_LZW;
                 break;
+        }
+
+        if (!TIFFIsCODECConfigured(static_cast<uint16_t>(compression)))
+        {
+            // this compression schema is not available with using libtiff.
+            if (TIFFIsCODECConfigured(static_cast<uint16_t>(IMWRITE_TIFF_COMPRESSION_LZW)))
+            {
+                // use LZW instead of specified compression schema.
+                CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION is not available, It is fallbacked to IMWRITE_TIFF_COMPRESSION_LZW", compression));
+                compression = IMWRITE_TIFF_COMPRESSION_LZW;
+            }
+            else
+            {
+                // use NONE instead of LZW which is not available too.
+                CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION is not available, It is fallbacked to IMWRITE_TIFF_COMPRESSION_NONE", compression));
+                compression = IMWRITE_TIFF_COMPRESSION_NONE;
+            }
+        }
+    }
+    switch (compression) {
+        case IMWRITE_TIFF_COMPRESSION_DEFLATE:
+        case IMWRITE_TIFF_COMPRESSION_ADOBE_DEFLATE:
+            compressionLevelValidRange = std::make_pair(1, 9);
+            break;
+        case IMWRITE_TIFF_COMPRESSION_LZMA:
+            compressionLevelValidRange = std::make_pair(0, 9);
+            break;
+        case IMWRITE_TIFF_COMPRESSION_ZSTD:
+            compressionLevelValidRange = std::make_pair(1, 22);
+            break;
+        case IMWRITE_TIFF_COMPRESSION_WEBP:
+            compressionLevelValidRange = std::make_pair(1, 100);
+            break;
+        default:
+          break;
+    }
+
+    if (readParam(params, IMWRITE_TIFF_COMPRESSION_LEVEL, compressionLevel))
+    {
+        const bool isValidCompression =
+          (compression == IMWRITE_TIFF_COMPRESSION_DEFLATE) ||
+          (compression == IMWRITE_TIFF_COMPRESSION_ADOBE_DEFLATE) ||
+          (compression == IMWRITE_TIFF_COMPRESSION_LZMA) ||
+          (compression == IMWRITE_TIFF_COMPRESSION_ZSTD) ||
+          (compression == IMWRITE_TIFF_COMPRESSION_WEBP);
+        const bool isValidValue = (compressionLevel == -1) ||
+          ((compressionLevel >= compressionLevelValidRange.first) && (compressionLevel <= compressionLevelValidRange.second));
+        if (!isValidCompression) {
+            CV_LOG_WARNING(nullptr, cv::format("IMWRITE_TIFF_COMPRESSION_LEVEL can only be used for DEFLATE, LZMA, ZSTD or WEBP compression. It is ignored."));
+            compressionLevel = -1;
+        }
+        else if (!isValidValue) {
+            CV_LOG_WARNING(nullptr, cv::format("The value(%d) for IMWRITE_TIFF_COMPRESSION_LEVEL=%d must be in the range %d-%d (or -1 for default). It is set to default.",
+              compressionLevel, compression,
+              compressionLevelValidRange.first, compressionLevelValidRange.second));
+            compressionLevel = -1;
         }
     }
     if(readParam(params, IMWRITE_TIFF_PREDICTOR, predictor))
@@ -1412,7 +1481,7 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
         int width = img.cols, height = img.rows;
         int type = img.type();
         int depth = CV_MAT_DEPTH(type);
-        CV_CheckType(type, depth == CV_8U || depth == CV_8S || depth == CV_16U || depth == CV_16S || depth == CV_32S || depth == CV_32F || depth == CV_64F, "");
+        CV_CheckDepth(type, isFormatSupported(depth), "Unsupported depth of input image");
         CV_CheckType(type, channels >= 1 && channels <= 4, "");
 
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_IMAGEWIDTH, width));
@@ -1462,7 +1531,7 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
         {
             case CV_8U:
                 sample_format = SAMPLEFORMAT_UINT;
-                /* FALLTHRU */
+                [[fallthrough]];
             case CV_8S:
             {
                 bitsPerChannel = 8;
@@ -1471,10 +1540,17 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
 
             case CV_16U:
                 sample_format = SAMPLEFORMAT_UINT;
-                /* FALLTHRU */
+                [[fallthrough]];
             case CV_16S:
             {
                 bitsPerChannel = 16;
+                break;
+            }
+
+            case CV_32U:
+            {
+                bitsPerChannel = 32;
+                sample_format = SAMPLEFORMAT_UINT;
                 break;
             }
 
@@ -1484,6 +1560,21 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
                 sample_format = SAMPLEFORMAT_INT;
                 break;
             }
+
+            case CV_64U:
+            {
+                bitsPerChannel = 64;
+                sample_format = SAMPLEFORMAT_UINT;
+                break;
+            }
+
+            case CV_64S:
+            {
+                bitsPerChannel = 64;
+                sample_format = SAMPLEFORMAT_INT;
+                break;
+            }
+
             case CV_32F:
             {
                 bitsPerChannel = 32;
@@ -1503,6 +1594,16 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
             }
         }
 
+// Predictor 2 for 64-bit is supported at v4.4.0 or later.
+// See https://libtiff.gitlab.io/libtiff/releases/v4.4.0.html
+#if TIFFLIB_VERSION < 20220520 /* Magic number of libtiff v4.4.0 */
+        if ( (bitsPerChannel == 64) && (page_predictor == PREDICTOR_HORIZONTAL /* 2 */) )
+        {
+            CV_LOG_ONCE_WARNING(NULL, "Predictor 2(HORIZONTAL) for 64-bit is supported at v4.4.0 or later, so it is fallbacked to 0(NONE)");
+            page_predictor = PREDICTOR_NONE;
+        }
+#endif
+
         const int bitsPerByte = 8;
         size_t fileStep = (width * channels * bitsPerChannel) / bitsPerByte;
         CV_Assert(fileStep > 0);
@@ -1515,6 +1616,40 @@ bool TiffEncoder::writeLibTiff( const std::vector<Mat>& img_vec, const std::vect
 
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_BITSPERSAMPLE, bitsPerChannel));
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_COMPRESSION, page_compression));
+        if (compressionLevel >= 0)
+        {
+          switch(page_compression)
+          {
+            case IMWRITE_TIFF_COMPRESSION_DEFLATE:
+            case IMWRITE_TIFF_COMPRESSION_ADOBE_DEFLATE:
+                CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_ZIPQUALITY, compressionLevel));
+                break;
+            case IMWRITE_TIFF_COMPRESSION_LZMA:
+                #ifdef TIFFTAG_LZMAPRESET // libtiff 4.0.0+
+                CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_LZMAPRESET, compressionLevel));
+                #else
+                CV_LOG_WARNING(nullptr, cv::format("The LZMA compression(%d) is not supported in that build of the TIFF library. It is ignored.", page_compression));
+                #endif
+                break;
+            case IMWRITE_TIFF_COMPRESSION_ZSTD:
+                #ifdef TIFFTAG_ZSTD_LEVEL // libtiff 4.0.10+
+                CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_ZSTD_LEVEL, compressionLevel));
+                #else
+                CV_LOG_WARNING(nullptr, cv::format("The ZSTD compression(%d) is not supported in that build of the TIFF library. It is ignored.", page_compression));
+                #endif
+                break;
+            case IMWRITE_TIFF_COMPRESSION_WEBP:
+                #ifdef TIFFTAG_WEBP_LEVEL // libtiff 4.0.10+
+                CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_WEBP_LEVEL, compressionLevel));
+                #else
+                CV_LOG_WARNING(nullptr, cv::format("The WEBP compression(%d) is not supported in that build of the TIFF library. It is ignored.", page_compression));
+                #endif
+                break;
+            default:
+                CV_LOG_WARNING(nullptr, cv::format("Unexpected page_compression %d", page_compression));
+                break;
+          }//end switch(page_compression)
+        }//end if (compressionLevel >= 0)
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_PHOTOMETRIC, colorspace));
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_SAMPLESPERPIXEL, channels));
         CV_TIFF_CHECK_CALL(TIFFSetField(tif, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG));
@@ -1654,7 +1789,7 @@ bool  TiffEncoder::write( const Mat& img, const std::vector<int>& params)
     int type = img.type();
     int depth = CV_MAT_DEPTH(type);
 
-    CV_CheckType(type, depth == CV_8U || depth == CV_8S || depth == CV_16U || depth == CV_16S || depth == CV_32S || depth == CV_32F || depth == CV_64F, "");
+    CV_CheckDepth(type, isFormatSupported(depth), "Unsupported depth of input image");
 
     std::vector<Mat> img_vec;
     img_vec.push_back(img);
@@ -1665,24 +1800,16 @@ static void extend_cvtColor( InputArray _src, OutputArray _dst, int code )
 {
     CV_Assert( !_src.empty() );
     CV_Assert( _src.dims() == 2 );
+    CV_Assert( (code == COLOR_BGR2RGB) || (code == COLOR_BGRA2RGBA) );
 
     // This function extend_cvtColor reorders the src channels with only thg limited condition.
     // Otherwise, it calls cvtColor.
 
     const int stype = _src.type();
-    if(!
-        (
-            (
-                ( stype == CV_8SC3  ) || ( stype == CV_8SC4  ) ||
-                ( stype == CV_16SC3 ) || ( stype == CV_16SC4 ) ||
-                ( stype == CV_32SC3 ) || ( stype == CV_32SC4 ) ||
-                ( stype == CV_64FC3 ) || ( stype == CV_64FC4 )
-            )
-            &&
-            (
-                ( code == COLOR_BGR2RGB ) || ( code == COLOR_BGRA2RGBA )
-            )
-        )
+    if(
+        ( stype == CV_8UC3  ) || ( stype == CV_8UC4  ) ||
+        ( stype == CV_16UC3 ) || ( stype == CV_16UC4 ) ||
+        ( stype == CV_32FC3 ) || ( stype == CV_32FC4 )
     )
     {
         cvtColor( _src, _dst, code );

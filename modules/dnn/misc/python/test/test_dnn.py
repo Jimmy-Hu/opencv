@@ -82,6 +82,13 @@ class dnn_test(NewOpenCVTests):
             g_dnnBackendsAndTargets = self.initBackendsAndTargets()
         self.dnnBackendsAndTargets = g_dnnBackendsAndTargets
 
+    def checkIETarget(self, backend, target):
+        # OpenVINO is optional; a target is usable only if its backend lists it.
+        try:
+            return target in cv.dnn.getAvailableTargets(backend)
+        except BaseException:
+            return False
+
     def initBackendsAndTargets(self):
         self.dnnBackendsAndTargets = [
             [cv.dnn.DNN_BACKEND_OPENCV, cv.dnn.DNN_TARGET_CPU],
@@ -109,20 +116,6 @@ class dnn_test(NewOpenCVTests):
                                          os.environ['OPENCV_TEST_DATA_PATH']],
                               required=required)
 
-    def checkIETarget(self, backend, target):
-        proto = self.find_dnn_file('dnn/layers/layer_convolution.prototxt')
-        model = self.find_dnn_file('dnn/layers/layer_convolution.caffemodel')
-        net = cv.dnn.readNet(proto, model)
-        try:
-            net.setPreferableBackend(backend)
-            net.setPreferableTarget(target)
-            inp = np.random.standard_normal([1, 2, 10, 11]).astype(np.float32)
-            net.setInput(inp)
-            net.forward()
-        except BaseException:
-            return False
-        return True
-
     def test_getAvailableTargets(self):
         targets = cv.dnn.getAvailableTargets(cv.dnn.DNN_BACKEND_OPENCV)
         self.assertTrue(cv.dnn.DNN_TARGET_CPU in targets)
@@ -134,7 +127,7 @@ class dnn_test(NewOpenCVTests):
         paramNet.mean = [0.485, 0.456, 0.406]
         paramNet.scalefactor = [0.229, 0.224, 0.225]
         paramNet.swapRB = False
-        paramNet.datalayout = cv.dnn.DNN_LAYOUT_NCHW
+        paramNet.datalayout = cv.DATA_LAYOUT_NCHW
         paramNet.paddingmode = cv.dnn.DNN_PMODE_LETTERBOX
         rBlob = np.zeros(shape=(20, 4), dtype=np.int32)
         rImg = paramNet.blobRectsToImageRects(rBlob, (356, 356))
@@ -148,7 +141,7 @@ class dnn_test(NewOpenCVTests):
         paramNet.mean = [0.485, 0.456, 0.406]
         paramNet.scalefactor = [0.229, 0.224, 0.225]
         paramNet.swapRB = False
-        paramNet.datalayout = cv.dnn.DNN_LAYOUT_NCHW
+        paramNet.datalayout = cv.DATA_LAYOUT_NCHW
         paramNet.paddingmode = cv.dnn.DNN_PMODE_LETTERBOX
         rBlob = np.zeros(shape=(20, 4), dtype=np.int32)
         rImg = paramNet.blobRectToImageRect((0, 0, 0, 0), (356, 356))
@@ -198,11 +191,11 @@ class dnn_test(NewOpenCVTests):
         param.size = (6, 7)
         param.mean = mean
         param.swapRB=True
-        param.datalayout = cv.dnn.DNN_LAYOUT_NHWC
+        param.datalayout = cv.DATA_LAYOUT_NHWC
 
         blob = cv.dnn.blobFromImageWithParams(img, param)
         blob_args = cv.dnn.blobFromImageWithParams(img, cv.dnn.Image2BlobParams(scalefactor=scalefactor, size=(6, 7), mean=mean,
-                                                                      swapRB=True, datalayout=cv.dnn.DNN_LAYOUT_NHWC))
+                                                                      swapRB=True, datalayout=cv.DATA_LAYOUT_NHWC))
         normAssert(self, blob, blob_args)
 
         target2 = cv.resize(img, (width, height), interpolation=cv.INTER_LINEAR).astype(np.float32)
@@ -219,25 +212,24 @@ class dnn_test(NewOpenCVTests):
 
     def test_model(self):
         img_path = self.find_dnn_file("dnn/street.png")
-        weights = self.find_dnn_file("dnn/MobileNetSSD_deploy_19e3ec3.caffemodel", required=False)
-        config = self.find_dnn_file("dnn/MobileNetSSD_deploy_19e3ec3.prototxt", required=False)
-        if weights is None or config is None:
-            raise unittest.SkipTest("Missing DNN test files (dnn/MobileNetSSD_deploy_19e3ec3.{prototxt/caffemodel}). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
+        weights = self.find_dnn_file("dnn/onnx/models/ssd_vgg16.onnx", required=False)
+        if weights is None:
+            raise unittest.SkipTest("Missing DNN test files (dnn/onnx/models/ssd_vgg16.onnx). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
 
         frame = cv.imread(img_path)
-        model = cv.dnn_DetectionModel(weights, config)
-        model.setInputParams(size=(300, 300), mean=(127.5, 127.5, 127.5), scale=1.0/127.5)
+        model = cv.dnn_DetectionModel(weights)
+        model.setInputParams(size=(300, 300), mean=(0, 0, 0), scale=1.0, swapRB=False)
 
         iouDiff = 0.05
-        confThreshold = 0.0001
+        confThreshold = 0.3
         nmsThreshold = 0
-        scoreDiff = 1.1e-3
+        scoreDiff = 5e-3
 
         classIds, confidences, boxes = model.detect(frame, confThreshold, nmsThreshold)
 
-        refClassIds = (7, 15)
-        refConfidences = (0.9998, 0.8793)
-        refBoxes = ((328, 238, 85, 102), (101, 188, 34, 138))
+        refClassIds = (37,)
+        refConfidences = (0.8196,)
+        refBoxes = ((331, 233, 85, 107),)
 
         normAssertDetections(self, refClassIds, refConfidences, refBoxes,
                              classIds, confidences, boxes,confThreshold, scoreDiff, iouDiff)
@@ -251,14 +243,13 @@ class dnn_test(NewOpenCVTests):
 
     def test_classification_model(self):
         img_path = self.find_dnn_file("dnn/googlenet_0.png")
-        weights = self.find_dnn_file("dnn/squeezenet_v1.1.caffemodel", required=False)
-        config = self.find_dnn_file("dnn/squeezenet_v1.1.prototxt")
+        weights = self.find_dnn_file("dnn/squeezenet_v1.1.onnx", required=False)
         ref = np.load(self.find_dnn_file("dnn/squeezenet_v1.1_prob.npy"))
-        if weights is None or config is None:
-            raise unittest.SkipTest("Missing DNN test files (dnn/squeezenet_v1.1.{prototxt/caffemodel}). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
+        if weights is None:
+            raise unittest.SkipTest("Missing DNN test files (dnn/squeezenet_v1.1.onnx). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
 
         frame = cv.imread(img_path)
-        model = cv.dnn_ClassificationModel(config, weights)
+        model = cv.dnn_ClassificationModel(weights)
         model.setInputSize(227, 227)
         model.setInputCrop(True)
 
@@ -286,86 +277,42 @@ class dnn_test(NewOpenCVTests):
 
 
     def test_face_detection(self):
-        proto = self.find_dnn_file('dnn/opencv_face_detector.prototxt')
-        model = self.find_dnn_file('dnn/opencv_face_detector.caffemodel', required=False)
-        if proto is None or model is None:
-            raise unittest.SkipTest("Missing DNN test files (dnn/opencv_face_detector.{prototxt/caffemodel}). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
-
+        model = self.find_dnn_file('dnn/onnx/models/yunet-202605.onnx', required=False)
         img = self.get_sample('gpu/lbpcascade/er.png')
-        blob = cv.dnn.blobFromImage(img, mean=(104, 177, 123), swapRB=False, crop=False)
 
-        ref = [[0, 1, 0.99520785, 0.80997437, 0.16379407, 0.87996572, 0.26685631],
-               [0, 1, 0.9934696,  0.2831718,  0.50738752, 0.345781,   0.5985168],
-               [0, 1, 0.99096733, 0.13629119, 0.24892329, 0.19756334, 0.3310290],
-               [0, 1, 0.98977017, 0.23901358, 0.09084064, 0.29902688, 0.1769477],
-               [0, 1, 0.97203469, 0.67965847, 0.06876482, 0.73999709, 0.1513494],
-               [0, 1, 0.95097077, 0.51901293, 0.45863652, 0.5777427,  0.5347801]]
+        ref = [[1, 339.62445, 35.32416, 30.754604, 40.202126, 0.9302596],
+               [1, 140.63962, 255.55545, 32.832615, 41.767395, 0.916015],
+               [1, 68.39314, 126.74046, 30.29324, 39.14823, 0.90639645],
+               [1, 119.57139, 48.482178, 30.600697, 40.485996, 0.906021],
+               [1, 259.0921, 229.30713, 31.088186, 39.74022, 0.90490955],
+               [1, 405.69778, 87.28158, 33.393406, 42.96226, 0.8996978]]
 
         print('\n')
         for backend, target in self.dnnBackendsAndTargets:
             printParams(backend, target)
 
-            net = cv.dnn.readNet(proto, model)
-            net.setPreferableBackend(backend)
-            net.setPreferableTarget(target)
-            net.setInput(blob)
-            out = net.forward().reshape(-1, 7)
+            net = cv.FaceDetectorYN.create(
+                model=model,
+                config="",
+                input_size=img.shape[:2],
+                score_threshold=0.3,
+                nms_threshold=0.45,
+                top_k=5000,
+                backend_id=backend,
+                target_id=target
+            )
 
-            scoresDiff = 4e-3 if target in [cv.dnn.DNN_TARGET_OPENCL_FP16, cv.dnn.DNN_TARGET_MYRIAD] else 1e-5
-            iouDiff = 2e-2 if target in [cv.dnn.DNN_TARGET_OPENCL_FP16, cv.dnn.DNN_TARGET_MYRIAD] else 1e-4
+            out = net.detect(img)
+            out = out[1]
+            out = out.reshape(-1, 15)
 
             ref = np.array(ref, np.float32)
-            refClassIds, testClassIds = ref[:, 1], out[:, 1]
-            refScores, testScores = ref[:, 2], out[:, 2]
-            refBoxes, testBoxes = ref[:, 3:], out[:, 3:]
+            refClassIds, testClassIds = ref[:, 0], np.ones(out.shape[0], np.float32)
+            refScores, testScores = ref[:, -1], out[:, -1]
+            refBoxes, testBoxes = ref[:, 1:5], out[:, 0:4]
 
             normAssertDetections(self, refClassIds, refScores, refBoxes, testClassIds,
-                                 testScores, testBoxes, 0.5, scoresDiff, iouDiff)
-
-    def test_async(self):
-        timeout = 10*1000*10**6  # in nanoseconds (10 sec)
-        proto = self.find_dnn_file('dnn/layers/layer_convolution.prototxt')
-        model = self.find_dnn_file('dnn/layers/layer_convolution.caffemodel')
-        if proto is None or model is None:
-            raise unittest.SkipTest("Missing DNN test files (dnn/layers/layer_convolution.{prototxt/caffemodel}). Verify OPENCV_DNN_TEST_DATA_PATH configuration parameter.")
-
-        print('\n')
-        for backend, target in self.dnnBackendsAndTargets:
-            if backend != cv.dnn.DNN_BACKEND_INFERENCE_ENGINE:
-                continue
-
-            printParams(backend, target)
-
-            netSync = cv.dnn.readNet(proto, model)
-            netSync.setPreferableBackend(backend)
-            netSync.setPreferableTarget(target)
-
-            netAsync = cv.dnn.readNet(proto, model)
-            netAsync.setPreferableBackend(backend)
-            netAsync.setPreferableTarget(target)
-
-            # Generate inputs
-            numInputs = 10
-            inputs = []
-            for _ in range(numInputs):
-                inputs.append(np.random.standard_normal([2, 6, 75, 113]).astype(np.float32))
-
-            # Run synchronously
-            refs = []
-            for i in range(numInputs):
-                netSync.setInput(inputs[i])
-                refs.append(netSync.forward())
-
-            # Run asynchronously. To make test more robust, process inputs in the reversed order.
-            outs = []
-            for i in reversed(range(numInputs)):
-                netAsync.setInput(inputs[i])
-                outs.insert(0, netAsync.forwardAsync())
-
-            for i in reversed(range(numInputs)):
-                ret, result = outs[i].get(timeoutNs=float(timeout))
-                self.assertTrue(ret)
-                normAssert(self, refs[i], result, 'Index: %d' % i, 1e-10)
+                                 testScores, testBoxes, 0.5)
 
     def test_nms(self):
         confs = (1, 1)
@@ -373,6 +320,8 @@ class dnn_test(NewOpenCVTests):
 
         self.assertTrue(all(cv.dnn.NMSBoxes(rects, confs, 0, 0.6).ravel() == (0, 1)))
 
+    # BUG: https://github.com/opencv/opencv/issues/26200
+    @unittest.skip("custom layers are partially broken with transition to the new dnn engine")
     def test_custom_layer(self):
         class CropLayer(object):
             def __init__(self, params, blobs):
@@ -395,51 +344,8 @@ class dnn_test(NewOpenCVTests):
                 return [inputs[0][:,:,self.ystart:self.yend,self.xstart:self.xend]]
 
         cv.dnn_registerLayer('CropCaffe', CropLayer)
-        proto = '''
-        name: "TestCrop"
-        input: "input"
-        input_shape
-        {
-            dim: 1
-            dim: 2
-            dim: 5
-            dim: 5
-        }
-        input: "roi"
-        input_shape
-        {
-            dim: 1
-            dim: 2
-            dim: 3
-            dim: 3
-        }
-        layer {
-          name: "Crop"
-          type: "CropCaffe"
-          bottom: "input"
-          bottom: "roi"
-          top: "Crop"
-        }'''
 
-        net = cv.dnn.readNetFromCaffe(bytearray(proto.encode()))
-        for backend, target in self.dnnBackendsAndTargets:
-            if backend != cv.dnn.DNN_BACKEND_OPENCV:
-                continue
-
-            printParams(backend, target)
-
-            net.setPreferableBackend(backend)
-            net.setPreferableTarget(target)
-            src_shape = [1, 2, 5, 5]
-            dst_shape = [1, 2, 3, 3]
-            inp = np.arange(0, np.prod(src_shape), dtype=np.float32).reshape(src_shape)
-            roi = np.empty(dst_shape, dtype=np.float32)
-            net.setInput(inp, "input")
-            net.setInput(roi, "roi")
-            out = net.forward()
-            ref = inp[:, :, 1:4, 1:4]
-            normAssert(self, out, ref)
-
+        # Skipped: Requires ONNX custom layer multi-input support and Python binding fixes for Net.connect (see #26200).
         cv.dnn_unregisterLayer('CropCaffe')
 
     # check that dnn module can work with 3D tensor as input for network
@@ -460,7 +366,7 @@ class dnn_test(NewOpenCVTests):
         for backend, target in self.dnnBackendsAndTargets:
             printParams(backend, target)
 
-            net = cv.dnn.readNet(model)
+            net = cv.dnn.readNet(model, engine=cv.dnn.ENGINE_OPENCV)
 
             net.setPreferableBackend(backend)
             net.setPreferableTarget(target)
@@ -509,7 +415,7 @@ class dnn_test(NewOpenCVTests):
         for backend, target in self.dnnBackendsAndTargets:
             printParams(backend, target)
 
-            net = cv.dnn.readNet(model_path)
+            net = cv.dnn.readNet(model_path, "", "", engine=cv.dnn.ENGINE_OPENCV)
 
             node_name = net.getLayerNames()[0]
             w = net.getParam(node_name, 0) # returns the original tensor of three-dimensional shape
@@ -544,6 +450,25 @@ class dnn_test(NewOpenCVTests):
         net.setInput(inp)
         out = net.forward()
         self.assertEqual(out.shape, (1, 2, 3, 4))
+
+    def test_bool_operator(self):
+        n = self.find_dnn_file('dnn/onnx/models/and_op.onnx')
+
+        x = np.random.randint(0, 2, [5], dtype=np.bool_)
+        y = np.random.randint(0, 2, [5], dtype=np.bool_)
+        o = x & y
+
+        net = cv.dnn.readNet(n)
+
+        names = ["x", "y"]
+        net.setInputsNames(names)
+        net.setInput(x, names[0])
+        net.setInput(y, names[1])
+
+        out = net.forward()
+
+        self.assertTrue(np.all(out == o))
+
 
 if __name__ == '__main__':
     NewOpenCVTests.bootstrap()

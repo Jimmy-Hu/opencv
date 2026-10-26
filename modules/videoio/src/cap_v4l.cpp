@@ -214,6 +214,7 @@ make & enjoy!
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -1647,15 +1648,15 @@ static inline int capPropertyToV4L2(int prop)
 {
     switch (prop) {
     case cv::CAP_PROP_FPS:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_FOURCC:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_FRAME_COUNT:
         return V4L2_CID_MPEG_VIDEO_B_FRAMES;
     case cv::CAP_PROP_FORMAT:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_MODE:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_BRIGHTNESS:
         return V4L2_CID_BRIGHTNESS;
     case cv::CAP_PROP_CONTRAST:
@@ -1669,13 +1670,13 @@ static inline int capPropertyToV4L2(int prop)
     case cv::CAP_PROP_EXPOSURE:
         return V4L2_CID_EXPOSURE_ABSOLUTE;
     case cv::CAP_PROP_CONVERT_RGB:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_WHITE_BALANCE_BLUE_U:
         return V4L2_CID_BLUE_BALANCE;
     case cv::CAP_PROP_RECTIFICATION:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_MONOCHROME:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_SHARPNESS:
         return V4L2_CID_SHARPNESS;
     case cv::CAP_PROP_AUTO_EXPOSURE:
@@ -1685,9 +1686,9 @@ static inline int capPropertyToV4L2(int prop)
     case cv::CAP_PROP_TEMPERATURE:
         return V4L2_CID_WHITE_BALANCE_TEMPERATURE;
     case cv::CAP_PROP_TRIGGER:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_TRIGGER_DELAY:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_WHITE_BALANCE_RED_V:
         return V4L2_CID_RED_BALANCE;
     case cv::CAP_PROP_ZOOM:
@@ -1695,7 +1696,7 @@ static inline int capPropertyToV4L2(int prop)
     case cv::CAP_PROP_FOCUS:
         return V4L2_CID_FOCUS_ABSOLUTE;
     case cv::CAP_PROP_GUID:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_ISO_SPEED:
         return V4L2_CID_ISO_SENSITIVITY;
     case cv::CAP_PROP_BACKLIGHT:
@@ -1709,9 +1710,9 @@ static inline int capPropertyToV4L2(int prop)
     case cv::CAP_PROP_IRIS:
         return V4L2_CID_IRIS_ABSOLUTE;
     case cv::CAP_PROP_SETTINGS:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_BUFFERSIZE:
-        return -1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_AUTOFOCUS:
         return V4L2_CID_FOCUS_AUTO;
     case cv::CAP_PROP_SAR_NUM:
@@ -1725,7 +1726,7 @@ static inline int capPropertyToV4L2(int prop)
     default:
         break;
     }
-    return -1;
+    return CAP_PROP_UNKNOWN;
 }
 
 static inline bool compatibleRange(int property_id)
@@ -1769,6 +1770,7 @@ bool CvCaptureCAM_V4L::controlInfo(int property_id, __u32 &_v4l2id, cv::Range &r
             break;
         case CAP_PROP_AUTO_EXPOSURE:
             range = Range(0, 4);
+            break;
         default:
             break;
         }
@@ -1842,7 +1844,7 @@ double CvCaptureCAM_V4L::getProperty(int property_id) const
         sp.type = type;
         if (!tryIoctl(VIDIOC_G_PARM, &sp)) {
             CV_LOG_WARNING(NULL, "VIDEOIO(V4L2:" << deviceName << "): Unable to get camera FPS");
-            return -1;
+            return CAP_PROP_UNKNOWN;
         }
         return sp.parm.capture.timeperframe.denominator / (double)sp.parm.capture.timeperframe.numerator;
     }
@@ -1858,13 +1860,13 @@ double CvCaptureCAM_V4L::getProperty(int property_id) const
         cv::Range range;
         __u32 v4l2id;
         if(!controlInfo(property_id, v4l2id, range))
-            return -1.0;
-        int value = 0;
+            return CAP_PROP_UNKNOWN;
+        int value = CAP_PROP_UNKNOWN;
         if(!icvControl(v4l2id, value, false))
-            return -1.0;
+            return CAP_PROP_UNKNOWN;
         if (normalizePropRange && compatibleRange(property_id))
             return ((double)value - range.start) / range.size();
-        return  value;
+        return (double) value;
     }
     }
 }
@@ -2262,6 +2264,68 @@ bool VideoCapture_V4L_waitAny(const std::vector<VideoCapture>& streams, CV_OUT s
     }
     return res;
 }
+
+std::vector<VideoDeviceInfo> enumerate_V4L_devices()
+{
+    std::vector<VideoDeviceInfo> result;
+    std::vector<int> indices;
+
+    DIR* dir = ::opendir("/dev");
+    if (!dir)
+        return result;
+
+    while (const dirent* ent = ::readdir(dir))
+    {
+        const char* name = ent->d_name;
+        if (strncmp(name, "video", 5) != 0 || name[5] == '\0')
+            continue;
+        const char* p = name + 5;
+        while (*p >= '0' && *p <= '9')
+            ++p;
+        if (*p != '\0')
+            continue;
+        indices.push_back(atoi(name + 5));
+    }
+    ::closedir(dir);
+    std::sort(indices.begin(), indices.end());
+
+    for (size_t i = 0; i < indices.size(); ++i)
+    {
+        const int index = indices[i];
+        const std::string path = cv::format("/dev/video%d", index);
+        int fd = ::open(path.c_str(), O_RDONLY | O_NONBLOCK);
+        if (fd == -1)
+            continue;
+
+        v4l2_capability capability = v4l2_capability();
+        int res;
+        do {
+            res = ioctl(fd, VIDIOC_QUERYCAP, &capability);
+        } while (res == -1 && errno == EINTR);
+        ::close(fd);
+
+        if (res == -1)
+            continue;
+
+        #ifdef V4L2_CAP_DEVICE_CAPS
+            const __u32 caps = (capability.capabilities & V4L2_CAP_DEVICE_CAPS)
+                            ? capability.device_caps
+                            : capability.capabilities;
+        #else
+            const __u32 caps = capability.capabilities;
+        #endif
+
+        if ((caps & (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_VIDEO_CAPTURE_MPLANE)) == 0)
+            continue;
+
+        const char* card = reinterpret_cast<const char*>(capability.card);
+        const std::string name(card, strnlen(card, sizeof(capability.card)));
+
+        result.push_back(makeVideoDeviceInfo(index, CAP_V4L2, name));
+    }
+    return result;
+}
+
 
 } // cv::
 

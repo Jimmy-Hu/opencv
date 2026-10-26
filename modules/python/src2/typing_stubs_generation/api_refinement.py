@@ -10,7 +10,8 @@ from .nodes import (NamespaceNode, FunctionNode, OptionalTypeNode, TypeNode,
                     TupleTypeNode, UnionTypeNode, ProtocolClassNode,
                     DictTypeNode, ClassTypeNode, AliasRefTypeNode)
 from .ast_utils import (find_function_node, SymbolName,
-                        for_each_function_overload)
+                        for_each_function_overload, ScopeNotFoundError,
+                        SymbolNotFoundError)
 from .types_conversion import create_type_node
 
 
@@ -24,7 +25,11 @@ def apply_manual_api_refinement(root: NamespaceNode) -> None:
     builtin_exception.is_exported = False
     root.add_class("error", (builtin_exception, ), ERROR_CLASS_PROPERTIES)
     for symbol_name, refine_symbol in NODES_TO_REFINE.items():
-        refine_symbol(root, symbol_name)
+        try:
+            refine_symbol(root, symbol_name)
+        except (ScopeNotFoundError, SymbolNotFoundError):
+            # Function is not part of this build, e.g. its module is disabled
+            continue
     version_constant = root.add_constant("__version__", "<unused>")
     version_constant._value_type = "str"
 
@@ -71,8 +76,8 @@ def make_optional_none_return(root_node: NamespaceNode,
 def export_matrix_type_constants(root: NamespaceNode) -> None:
     MAX_PREDEFINED_CHANNELS = 4
 
-    depth_names = ("CV_8U", "CV_8S", "CV_16U", "CV_16S", "CV_32S",
-                   "CV_32F", "CV_64F", "CV_16F")
+    depth_names = ("CV_8U", "CV_8S", "CV_16U", "CV_16S", "CV_32U", "CV_32S",
+                   "CV_64U", "CV_64S", "CV_32F", "CV_64F", "CV_16F", "CV_16BF" "CV_Bool")
     for depth_value, depth_name in enumerate(depth_names):
         # Export depth constants
         root.add_constant(depth_name, str(depth_value))
@@ -432,7 +437,44 @@ def make_matlike_or_scalar_arg(*arg_names: str) -> Callable[[NamespaceNode, Symb
     return _make_matlike_or_scalar_arg
 
 
+def refine_min_max(root_node: NamespaceNode,
+                   function_symbol_name: SymbolName) -> None:
+    make_matlike_or_scalar_arg("src2")(root_node, function_symbol_name)
+    function = find_function_node(root_node, function_symbol_name)
+    for overload in tuple(function.overloads):
+        first_type = cast(TypeNode, overload.arguments[0].type_node)
+        if first_type.typename == "UMat":
+            # Keep Scalar/Scalar on Mat without overlapping UMat signatures.
+            function.add_overload([
+                FunctionNode.Arg("src1", AliasRefTypeNode("Scalar")),
+                FunctionNode.Arg("src2", first_type),
+                *overload.arguments[2:],
+            ], overload.return_type)
+        else:
+            overload.arguments[0].type_node = UnionTypeNode(
+                "src1_type", (first_type, AliasRefTypeNode("Scalar"))
+            )
+
+def refine_umat_constructor(root_node: NamespaceNode,
+                            function_symbol_name: SymbolName) -> None:
+    # shadow_umat.hpp maps Mat inputs even though C++ constructors declare UMat.
+    constructor = find_function_node(root_node, function_symbol_name)
+    for overload in constructor.overloads:
+        index = _find_argument_index(overload.arguments, "m")
+        if index is not None:
+            argument = overload.arguments[index]
+            argument.type_node = UnionTypeNode(
+                "umat_input", (cast(TypeNode, argument.type_node), AliasRefTypeNode("MatLike"))
+            )
+
+
 NODES_TO_REFINE = {
+    SymbolName(("cv", ), (), "min"): refine_min_max,
+    SymbolName(("cv", ), (), "max"): refine_min_max,
+    SymbolName(("cv", ), ("UMat", ), "UMat"): refine_umat_constructor,
+    SymbolName(("cv", ), (), "add"): make_matlike_or_scalar_arg("src2"),
+    SymbolName(("cv", ), (), "multiply"): make_matlike_or_scalar_arg("src2"),
+    SymbolName(("cv", ), (), "remap"): make_optional_arg("map2"),
     SymbolName(("cv", ), (), "resize"): make_optional_arg("dsize"),
     SymbolName(("cv", ), (), "calcHist"): make_optional_arg("mask"),
     SymbolName(("cv", ), (), "floodFill"): make_optional_arg("mask"),
@@ -455,6 +497,13 @@ NODES_TO_REFINE = {
     SymbolName(("cv", ), (), "undistortPoints"): make_optional_arg("distCoeffs"),
     SymbolName(("cv", ), (), "calibrateCamera"): make_optional_arg("cameraMatrix", "distCoeffs"),
     SymbolName(("cv", "fisheye"), (), "initUndistortRectifyMap"): make_optional_arg("D"),
+    SymbolName(("cv", ), (), "calcOpticalFlowPyrLK"): make_optional_arg("nextPts"),
+    SymbolName(("cv", ), (), "calcOpticalFlowFarneback"): make_optional_arg("flow"),
+    SymbolName(("cv", ), (), "normalize"): make_optional_arg("dst"),
+    SymbolName(("cv", ), (), "kmeans"): make_optional_arg("bestLabels"),
+    SymbolName(("cv", ), (), "drawKeypoints"): make_optional_arg("outImage"),
+    SymbolName(("cv", ), (), "drawMatches"): make_optional_arg("outImg"),
+    SymbolName(("cv", ), (), "drawMatchesKnn"): make_optional_arg("outImg"),
     SymbolName(("cv", ), (), "imread"): make_optional_none_return,
     SymbolName(("cv", ), (), "imdecode"): make_optional_none_return,
     SymbolName(("cv", ), (), "HoughCircles"): make_optional_none_return,

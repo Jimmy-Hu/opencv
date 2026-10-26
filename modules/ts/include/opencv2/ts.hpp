@@ -116,7 +116,7 @@
 # endif
 #endif
 
-#if defined(__OPENCV_BUILD) && defined(__GNUC__) && __GNUC__ >= 5
+#if defined(__OPENCV_BUILD) && defined(__GNUC__)
 //#pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wsuggest-override"
 #endif
@@ -126,7 +126,7 @@
 #pragma clang diagnostic ignored "-Winconsistent-missing-override"
 #endif
 #include "opencv2/ts/ts_gtest.h"
-#if defined(__OPENCV_BUILD) && defined(__GNUC__) && __GNUC__ >= 5
+#if defined(__OPENCV_BUILD) && defined(__GNUC__)
 //#pragma GCC diagnostic pop
 #endif
 #if defined(__OPENCV_BUILD) && defined(__clang__) && ((__clang_major__*100 + __clang_minor__) >= 1301)
@@ -219,38 +219,38 @@ void checkTestTags();
 
 void applyTestTag_(const std::string& tag);
 
-static inline void applyTestTag(const std::string& tag1, const std::string& tag2)
+inline void applyTestTag(const std::string& tag1, const std::string& tag2)
 { applyTestTag_(tag1); applyTestTag_(tag2); checkTestTags(); }
-static inline void applyTestTag(const std::string& tag1, const std::string& tag2, const std::string& tag3)
+inline void applyTestTag(const std::string& tag1, const std::string& tag2, const std::string& tag3)
 { applyTestTag_(tag1); applyTestTag_(tag2); applyTestTag_(tag3); checkTestTags(); }
-static inline void applyTestTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4)
+inline void applyTestTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4)
 { applyTestTag_(tag1); applyTestTag_(tag2); applyTestTag_(tag3); applyTestTag_(tag4); checkTestTags(); }
-static inline void applyTestTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4, const std::string& tag5)
+inline void applyTestTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4, const std::string& tag5)
 { applyTestTag_(tag1); applyTestTag_(tag2); applyTestTag_(tag3); applyTestTag_(tag4); applyTestTag_(tag5); checkTestTags(); }
 
 
 /** Append global skip test tags
 */
 void registerGlobalSkipTag(const std::string& skipTag);
-static inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2)
+inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2)
 { registerGlobalSkipTag(tag1); registerGlobalSkipTag(tag2); }
-static inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3)
+inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3)
 { registerGlobalSkipTag(tag1); registerGlobalSkipTag(tag2); registerGlobalSkipTag(tag3); }
-static inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4)
+inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4)
 { registerGlobalSkipTag(tag1); registerGlobalSkipTag(tag2); registerGlobalSkipTag(tag3); registerGlobalSkipTag(tag4); }
-static inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4,
+inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4,
     const std::string& tag5)
 {
     registerGlobalSkipTag(tag1); registerGlobalSkipTag(tag2); registerGlobalSkipTag(tag3); registerGlobalSkipTag(tag4);
     registerGlobalSkipTag(tag5);
 }
-static inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4,
+inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4,
     const std::string& tag5, const std::string& tag6)
 {
     registerGlobalSkipTag(tag1); registerGlobalSkipTag(tag2); registerGlobalSkipTag(tag3); registerGlobalSkipTag(tag4);
     registerGlobalSkipTag(tag5); registerGlobalSkipTag(tag6);
 }
-static inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4,
+inline void registerGlobalSkipTag(const std::string& tag1, const std::string& tag2, const std::string& tag3, const std::string& tag4,
     const std::string& tag5, const std::string& tag6, const std::string& tag7)
 {
     registerGlobalSkipTag(tag1); registerGlobalSkipTag(tag2); registerGlobalSkipTag(tag3); registerGlobalSkipTag(tag4);
@@ -666,8 +666,6 @@ protected:
     virtual void get_minmax_bounds( int i, int j, int type, Scalar& low, Scalar& high );
     virtual double get_success_error_level( int test_case_idx, int i, int j );
 
-    bool cvmat_allowed;
-    bool iplimage_allowed;
     bool optional_mask;
     bool element_wise_relative_error;
 
@@ -676,8 +674,31 @@ protected:
 
     enum { INPUT, INPUT_OUTPUT, OUTPUT, REF_INPUT_OUTPUT, REF_OUTPUT, TEMP, MASK, MAX_ARR };
 
-    vector<vector<void*> > test_array;
-    vector<vector<Mat> > test_mat;
+    // Helper classes to proxy specific calls to test_mat array, emulates vector<vector<void*>>
+    // allowed calls:
+    // test_array.size() - always MAX_ARR
+    // test_array[i].size()
+    // test_array[i].push_back(NULL) - only NULL is supported
+    // test_array[i].pop_back()
+    struct ProxyAccessor {
+        ProxyAccessor(ArrayTest & parent_, size_t idx_) : parent(parent_), idx(idx_) {}
+        inline void push_back(void * ptr) const { CV_Assert(ptr == NULL); parent.test_mat[idx].push_back(Mat()); }
+        inline void pop_back() const { CV_Assert(parent.test_mat[idx].size() > 0); parent.test_mat[idx].pop_back(); }
+        inline size_t size() const { return parent.test_mat[idx].size(); }
+    private:
+        ArrayTest &parent;
+        size_t idx;
+    };
+    struct ProxyInterface {
+        ProxyInterface(ArrayTest & parent_) : parent(parent_) {}
+        inline ProxyAccessor operator[](size_t idx) const { return ProxyAccessor(parent, idx); }
+        inline size_t size() const { return MAX_ARR; }
+    private:
+        ArrayTest &parent;
+    };
+
+    ProxyInterface test_array; // former vector<vector<void*> > test_array;
+    std::vector<std::vector<cv::Mat> > test_mat;
     float buf[4];
 };
 
@@ -748,8 +769,76 @@ struct DefaultRngAuto
 
 
 // test images generation functions
-void fillGradient(Mat& img, int delta = 5);
-void smoothBorder(Mat& img, const Scalar& color, int delta = 3);
+template<typename T>
+void fillGradient(Mat& img, int delta = 5)
+{
+    CV_UNUSED(delta);
+    const int ch = img.channels();
+
+    int r, c, i;
+    for(r=0; r<img.rows; r++)
+    {
+        for(c=0; c<img.cols; c++)
+        {
+            T vals[] = {(T)r, (T)c, (T)(r*c), (T)(r*c/(r+c+1))};
+            T *p = (T*)img.ptr(r, c);
+            for(i=0; i<ch; i++) p[i] = (T)vals[i];
+        }
+    }
+}
+template<>
+void fillGradient<uint8_t>(Mat& img, int delta);
+
+template<typename T>
+void smoothBorder(Mat& img, const Scalar& color, int delta = 3)
+{
+    const int ch = img.channels();
+    CV_Assert(!img.empty() && ch <= 4);
+
+    Scalar s;
+    int n = 100/delta;
+    int nR = std::min(n, (img.rows+1)/2), nC = std::min(n, (img.cols+1)/2);
+
+    int r, c, i;
+    for(r=0; r<nR; r++)
+    {
+        double k1 = r*delta/100., k2 = 1-k1;
+        for(c=0; c<img.cols; c++)
+        {
+            auto *p = img.ptr<T>(r, c);
+            for(i=0; i<ch; i++) s[i] = p[i];
+            s = s * k1 + color * k2;
+            for(i=0; i<ch; i++) p[i] = static_cast<T>((s[i]));
+        }
+        for(c=0; c<img.cols; c++)
+        {
+            auto *p = img.ptr<T>(img.rows-r-1, c);
+            for(i=0; i<ch; i++) s[i] = p[i];
+            s = s * k1 + color * k2;
+            for(i=0; i<ch; i++) p[i] = static_cast<T>((s[i]));
+        }
+    }
+
+    for(r=0; r<img.rows; r++)
+    {
+        for(c=0; c<nC; c++)
+        {
+            double k1 = c*delta/100., k2 = 1-k1;
+            auto *p = img.ptr<T>(r, c);
+            for(i=0; i<ch; i++) s[i] = p[i];
+            s = s * k1 + color * k2;
+            for(i=0; i<ch; i++) p[i] = static_cast<T>((s[i]));
+        }
+        for(c=0; c<n; c++)
+        {
+            double k1 = c*delta/100., k2 = 1-k1;
+            auto *p = img.ptr<T>(r, img.cols-c-1);
+            for(i=0; i<ch; i++) s[i] = p[i];
+            s = s * k1 + color * k2;
+            for(i=0; i<ch; i++) p[i] = static_cast<T>((s[i]));
+        }
+    }
+}
 
 // Utility functions
 

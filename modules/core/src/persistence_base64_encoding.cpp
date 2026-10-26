@@ -185,9 +185,9 @@ size_t base64::base64_encode(const uint8_t *src, uint8_t *dst, size_t off, size_
     switch (rst)
     {
         case 1U: *dst_cur++ = base64_padding;
-            /* fallthrough */
+            [[fallthrough]];
         case 2U: *dst_cur++ = base64_padding;
-            /* fallthrough */
+            [[fallthrough]];
         default: *dst_cur   = 0;
             break;
     }
@@ -202,12 +202,18 @@ int base64::icvCalcStructSize(const char *dt, int initial_size) {
         switch ( *type )
         {
             case 'u': { elem_max_size = std::max( elem_max_size, sizeof(uchar ) ); break; }
+            case 'b': { elem_max_size = std::max( elem_max_size, sizeof(uchar ) ); break; }
             case 'c': { elem_max_size = std::max( elem_max_size, sizeof(schar ) ); break; }
             case 'w': { elem_max_size = std::max( elem_max_size, sizeof(ushort) ); break; }
             case 's': { elem_max_size = std::max( elem_max_size, sizeof(short ) ); break; }
             case 'i': { elem_max_size = std::max( elem_max_size, sizeof(int   ) ); break; }
+            case 'n': { elem_max_size = std::max( elem_max_size, sizeof(unsigned) ); break; }
             case 'f': { elem_max_size = std::max( elem_max_size, sizeof(float ) ); break; }
             case 'd': { elem_max_size = std::max( elem_max_size, sizeof(double) ); break; }
+            case 'I': { elem_max_size = std::max( elem_max_size, sizeof(int64_t)); break; }
+            case 'U': { elem_max_size = std::max( elem_max_size, sizeof(uint64_t)); break; }
+            case 'e': { elem_max_size = std::max( elem_max_size, sizeof(uchar) ); break; }
+            case 'E': { elem_max_size = std::max( elem_max_size, sizeof(uchar) ); break; }
             default: break;
         }
     }
@@ -330,11 +336,16 @@ size_t base64::RawDataToBinaryConvertor::make_to_binary_funcs(const std::string 
                     size = sizeof(uchar);
                     pack.func = to_binary<uchar>;
                     break;
+                case 'b':
+                    size = sizeof(uchar);
+                    pack.func = to_binary<bool>;
+                    break;
                 case 'w':
                 case 's':
                     size = sizeof(ushort);
                     pack.func = to_binary<ushort>;
                     break;
+                case 'n':
                 case 'i':
                     size = sizeof(uint);
                     pack.func = to_binary<uint>;
@@ -346,6 +357,16 @@ size_t base64::RawDataToBinaryConvertor::make_to_binary_funcs(const std::string 
                 case 'd':
                     size = sizeof(double);
                     pack.func = to_binary<double>;
+                    break;
+                case 'I':
+                case 'U':
+                    size = sizeof(uint64_t);
+                    pack.func = to_binary<uint64_t>;
+                    break;
+                case 'e':
+                case 'E':
+                    size = sizeof(uchar);
+                    pack.func = to_binary<uchar>;
                     break;
                 case 'r':
                 default:

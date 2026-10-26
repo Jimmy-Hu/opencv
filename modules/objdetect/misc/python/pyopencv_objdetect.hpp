@@ -3,9 +3,10 @@
 #include "opencv2/objdetect.hpp"
 
 typedef QRCodeEncoder::Params QRCodeEncoder_Params;
-
-typedef HOGDescriptor::HistogramNormType HOGDescriptor_HistogramNormType;
-typedef HOGDescriptor::DescriptorStorageFormat HOGDescriptor_DescriptorStorageFormat;
+typedef std::vector<cv::Ptr<mcc::CChecker>> vector_Ptr_CChecker;
+#ifdef HAVE_OPENCV_DNN
+typedef dnn::Net dnn_Net;
+#endif
 
 class NativeByteArray
 {

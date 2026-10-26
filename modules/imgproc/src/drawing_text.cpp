@@ -1,0 +1,1715 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html
+
+//
+// Unicode text rendering (cv::putText / cv::getTextSize for TrueType/OpenType
+// fonts), implemented on top of HarfBuzz.
+//
+// Pipeline (FontRenderEngine::putText_):
+//   1. Decode the UTF-8 string to UTF-32 code points.
+//   2. Segment the code points into runs of uniform script, direction and font.
+//      Script/category come from HarfBuzz's Unicode functions; direction is a
+//      lightweight RTL heuristic (full UAX#9 BiDi is a TODO). For each code point
+//      the engine picks the first font that covers it: the user font first, then
+//      the built-in font slots (sans/italic/uni); uncovered -> '?'. Adjacent
+//      compatible runs are then merged. Only "sans" (Rubik) is always compiled in;
+//      "italic" and "uni" are optional (WITH_ITALICFONT / WITH_UNIFONT) and any slot
+//      can be (re)filled at run time with an external file via
+//      FontFace::setBuiltinFont() (see the registry below).
+//   3. Shape each run with hb_shape(), yielding glyph ids and positions
+//      (advances include GPOS kerning); RTL runs come out already reordered.
+//   4. Lay out and render the glyphs. Each glyph is rasterized once by HarfBuzz's
+//      built-in rasterizer (hb-raster) into a grayscale A8 coverage mask and
+//      cached; the layout walks the pen, applies offsets/advances, handles line
+//      wrapping/alignment, and alpha-blends the masks onto the image.
+//
+// Conventions:
+//   * Positions/advances are HarfBuzz 26.6 fixed point (1/64 px); the layout
+//     shifts right by 6 to get pixels.
+//   * Each font is scaled so the ascender maps to the requested pixel size
+//     (matching the historical stb sizing): scale = size*64*upem/ascent.
+//   * The weight argument is 16.16 fixed point; it drives the 'wght' variable
+//     axis (design value = weight/65536).
+//   * The whole engine (cache, scratch buffers, shaping buffer) lives in a
+//     thread_local FontRenderEngine, so it is lock-free across threads.
+//
+// Built without HarfBuzz (WITH_HARFBUZZ=OFF) the public API still links but
+// throws cv::Error::StsNotImplemented (see the #else stub block at end of file).
+//
+
+#include "precomp.hpp"
+
+#include <list>
+#include <tuple>
+#include <unordered_map>
+#include "zlib.h"
+
+#ifdef HAVE_HARFBUZZ
+
+#include <hb.h>
+#include <hb-ot.h>
+#include <hb-raster.h>
+
+#include "builtin_font_sans.h"
+#ifdef HAVE_ITALICFONT
+#include "builtin_font_italic.h"
+#endif
+#ifdef HAVE_UNIFONT
+#include "builtin_font_uni.h"
+#endif
+#include <atomic>
+#include <mutex>
+
+//////////////////////////////////////////////////////////////////////////////////////
+
+namespace cv
+{
+
+typedef struct BuiltinFontData
+{
+    const uchar* gzdata;
+    size_t size;
+    const char* name;
+    double sf;
+    bool italic;
+} BuiltinFontData;
+
+// The built-in font slots, in fallback order. A slot is backed by a compiled-in
+// gzipped blob (gzdata/size, when the corresponding WITH_* option is ON), or by an
+// external file registered with FontFace::setBuiltinFont(), or is empty.
+enum
+{
+    BUILTIN_FONT_SANS = 0,
+    BUILTIN_FONT_ITALIC = 1,
+    BUILTIN_FONT_UNI = 2,
+    BUILTIN_FONTS_NUM = 3
+};
+
+static const BuiltinFontData builtinFontData[BUILTIN_FONTS_NUM] =
+{
+    {OcvBuiltinFontSans, sizeof(OcvBuiltinFontSans), "sans", 1.0, false},
+#ifdef HAVE_ITALICFONT
+    {OcvBuiltinFontItalic, sizeof(OcvBuiltinFontItalic), "italic", 1.0, true},
+#else
+    {0, 0, "italic", 1.0, true},
+#endif
+#ifdef HAVE_UNIFONT
+    {OcvBuiltinFontUni, sizeof(OcvBuiltinFontUni), "uni", 1.0, true},
+#else
+    {0, 0, "uni", 1.0, true},
+#endif
+};
+
+static int builtinFontIndex(const String& name)
+{
+    for(int i = 0; i < BUILTIN_FONTS_NUM; i++)
+        if(name == builtinFontData[i].name)
+            return i;
+    return -1;
+}
+
+// Registry of external files provided via FontFace::setBuiltinFont(). It is
+// process-wide, while the loaded fonts live in each thread's FontRenderEngine:
+// the engine compares its generation with builtinFontGeneration on every use and
+// reloads its slots when they differ.
+static std::mutex& builtinFontMutex()
+{
+    static std::mutex m;
+    return m;
+}
+static std::string builtinFontPaths[BUILTIN_FONTS_NUM];
+static std::atomic<int> builtinFontGeneration(0);
+
+static bool inflate(const void* src, size_t srclen, std::vector<uchar>& dst)
+{
+    std::vector<uchar> newdst((size_t)(srclen*2.5));
+    std::swap(dst, newdst); // make sure we deallocated all the unused space that would be wasted otherwise
+    for(int attempts = 0; attempts < 5; attempts++)
+    {
+        z_stream strm = {};
+        strm.total_in = strm.avail_in  = (uInt)srclen;
+        strm.total_out = strm.avail_out = (uInt)dst.size();
+        strm.next_in = (Bytef*)src;
+        strm.next_out = (Bytef*)&dst[0];
+
+        int err = inflateInit2(&strm, (15 + 32)); //15 window bits, and the +32 tells zlib to to detect if using gzip or zlib
+        if (err == Z_OK)
+        {
+            err = inflate(&strm, Z_FINISH);
+            inflateEnd(&strm);
+            if (err == Z_STREAM_END)
+            {
+                dst.resize((size_t)strm.total_out);
+                return true;
+            }
+            else
+                dst.resize(dst.size()*3/2);
+        }
+        else
+        {
+            inflateEnd(&strm);
+            return false;
+        }
+    }
+    return false;
+}
+
+struct FontFace::Impl {
+    Impl()
+    {
+        initParams();
+        hb_font = 0;
+        hb_upem = 0;
+        hb_ascent = 0;
+        scalefactor = 1.0;
+        italic = false;
+    }
+
+    ~Impl()
+    {
+        deleteFont();
+    }
+
+    void deleteFont()
+    {
+        if (hb_font)
+            hb_font_destroy(hb_font);
+        hb_font = 0;
+        currname.clear();
+        initParams();
+    }
+
+    // hb_font references fontbuf read-only, so fontbuf must outlive it;
+    // deleteFont() always runs before fontbuf changes.
+    void createHbFont()
+    {
+        if (hb_font)
+        {
+            hb_font_destroy(hb_font);
+            hb_font = 0;
+        }
+        if (fontbuf.empty())
+            return;
+        hb_blob_t* blob = hb_blob_create((const char*)&fontbuf[0], (unsigned)fontbuf.size(),
+                                         HB_MEMORY_MODE_READONLY, 0, 0);
+        hb_face_t* face = hb_face_create(blob, 0);
+        hb_blob_destroy(blob);
+        hb_upem = hb_face_get_upem(face);
+        hb_font = hb_font_create(face);
+        hb_face_destroy(face);
+        // A fresh hb_font has scale == upem, so extents come back in font units.
+        hb_font_extents_t fe;
+        hb_ascent = hb_font_get_h_extents(hb_font, &fe) && fe.ascender > 0 ?
+                    (int)fe.ascender : (int)hb_upem;
+    }
+
+    void initParams()
+    {
+        currweight = -1;
+        currsize = -1;
+    }
+
+    bool setStd(const BuiltinFontData& fontdata)
+    {
+        if(fontdata.size <= 1)
+            return false;
+        if(hb_font == 0 || currname != fontdata.name)
+        {
+            deleteFont();
+            if(!inflate(fontdata.gzdata, fontdata.size, fontbuf))
+                return false;
+            createHbFont();
+            if (!hb_font)
+                return false;
+        }
+        currname = fontdata.name;
+        scalefactor = fontdata.sf;
+        italic = fontdata.italic;
+        initParams();
+        return true;
+    }
+
+    // Load an external file into a built-in slot: it is then addressed by the
+    // slot name ("italic", "uni", ...) and takes part in the fallback chain.
+    bool setStdExternal(const BuiltinFontData& fontdata, const String& path)
+    {
+        if(!set(path))
+            return false;
+        currname = fontdata.name;
+        scalefactor = fontdata.sf;
+        italic = fontdata.italic;
+        initParams();
+        return true;
+    }
+
+    bool set(const String& fontname)
+    {
+        CV_Assert(!fontname.empty());
+
+        if(hb_font != 0 && fontname == currname)
+            return true;
+
+        deleteFont();
+
+        const char* fntname = fontname.c_str();
+        size_t fntnamelen = fontname.size();
+        FILE* f = fopen(fntname, "rb");
+        if (!f)
+            return false;
+        fseek(f, 0, SEEK_END);
+        long sz0 = ftell(f), sz1 = 0;
+        std::vector<uchar> srcdata(sz0);
+        if (sz0 > 0)
+        {
+            fseek(f, 0, SEEK_SET);
+            sz1 = (long)fread(&srcdata[0], 1, sz0, f);
+        }
+        fclose(f);
+        if (sz0 == 0 || sz1 != sz0)
+            return false;
+        if (fntnamelen > 3 && strcmp(fntname + fntnamelen - 3, ".gz") == 0)
+        {
+            if (!inflate(&srcdata[0], srcdata.size(), fontbuf))
+                return false;
+        }
+        else
+        {
+            fontbuf.resize(srcdata.size());
+            std::copy(srcdata.begin(), srcdata.end(), fontbuf.begin());
+        }
+        createHbFont();
+        if (!hb_font)
+            return false;
+        currname = fontname;
+        initParams();
+        return true;
+    }
+
+    bool setParams(int size, int weight)
+    {
+        if (!hb_font)
+            return false;
+        if (std::abs(size - currsize) < 1e-3 &&
+            (weight == currweight || weight == 0))
+            return true;
+        int hbscale = (hb_ascent > 0)
+                    ? cvRound((double)size * 64.0 * hb_upem / hb_ascent)
+                    : size*64;
+        hb_font_set_scale(hb_font, hbscale, hbscale);
+        if (weight != 0)
+        {
+            hb_variation_t var = { HB_TAG('w','g','h','t'), weight / 65536.0f };
+            hb_font_set_variations(hb_font, &var, 1);
+            currweight = weight;
+        }
+        currsize = size;
+        return true;
+    }
+
+    String currname;
+    double scalefactor;
+    bool italic;
+    int currsize;
+    int currweight;
+    hb_font_t* hb_font;
+    unsigned hb_upem;   // units per em (HarfBuzz)
+    int hb_ascent;      // unscaled hhea ascender, for stb-compatible text sizing
+    std::vector<uchar> fontbuf;
+};
+
+struct GlyphCacheKey
+{
+    GlyphCacheKey()
+    {
+        face = 0;
+        glyph_index = 0;
+        size = 0;
+        weight = 0;
+        scale = 1.f;
+    }
+    // 'face' is an opaque per-font identity: the stb font in the stb path,
+    // the hb_font in the HarfBuzz path.
+    GlyphCacheKey(const void* face_, int index_, double size_, int weight_, float scale_ = 1.f)
+    {
+        face = face_;
+        glyph_index = index_;
+        size = cvRound(size_*256);
+        weight = weight_;
+        scale = scale_;
+    }
+
+    const void* face;
+    int glyph_index;
+    int size;
+    int weight;
+    float scale;
+};
+
+static bool operator == (const GlyphCacheKey& k1, const GlyphCacheKey& k2)
+{
+    return k1.face == k2.face && k1.glyph_index == k2.glyph_index &&
+           k1.size == k2.size && k1.weight == k2.weight && k1.scale == k2.scale;
+}
+
+static size_t hash_seq(const size_t* hashvals, size_t n)
+{
+    size_t h = (size_t)-1;
+    const int hsz = (int)(sizeof(h)*8);
+    for( size_t i = 0; i < n; i++ )
+    {
+        h = (h >> 5) ^ (h << (hsz - 5)) ^ hashvals[i];
+    }
+    return h;
+}
+
+struct GlyphCacheHash
+{
+    size_t operator()(const GlyphCacheKey& key) const noexcept
+    {
+        size_t hs[] = {(size_t)key.face, (size_t)key.glyph_index,
+            (size_t)key.size, (size_t)key.weight}; // do not include scale, because it's completely defined by size
+        return hash_seq(hs, sizeof(hs)/sizeof(hs[0]));
+    }
+};
+
+struct GlyphCacheVal
+{
+    GlyphCacheVal()
+    {
+        crc = 0;
+        width = height = linegap = ascent = horiBearingX = horiBearingY = 0;
+    }
+
+    std::vector<uchar> rlebuf;
+    Rect bbox;
+    unsigned crc;
+    int width;
+    int height;
+    Point advance;
+    int linegap, ascent;
+    int horiBearingX;
+    int horiBearingY;
+};
+
+typedef std::pair<GlyphCacheKey, GlyphCacheVal> GlyphCacheEntry;
+typedef std::list<GlyphCacheEntry>::iterator GlyphCacheEntryIt;
+
+struct TextSegment
+{
+    TextSegment()
+    {
+        fontidx = 0;
+        start = end = 0;
+        script = HB_SCRIPT_UNKNOWN;
+        dir = HB_DIRECTION_LTR;
+    }
+    TextSegment(int fontidx_, int start_, int end_, hb_script_t script_, hb_direction_t dir_)
+    {
+        fontidx = fontidx_;
+        start = start_;
+        end = end_;
+        script = script_;
+        dir = dir_;
+    }
+    int fontidx;
+    int start, end;
+    hb_script_t script;
+    hb_direction_t dir;
+};
+
+struct FontGlyph
+{
+    FontGlyph() { hb_font = 0; index = -1; }
+    FontGlyph(hb_font_t* hb_font_, int glyph_index_,
+              const hb_glyph_position_t& pos_)
+    {
+        hb_font = hb_font_;
+        index = glyph_index_;
+        pos = pos_;
+    }
+    hb_font_t* hb_font;
+    int index;
+    hb_glyph_position_t pos;
+};
+
+
+class FontRenderEngine
+{
+public:
+    enum { MAX_CACHED_GLYPH_SIZE = 128, MAX_CACHE_SIZE=2048 };
+    FontRenderEngine()
+    {
+        hb_buf = hb_buffer_create();
+        hb_buffer_guess_segment_properties(hb_buf);
+        hb_uni_funcs = hb_unicode_funcs_get_default();
+        max_cache_size = (size_t)MAX_CACHE_SIZE;
+        raster_draw = 0;
+        builtin_generation = -1;  // force the first syncBuiltinFonts() to load the slots
+    }
+
+    ~FontRenderEngine()
+    {
+        hb_buffer_destroy(hb_buf);
+        if(raster_draw)
+            hb_raster_draw_destroy(raster_draw);  // also frees its recycled image
+        for(int i = 0; i < BUILTIN_FONTS_NUM; i++)
+            builtin_ffaces[i] = FontFace();
+    }
+
+    void addToCache(const GlyphCacheKey& key, const GlyphCacheVal& val)
+    {
+        if(glyph_cache.size() == max_cache_size)
+        {
+            GlyphCacheEntryIt last = all_cached.end();
+            --last;
+            glyph_cache.erase(last->first);
+            all_cached.pop_back();
+        }
+
+        all_cached.push_front(std::make_pair(key, val));
+        GlyphCacheEntryIt first = all_cached.begin();
+        glyph_cache.insert(std::make_pair(first->first, first));
+    }
+
+    GlyphCacheVal* findCachedGlyph(const GlyphCacheKey& key)
+    {
+        auto it = glyph_cache.find(key);
+        if(it == glyph_cache.end())
+            return 0;
+        all_cached.splice(all_cached.begin(), all_cached, it->second);
+        return &it->second->second;
+    }
+
+    FontFace& getStdFontFace(int i)
+    {
+        CV_Assert(i >= 0 && i < BUILTIN_FONTS_NUM);
+        syncBuiltinFonts();
+        return builtin_ffaces[i];
+    }
+
+    // (Re)load the built-in font slots of this thread's engine if
+    // FontFace::setBuiltinFont() changed the registry since the last call.
+    void syncBuiltinFonts()
+    {
+        int gen = builtinFontGeneration.load(std::memory_order_acquire);
+        if(gen == builtin_generation)
+            return;
+        std::string paths[BUILTIN_FONTS_NUM];
+        {
+            std::lock_guard<std::mutex> lock(builtinFontMutex());
+            for(int i = 0; i < BUILTIN_FONTS_NUM; i++)
+                paths[i] = builtinFontPaths[i];
+            gen = builtinFontGeneration.load(std::memory_order_acquire);
+        }
+        for(int i = 0; i < BUILTIN_FONTS_NUM; i++)
+        {
+            const BuiltinFontData& fontdata = builtinFontData[i];
+            // a fresh Impl: FontFace objects handed out earlier keep the old one alive
+            FontFace fface;
+            bool ok = !paths[i].empty() && fface->setStdExternal(fontdata, paths[i]);
+            if(!ok && fontdata.size > 1)
+                ok = fface->setStd(fontdata);
+            builtin_ffaces[i] = ok ? fface : FontFace();
+        }
+        builtin_generation = gen;
+        // hb_font pointers are part of the glyph cache key; drop the cache so that a
+        // recycled address of a destroyed font cannot alias its glyphs.
+        glyph_cache.clear();
+        all_cached.clear();
+    }
+
+    Point putText_( Mat& img, Size imgsize, const String& str_, Point org,
+                    const uchar* color, FontFace& fontface, int size,
+                    int weight, PutTextFlags flags, Range wrapRange, bool render,
+                    Rect* bbox );
+
+protected:
+    FontFace builtin_ffaces[BUILTIN_FONTS_NUM];
+    int builtin_generation;
+
+    hb_unicode_funcs_t* hb_uni_funcs;
+
+    // LRU cache of glyphs
+    GlyphCacheVal new_cached;
+    std::list<GlyphCacheEntry> all_cached;
+    std::unordered_map<GlyphCacheKey, GlyphCacheEntryIt, GlyphCacheHash> glyph_cache;
+    size_t max_cache_size;
+
+    hb_buffer_t* hb_buf;
+    hb_raster_draw_t* raster_draw;  // reused across glyphs (thread_local engine)
+    std::vector<unsigned> u32buf;
+    std::vector<TextSegment> segments;
+    std::vector<FontGlyph> glyphs;
+    std::vector<uchar> pixbuf;
+    std::vector<uchar> glyph_buf;
+};
+
+thread_local FontRenderEngine fontRenderEngine;
+
+FontFace::FontFace() { impl = makePtr<Impl>(); }
+FontFace::FontFace(const String& fontname)
+{
+    impl = makePtr<Impl>();
+    set(fontname);
+}
+
+bool FontFace::set(const String& fontname_)
+{
+    String fontname = fontname_;
+    if(fontname.empty())
+        fontname = "sans";
+    if(impl->hb_font != 0 && impl->currname == fontname)
+        return true;
+    int i = builtinFontIndex(fontname);
+
+    FontRenderEngine& engine = fontRenderEngine;
+
+    bool ok = false;
+    if( i >= 0 )
+    {
+        FontFace* builtin_fface = &engine.getStdFontFace(i);
+        // no italic font compiled in or registered: fall back to the upright one,
+        // so that e.g. FONT_ITALIC in the legacy putText() keeps working
+        if(!(*builtin_fface)->hb_font && i == BUILTIN_FONT_ITALIC)
+            builtin_fface = &engine.getStdFontFace(BUILTIN_FONT_SANS);
+        if((*builtin_fface)->hb_font)
+        {
+            impl = builtin_fface->impl;
+            ok = true;
+        }
+    }
+    else
+    {
+        if(impl->hb_font != 0)
+            impl = makePtr<Impl>();
+        ok = impl->set(fontname);
+    }
+    return ok;
+}
+
+bool FontFace::setBuiltinFont(const String& fontName, const String& fontPath)
+{
+    int i = builtinFontIndex(fontName);
+    if(i < 0)
+        return false;
+    if(!fontPath.empty())
+    {
+        // validate the file now, so that the caller learns about a bad path immediately
+        // and a broken registration cannot leave a slot empty
+        Impl probe;
+        if(!probe.set(fontPath))
+            return false;
+    }
+    std::lock_guard<std::mutex> lock(builtinFontMutex());
+    builtinFontPaths[i] = fontPath;
+    builtinFontGeneration.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+bool FontFace::getBuiltinFontData(const String& fontname_,
+                                  const uchar*& data, size_t& size)
+{
+    String fontname = fontname_;
+    if(fontname.empty())
+        fontname = "sans";
+    data = 0;
+    size = 0;
+    int i = builtinFontIndex(fontname);
+    if(i < 0)
+        return false;
+    FontFace& builtin_fface = fontRenderEngine.getStdFontFace(i);
+    if( builtin_fface.impl->hb_font )
+    {
+        std::vector<uchar>& fbuf = builtin_fface.impl->fontbuf;
+        size = fbuf.size();
+        data = size > 0 ? &fbuf[0] : 0;
+        return size > 0;
+    }
+    return false;
+}
+
+String FontFace::getName() const { return impl->currname; }
+FontFace::Impl* FontFace::operator -> () { return impl.get(); }
+FontFace::~FontFace() {}
+
+bool FontFace::setInstance(const std::vector<int>& params)
+{
+    if (params.empty())
+        return true;
+    CV_Assert(params.size() % 2 == 0);
+    if (!impl->hb_font)
+        return false;
+    int n = (int)(params.size()/2);
+    std::vector<hb_variation_t> vars((size_t)n);
+    for (int i = 0; i < n; i++)
+    {
+        unsigned t = (unsigned)params[i*2];
+        // params hold CV_FOURCC tags (LSB-first); HarfBuzz wants MSB-first tags.
+        vars[i].tag = ((t & 0xFF) << 24) | (((t >> 8) & 0xFF) << 16) |
+                      (((t >> 16) & 0xFF) << 8) | ((t >> 24) & 0xFF);
+        // axis values arrive in 16.16 fixed point.
+        vars[i].value = params[i*2+1] / 65536.0f;
+    }
+    hb_font_set_variations(impl->hb_font, vars.data(), n);
+    // Force the next setParams() to re-apply weight (an explicit weight should
+    // override this instance).
+    impl->currweight = -1;
+    return true;
+}
+
+bool FontFace::getInstance(std::vector<int>& params) const
+{
+    if (!impl->hb_font)
+        return false;
+
+    hb_face_t* face = hb_font_get_face(impl->hb_font);
+    unsigned naxes = hb_ot_var_get_axis_count(face);
+    if (naxes == 0)
+        return false;
+
+    std::vector<hb_ot_var_axis_info_t> axes(naxes);
+    unsigned n = naxes;
+    hb_ot_var_get_axis_infos(face, 0, &n, &axes[0]);
+
+    unsigned ncoords = 0;
+    const float* coords = hb_font_get_var_coords_design(impl->hb_font, &ncoords);
+
+    params.resize(naxes*2);
+    for( unsigned i = 0; i < naxes; i++ )
+    {
+        unsigned tag = axes[i].tag;  // HarfBuzz tag is MSB-first
+        params[i*2] = CV_FOURCC((char)(tag >> 24), (char)(tag >> 16), (char)(tag >> 8), (char)tag);
+        float v = (i < ncoords && coords) ? coords[i] : axes[i].default_value;
+        params[i*2+1] = cvRound(v * 65536.0);
+    }
+    return true;
+}
+
+static unsigned calccrc(const std::vector<uchar>& buf)
+{
+    unsigned crc = (unsigned)-1;
+    size_t i, n = buf.size();
+    for(i = 0; i < n; i++)
+        crc = (crc << 5) ^ (crc >> 27) ^ buf[i];
+    return crc;
+}
+
+static void
+compressCharacter(const uchar* bitmap_buf,
+                  int bitmap_step, Size bitmap_size,
+                  std::vector<uchar>& rlebuf,
+                  Rect& roi, unsigned* crc)
+{
+    const int RLE_MAX = 255;
+    int width = bitmap_size.width, height = bitmap_size.height;
+    int left = width-1, right = 0, top = height-1, bottom = 0;
+    bool global_have_nz = false;
+    for( int i = 0; i < height; i++ )
+    {
+        bool have_nz = false;
+        for( int j = 0; j < width; j++ )
+        {
+            if(bitmap_buf[i*bitmap_step + j] != 0)
+            {
+                left = min(left, j);
+                right = max(right, j);
+                have_nz = true;
+            }
+        }
+        if( have_nz )
+        {
+            global_have_nz |= have_nz;
+            top = min(top, i);
+            bottom = max(bottom, i);
+        }
+    }
+    // all 0's
+    if(!global_have_nz)
+    {
+        roi = Rect(0, 0, 0, 0);
+        rlebuf.clear();
+        if(crc)
+            *crc = calccrc(rlebuf);
+        return;
+    }
+    roi = Rect(left, top, right - left + 1, bottom - top + 1);
+    bool rle_mode = true;
+    int k = 0, count = 0;
+    int count_pos = -1;
+    int bufsz = roi.width*roi.height*2+256;
+    rlebuf.resize(bufsz);
+    uchar* buf = &rlebuf[0];
+    int prev = 0, x = 0;
+
+    //  c b
+    //  a x
+    for( int i = top; i <= bottom; i++ )
+    {
+        for( int j = left; j <= right; j++ )
+        {
+            const uchar* ptr = bitmap_buf + i*bitmap_step + j;
+            prev = x;
+            x = *ptr;
+            int a = 0, b = 0, c = 0;
+            if( i > top )
+            {
+                b = ptr[-bitmap_step];
+                if( j > left )
+                {
+                    a = ptr[-1];
+                    c = ptr[-1-bitmap_step];
+                }
+            }
+            else if( j > left )
+                a = ptr[-1];
+            int predicted = a + b - c;
+            if( x == predicted )
+            {
+                if(rle_mode) ++count;
+                else
+                {
+                    if(count > 0)
+                        buf[count_pos] = (uchar)count;
+                    count = 1;
+                    rle_mode = true;
+                }
+            }
+            else if( !rle_mode )
+            {
+                if(count == RLE_MAX)
+                {
+                    buf[count_pos] = (uchar)count;
+                    buf[k++] = 0;
+                    count_pos = k++;
+                    count = 0;
+                }
+                buf[k++] = (uchar)x;
+                count++;
+            }
+            else if( count == 1 && count_pos >= 0 && buf[count_pos] < RLE_MAX-1 )
+            {
+                count = buf[count_pos] + 2;
+                buf[k++] = (uchar)prev;
+                buf[k++] = (uchar)x;
+                rle_mode = false;
+            }
+            else
+            {
+                if(count == 0)
+                    buf[k++] = 0;
+                while(count > 0)
+                {
+                    int dcount = min(count, RLE_MAX);
+                    count -= dcount;
+                    buf[k++] = (uchar)dcount;
+                    if(count > 0)
+                        buf[k++] = 0;
+                }
+                count_pos = k++;
+                buf[k++] = (uchar)x;
+                count = 1;
+                rle_mode = false;
+            }
+        }
+    }
+
+    if(rle_mode)
+    {
+        while(count > 0)
+        {
+            int dcount = min(count, RLE_MAX);
+            count -= dcount;
+            buf[k++] = (uchar)dcount;
+            if(count > 0)
+                buf[k++] = 0;
+        }
+    }
+    else buf[count_pos] = (uchar)count;
+    rlebuf.resize(k);
+    if(crc)
+        *crc = calccrc(rlebuf);
+}
+
+static bool
+decompressCharacter(const std::vector<uchar>& rlebuf, Rect r,
+                    std::vector<uchar>& pixbuf, const unsigned* crc)
+{
+    if(crc)
+        CV_Assert(*crc == calccrc(rlebuf));
+
+    int width = r.width, height = r.height;
+    int i = 0, j = 0, k = 0;
+    int bufsz = (int)rlebuf.size();
+    const uchar* buf = bufsz > 0 ? &rlebuf[0] : 0;
+
+    pixbuf.resize(width*height);
+    uchar* pixels = width*height > 0 ? &pixbuf[0] : 0;
+
+    if(bufsz == 0)
+    {
+        if(width > 0 && height > 0)
+            memset(pixels, 0, width*height);
+        return true;
+    }
+
+    while( k < bufsz )
+    {
+        int rle_count = buf[k++];
+        for( ; rle_count > 0; rle_count-- )
+        {
+            int a = 0, b = 0, c = 0;
+            uchar* ptr = pixels + i*width + j;
+            if( i > 0 )
+            {
+                b = ptr[-width];
+                if( j > 0 )
+                {
+                    a = ptr[-1];
+                    c = ptr[-width-1];
+                }
+            }
+            else if( j > 0 )
+                a = ptr[-1];
+            int pred = a + b - c;
+            ptr[0] = (uchar)pred;
+            if( ++j >= width )
+            {
+                j = 0;
+                if( ++i >= height )
+                    return true;
+            }
+        }
+        if( k >= bufsz )
+            return false;
+        int nz_end = buf[k++];
+        nz_end += k;
+        if( nz_end > bufsz )
+            return false;
+        for( ; k < nz_end; k++ )
+        {
+            pixels[i*width + j] = buf[k];
+            if( ++j >= width )
+            {
+                j = 0;
+                if( ++i >= height )
+                    return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void drawCharacter(
+    Mat& img, const uchar* color,
+    const uchar* bitmap_buf,
+    int bitmap_step, Size bitmap_size,
+    int x0, int y0, bool bottom_left )
+{
+    int nch = img.channels();
+    int bw = bitmap_size.width, bh = bitmap_size.height;
+    int rows = img.rows, cols = img.cols;
+    uchar b = color[0], g = color[1], r = color[2];
+
+    if(x0 >= cols || x0 + bw <= 0)
+        return;
+
+    // for simplicity, we assume that `bitmap->pixel_mode'
+    // is `FT_PIXEL_MODE_GRAY' (i.e., not a bitmap font)
+    for( int dy = 0; dy < bh; dy++ )
+    {
+        int y = y0 + dy*(bottom_left ? -1 : 1);
+        if( y < 0 || y >= rows )
+            continue;
+        uchar* imgptr0 = img.ptr<uchar>(y);
+        for( int dx = 0; dx < bw; dx++ )
+        {
+            int x = x0 + dx;
+            if( x < 0 || x >= cols )
+                continue;
+            uchar* imgptr = imgptr0 + x*nch;
+            uchar alpha = bitmap_buf[dy*bitmap_step + dx];
+            if(alpha == 0)
+                continue;
+            if( nch == 3 )
+            {
+                uchar b1 = (uchar)((imgptr[0]*(255 - alpha) + b*alpha + 127)/255);
+                uchar g1 = (uchar)((imgptr[1]*(255 - alpha) + g*alpha + 127)/255);
+                uchar r1 = (uchar)((imgptr[2]*(255 - alpha) + r*alpha + 127)/255);
+                imgptr[0] = b1;
+                imgptr[1] = g1;
+                imgptr[2] = r1;
+            }
+            else if(nch == 1)
+            {
+                uchar b1 = (uchar)((imgptr[0]*(255 - alpha) + b*alpha + 127)/255);
+                imgptr[0] = b1;
+            }
+            else
+            {
+                uchar b1 = (uchar)((imgptr[0]*(255 - alpha) + b*alpha + 127)/255);
+                uchar g1 = (uchar)((imgptr[1]*(255 - alpha) + g*alpha + 127)/255);
+                uchar r1 = (uchar)((imgptr[2]*(255 - alpha) + r*alpha + 127)/255);
+                imgptr[0] = b1;
+                imgptr[1] = g1;
+                imgptr[2] = r1;
+                imgptr[3] = alpha;
+            }
+        }
+    }
+}
+
+//by amarullz from https://stackoverflow.com/questions/5423960/how-can-i-recognize-rtl-strings-in-c
+static bool isRightToLeft(unsigned c)
+{
+    if(c < 0x5BE)
+        return false;
+
+    return
+    ((c==0x05BE)||(c==0x05C0)||(c==0x05C3)||(c==0x05C6)||
+    ((c>=0x05D0)&&(c<=0x05F4))||
+    (c==0x0608)||(c==0x060B)||(c==0x060D)||
+    ((c>=0x061B)&&(c<=0x064A))||
+    ((c>=0x066D)&&(c<=0x066F))||
+    ((c>=0x0671)&&(c<=0x06D5))||
+    ((c>=0x06E5)&&(c<=0x06E6))||
+    ((c>=0x06EE)&&(c<=0x06EF))||
+    ((c>=0x06FA)&&(c<=0x0710))||
+    ((c>=0x0712)&&(c<=0x072F))||
+    ((c>=0x074D)&&(c<=0x07A5))||
+    ((c>=0x07B1)&&(c<=0x07EA))||
+    ((c>=0x07F4)&&(c<=0x07F5))||
+    ((c>=0x07FA)&&(c<=0x0815))||
+    (c==0x081A)||(c==0x0824)||(c==0x0828)||
+    ((c>=0x0830)&&(c<=0x0858))||
+    ((c>=0x085E)&&(c<=0x08AC))||
+    (c==0x200F)||(c==0xFB1D)||
+    ((c>=0xFB1F)&&(c<=0xFB28))||
+    ((c>=0xFB2A)&&(c<=0xFD3D))||
+    ((c>=0xFD50)&&(c<=0xFDFC))||
+    ((c>=0xFE70)&&(c<=0xFEFC))||
+    ((c>=0x10800)&&(c<=0x1091B))||
+    ((c>=0x10920)&&(c<=0x10A00))||
+    ((c>=0x10A10)&&(c<=0x10A33))||
+    ((c>=0x10A40)&&(c<=0x10B35))||
+    ((c>=0x10B40)&&(c<=0x10C48))||
+    ((c>=0x1EE00)&&(c<=0x1EEBB)));
+}
+
+// Glyph id for a code point, or 0 if the font has no glyph for it.
+static int hbGlyphIndex(hb_font_t* font, unsigned c)
+{
+    hb_codepoint_t g = 0;
+    return font && hb_font_get_nominal_glyph(font, c, &g) ? (int)g : 0;
+}
+
+// Round fixed-point value to the nearest whole pixel.
+static inline int roundFixPt(int64_t v, int n) {
+    int64_t half  = int64_t(1) << (n - 1);
+    int64_t delta = half - 1 + ((v >> n) & 1);
+    return int((v + delta) >> n);
+}
+
+Point FontRenderEngine::putText_(
+    Mat& img, Size imgsize, const String& str_, Point org,
+    const uchar* color, FontFace& fontface, int size,
+    int weight_, PutTextFlags flags, Range wrapRange,
+    bool render, Rect* bbox_ )
+{
+    constexpr int FRAC_BITS = 6;
+    bool bottom_left = (flags & PUT_TEXT_ORIGIN_BL) != 0;
+    int weight = weight_*65536;
+
+    if(fontface.getName().empty())
+        fontface.set("sans");
+    if(!fontface->hb_font)
+        CV_Error(Error::StsError, "No available fonts for putText()");
+
+    Point pen = org;
+    int i, j, len = (int)str_.size();
+    bool wrap = (flags & PUT_TEXT_WRAP) != 0;
+    int alignment = flags & PUT_TEXT_ALIGN_MASK;
+    int x0 = std::min(wrapRange.start, wrapRange.end);
+    int x1 = std::max(wrapRange.start, wrapRange.end);
+
+    if(x0 == 0 && x1 == 0)
+    {
+        if(alignment == PUT_TEXT_ALIGN_RIGHT)
+        {
+            x0 = 0;
+            x1 = org.x;
+        }
+        else
+        {
+            x0 = org.x;
+            x1 = imgsize.width > 0 ? imgsize.width : INT_MAX;
+        }
+    }
+
+    if(x0 >= x1 || len == 0)
+    {
+        if(bbox_)
+            *bbox_ = Rect(org.x, org.y, 0, 0);
+        return org;
+    }
+
+    fontface->setParams(size, weight);
+
+    syncBuiltinFonts();
+    for(j = 0; j < BUILTIN_FONTS_NUM; j++)
+    {
+        FontFace& fface = builtin_ffaces[j];
+        if (fface->hb_font)
+            fface->setParams(size, weight);
+    }
+
+    if(alignment == PUT_TEXT_ALIGN_RIGHT)
+        std::swap(x0, x1);
+
+    int alignSign = alignment == PUT_TEXT_ALIGN_RIGHT ? -1 : 1;
+
+    // text size computing algorithm is adopted from G-API module, ft_render.cpp.
+    const char* str = &str_[0];
+    int max_dy = 0, max_baseline = 0;
+    int max_x = INT_MIN, min_x = INT_MAX;
+    bool wrapped = false;
+
+    // step 1. convert UTF8 to UTF32
+    u32buf.clear();
+    for( i = 0; i < len; i++ )
+    {
+        uchar ch = (uchar)str[i];
+        unsigned charcode;
+        if( ch <= 127 )
+            charcode = ch;
+        else if( ch <= 223 && i+1 < len && (str[i+1] & 0xc0) == 0x80) {
+            charcode = ((ch & 31) << 6) | (str[i+1] & 63);
+            i++;
+        }
+        else if( ch <= 239 && i+2 < len && (str[i+1] & 0xc0) == 0x80 && (str[i+2] & 0xc0) == 0x80) {
+            charcode = ((ch & 15) << 12) | ((str[i+1] & 63) << 6) | (str[i+2] & 63);
+            i += 2;
+        }
+        else if( ch <= 247 && i+3 < len && (str[i+1] & 0xc0) == 0x80 && (str[i+2] & 0xc0) == 0x80 && (str[i+3] & 0xc0) == 0x80) {
+            int val = (int)(((ch & 15) << 18) | ((str[i+1] & 63) << 12) | ((str[i+2] & 63) << 6) | (str[i+3] & 63));
+            if( val > 1114111 ) val = 65533;
+            charcode = val;
+            i += 3;
+        }
+        else
+        {
+            charcode = 65533;
+            while(i+1 < len && (str[i+1] & 0xc0) == 0x80)
+                i++;
+        }
+        u32buf.push_back(charcode);
+    }
+
+    // step 2. form segments, for each segment find the proper font, direction and script.
+    len = (int)u32buf.size();
+    unsigned* chars = &u32buf[0];
+    int prev_dy = 0;
+
+    hb_direction_t glob_dir = HB_DIRECTION_INVALID;
+
+    while(len > 0)
+    {
+        int nextline_dy = 0;
+
+        segments.clear();
+        glyphs.clear();
+
+        hb_script_t curr_script = HB_SCRIPT_UNKNOWN;
+        hb_direction_t curr_dir = HB_DIRECTION_INVALID;
+        int curr_fontidx = -1;
+        hb_font_t* hb_font0 = fontface->hb_font;
+        hb_font_t* curr_hb_font = hb_font0;
+
+        int k, segstart = 0, punctstart = -1;
+        // TODO: possibly implement https://unicode.org/reports/tr9/ or find compact implementation of it
+        for(i = 0; i < len; i++)
+        {
+            int c = chars[i];
+            if(c == '\n')
+                break;
+            hb_unicode_general_category_t cat = hb_unicode_general_category(hb_uni_funcs, c);
+            hb_script_t script = hb_unicode_script(hb_uni_funcs, c);
+            int glyph_index = hbGlyphIndex(curr_hb_font, c);
+            bool is_rtl = isRightToLeft(c);
+            hb_direction_t dir = HB_DIRECTION_INVALID;
+
+            if(script == HB_SCRIPT_ARABIC || script == HB_SCRIPT_HEBREW ||
+               script == HB_SCRIPT_SYRIAC || script == HB_SCRIPT_THAANA || is_rtl)
+                dir = HB_DIRECTION_RTL;
+            else if(script == HB_SCRIPT_LATIN || script == HB_SCRIPT_CYRILLIC || script == HB_SCRIPT_GREEK ||
+               (cat >= HB_UNICODE_GENERAL_CATEGORY_SURROGATE &&
+                cat <= HB_UNICODE_GENERAL_CATEGORY_CONNECT_PUNCTUATION) ||
+                cat == HB_UNICODE_GENERAL_CATEGORY_CURRENCY_SYMBOL)
+                dir = HB_DIRECTION_LTR;
+
+            bool is_punct = dir == HB_DIRECTION_INVALID &&
+                ((c < 128 && (ispunct((char)c) || isspace((char)c))) ||
+               (cat >= HB_UNICODE_GENERAL_CATEGORY_DASH_PUNCTUATION &&
+                cat <= HB_UNICODE_GENERAL_CATEGORY_OPEN_PUNCTUATION) ||
+               (cat >= HB_UNICODE_GENERAL_CATEGORY_MODIFIER_SYMBOL &&
+                cat <= HB_UNICODE_GENERAL_CATEGORY_SPACE_SEPARATOR) ||
+                 cat == HB_UNICODE_GENERAL_CATEGORY_FORMAT);
+
+            // when we switch to fallback (e.g. uni) font for some characters after quote or open paren,
+            // and when we meet the corresponding closing quote/closing paren, we would prefer to
+            // take it from the same font. this hack helps to achieve this effect in some cases
+            if (is_punct && c < 256 && cat != HB_UNICODE_GENERAL_CATEGORY_FORMAT &&
+                cat != HB_UNICODE_GENERAL_CATEGORY_SPACE_SEPARATOR && !isspace((char)c) &&
+                curr_script != HB_SCRIPT_LATIN && curr_script != HB_SCRIPT_CYRILLIC && curr_dir != HB_DIRECTION_RTL)
+            {
+                is_punct = false;
+                script = HB_SCRIPT_LATIN;
+                dir = HB_DIRECTION_LTR;
+            }
+
+        #if 0
+            printf("%d. c=%d, scr=%c%c%c%c, cat=%d, is_rtl=%d, dir=%s, is_punct=%d\n", i, c,
+            (script>>24)&255, (script>>16)&255, (script>>8)&255, (script>>0)&255, (int)cat, (int)is_rtl,
+             (dir == HB_DIRECTION_INVALID? "invalid" : dir == HB_DIRECTION_LTR ? "left" : "right"), (int)is_punct);
+        #endif
+
+            if(glyph_index != 0 ||
+               (cat == HB_UNICODE_GENERAL_CATEGORY_FORMAT &&
+                dir == HB_DIRECTION_INVALID))
+            {
+                if(is_punct)
+                {
+                    if(punctstart < 0)
+                        punctstart = i;
+                    continue;
+                }
+
+                if(cat == HB_UNICODE_GENERAL_CATEGORY_SURROGATE || cat == HB_UNICODE_GENERAL_CATEGORY_NON_SPACING_MARK ||
+                   ((script == curr_script || curr_script == HB_SCRIPT_UNKNOWN || curr_script == HB_SCRIPT_COMMON ||
+                    script == HB_SCRIPT_UNKNOWN || script == HB_SCRIPT_COMMON || script == HB_SCRIPT_INHERITED) &&
+                    (dir == curr_dir || curr_dir == HB_DIRECTION_INVALID || dir == HB_DIRECTION_INVALID)))
+                {
+                    punctstart = -1;
+                    if(curr_dir == HB_DIRECTION_INVALID)
+                        curr_dir = dir;
+                    if(curr_script == HB_SCRIPT_UNKNOWN || curr_script == HB_SCRIPT_INHERITED)
+                        curr_script = script;
+                    continue;
+                }
+            }
+
+            if(glob_dir == HB_DIRECTION_INVALID)
+            {
+                glob_dir = curr_dir;
+                if(glob_dir == HB_DIRECTION_INVALID)
+                    glob_dir = dir;
+            }
+
+            // pick the first font that covers the character: the user font, then the
+            // built-in slots (empty slots have hb_font == 0 and are skipped by hbGlyphIndex)
+            hb_font_t* cand_hb = hb_font0;
+            for(int attempt = 0; attempt < 2; attempt++)
+            {
+                for(j = -1; j < BUILTIN_FONTS_NUM; j++)
+                {
+                    cand_hb = j < 0 ? hb_font0 : builtin_ffaces[j]->hb_font;
+                    glyph_index = hbGlyphIndex(cand_hb, c);
+                    if(glyph_index != 0)
+                        break;
+                }
+                if(j < BUILTIN_FONTS_NUM || attempt > 0)
+                    break;
+                chars[i] = c = '?'; // no font covers the character: draw 'unknown' ~ <?> instead (TBD: 0xFFFD)
+            }
+            if(j >= BUILTIN_FONTS_NUM)
+                j = -1; // not even '?' is available; stay with the user font
+            int fontidx = j;
+            int seglen = i - segstart;
+            // if the current segment (if any) ends with 1 or more neutral/punctuation characters,
+            // we have 3 choices:
+            //   1. attach this "tail" to the current segment
+            //   2. make this "tail" the head of the new segment
+            //   3. split those characters somehow between the current and the new segment
+            // if the current segment direction matches the global direction, we choose the option 1.
+            // otherwise we choose the option 3, depending on which characters from the tail
+            // are available in the new font for the new segment.
+            // Unless they are some specific marks, they are all available, in which case
+            // the option 3 turns into the option 2.
+            if(seglen > 0 && punctstart >= 0 && glob_dir != curr_dir)
+            {
+                for(k = i; k > punctstart; k--)
+                {
+                    if(hbGlyphIndex(cand_hb, chars[k-1]) == 0)
+                        break;
+                }
+                seglen = k - segstart;
+            }
+
+            if(seglen > 0)
+            {
+                //printf("segment of %d characters pushed\n", seglen);
+                segments.push_back(TextSegment(curr_fontidx,
+                    segstart, segstart + seglen, curr_script, curr_dir));
+            }
+            segstart += seglen;
+            punctstart = punctstart >= 0 && is_punct ? segstart : -1;
+            curr_hb_font = cand_hb;
+            curr_fontidx = fontidx;
+            curr_script = script;
+            curr_dir = dir;
+        }
+
+        if(i > segstart)
+        {
+            segments.push_back(TextSegment(curr_fontidx,
+                segstart, i, curr_script, curr_dir));
+        }
+
+        if(glob_dir == HB_DIRECTION_INVALID)
+            glob_dir = HB_DIRECTION_LTR;
+
+        int nsegments = (int)segments.size();
+
+        if(nsegments > 0)
+        {
+            TextSegment& seg = segments[0];
+            if(seg.dir == HB_DIRECTION_INVALID)
+                seg.dir = glob_dir;
+            if(seg.script == HB_SCRIPT_INVALID)
+                seg.script = HB_SCRIPT_COMMON;
+        }
+
+        // step 3. try to merge some segments
+        for(k = 0, j = 1; j < nsegments; j++)
+        {
+            TextSegment& seg = segments[j];
+            if(seg.dir == HB_DIRECTION_INVALID)
+                seg.dir = glob_dir;
+            hb_script_t script = seg.script;
+            if(script == HB_SCRIPT_INVALID)
+                seg.script = script = HB_SCRIPT_COMMON;
+            TextSegment& prev = segments[k];
+            if(seg.fontidx == prev.fontidx && seg.dir == prev.dir &&
+               (script == prev.script ||
+                ((script == HB_SCRIPT_COMMON || script == HB_SCRIPT_LATIN ||
+                  script == HB_SCRIPT_CYRILLIC || script == HB_SCRIPT_GREEK ||
+                  script == HB_SCRIPT_HAN || script == HB_SCRIPT_HIRAGANA) &&
+                 (prev.script == HB_SCRIPT_COMMON || prev.script == HB_SCRIPT_LATIN ||
+                  prev.script == HB_SCRIPT_CYRILLIC || prev.script == HB_SCRIPT_GREEK ||
+                  prev.script == HB_SCRIPT_HAN || prev.script == HB_SCRIPT_HIRAGANA))))
+            {
+                prev.end = seg.end;
+                if(prev.script != script)
+                    prev.script = HB_SCRIPT_COMMON;
+            }
+            else
+            {
+                k++;
+                if(j > k)
+                    segments[k] = seg;
+            }
+        }
+
+        if(nsegments > 0)
+            segments.resize(k+1);
+        else
+            nextline_dy = prev_dy;
+        nsegments = (int)segments.size();
+
+        if(glob_dir == HB_DIRECTION_RTL)
+        {
+            std::reverse(segments.begin(), segments.end());
+        }
+        //printf("%s: nsegments=%d\n", str_.c_str(), nsegments);
+
+        // step 4. shape each text segment using Harfbuzz
+        for(j = 0; j < nsegments; j++)
+        {
+            const TextSegment& seg = segments[j];
+            int fontidx = seg.fontidx;
+            FontFace& fface = fontidx < 0 ? fontface : builtin_ffaces[fontidx];
+            hb_font_t* hb_font = fface->hb_font;
+            hb_buffer_reset(hb_buf);
+            hb_buffer_add_utf32(hb_buf, chars, len, seg.start, seg.end - seg.start);
+            hb_buffer_set_direction(hb_buf, seg.dir);
+            hb_buffer_set_script(hb_buf, seg.script);
+            hb_shape(hb_font, hb_buf, 0, 0);
+
+            unsigned nglyphs = 0;
+            hb_glyph_info_t *ginfo = hb_buffer_get_glyph_infos(hb_buf, &nglyphs);
+            hb_glyph_position_t* gpos = hb_buffer_get_glyph_positions(hb_buf, &nglyphs);
+
+            for(k = 0; k < (int)nglyphs; k++)
+            {
+                FontGlyph glyph(hb_font, ginfo[k].codepoint, gpos[k]);
+                glyphs.push_back(glyph);
+            }
+        }
+
+        chars += i;
+        len -= i;
+
+        if(len > 0 && chars[0] == '\n')
+        {
+            chars++;
+            len--;
+        }
+
+        // step 5. finally, let's render it
+        // (TODO: in the case of right alignment we need to render it from the right-most character)
+        int nglyphs = (int)glyphs.size();
+        int space_glyph = -1;
+        min_x = std::min(min_x, pen.x);
+        max_x = std::max(max_x, pen.x);
+
+        curr_hb_font = 0;
+        int ascent = 0, descent = 0, linegap = 0;
+        for(j = 0; j < nglyphs; j++)
+        {
+            const FontGlyph& glyph = glyphs[alignment == PUT_TEXT_ALIGN_RIGHT ? nglyphs - j - 1 : j];
+            hb_font_t* hbf = glyph.hb_font;
+            if(hbf != curr_hb_font)
+            {
+                curr_hb_font = hbf;
+                hb_codepoint_t sp = 0;
+                space_glyph = hb_font_get_nominal_glyph(hbf, ' ', &sp) ? (int)sp : -1;
+                hb_font_extents_t fext;
+                hb_font_get_h_extents(hbf, &fext);
+                ascent  = fext.ascender;
+                descent = fext.descender;
+                linegap = fext.line_gap;
+                if (linegap == 0) linegap = ascent - descent;
+            }
+            GlyphCacheKey key(hbf, glyph.index, size, weight);
+            GlyphCacheVal* cached = findCachedGlyph(key);
+            const uchar* bitmap_buf = 0;
+            int bitmap_step = 0;
+            Rect bbox;
+
+            if(!cached)
+            {
+                cached = &new_cached;
+                int w=0, h=0;
+                // One rasterizer per thread_local engine: its internal scratch
+                // (edges, row buffers, edge buckets) and the output image are
+                // reused across glyphs instead of reallocated per glyph.
+                if(!raster_draw)
+                    raster_draw = hb_raster_draw_create_or_fail();
+                hb_raster_draw_t* rd = raster_draw;
+                if(!rd)
+                    continue;
+                // Outline coords come in 26.6 (font scaled to size*64); the
+                // rasterizer divides by the scale factor, so 64 -> device pixels
+                // and the output extents are whole pixels.
+                hb_raster_draw_set_scale_factor(rd, 64.f, 64.f);
+                hb_raster_extents_t zext;
+                memset(&zext, 0, sizeof(zext));
+                hb_raster_draw_set_extents(rd, &zext);
+                hb_glyph_extents_t gext;
+                if(hb_font_get_glyph_extents(hbf, glyph.index, &gext))
+                    hb_raster_draw_set_glyph_extents(rd, &gext);
+                hb_raster_draw_glyph(rd, hbf, glyph.index);
+                hb_raster_image_t* rimg = hb_raster_draw_render(rd);
+
+                hb_raster_extents_t rext;
+                memset(&rext, 0, sizeof(rext));
+                const uint8_t* rbuf = 0;
+                if(rimg)
+                {
+                    hb_raster_image_get_extents(rimg, &rext);
+                    rbuf = hb_raster_image_get_buffer(rimg);
+                }
+                w = (int)rext.width;
+                h = (int)rext.height;
+
+                // Copy the A8 mask into the persistent scratch buffer (it must
+                // outlive the raster image) flipping rows: hb-raster buffers are
+                // bottom-up (y-up), drawCharacter expects top-down.
+                bitmap_step = w;
+                if(w > 0 && h > 0 && rbuf)
+                {
+                    size_t need = (size_t)w*h;
+                    if(need > glyph_buf.size())
+                        glyph_buf.resize(need);
+                    unsigned src_step = rext.stride ? rext.stride : (unsigned)w;
+                    for(int yy = 0; yy < h; yy++)
+                        memcpy(glyph_buf.data() + yy*w, rbuf + (size_t)(h-1-yy)*src_step, w);
+                }
+                bitmap_buf = glyph_buf.empty() ? 0 : glyph_buf.data();
+
+                // Hand the image back to the rasterizer to reuse next time
+                // instead of freeing it (render() already cleared geometry).
+                if(rimg)
+                    hb_raster_draw_recycle_image(rd, rimg);
+
+                cached->width = w;
+                cached->height = h;
+                cached->advance.x = 0;  // advance comes from the shaped position
+                cached->advance.y = 0;
+                cached->ascent = cvRound(ascent/double(1 << FRAC_BITS));
+                cached->linegap = cvRound(linegap/double(1 << FRAC_BITS));
+                // extents are whole pixels (scale factor 64); bearings are 1/64 px
+                cached->horiBearingX = rext.x_origin * (1 << FRAC_BITS);
+                cached->horiBearingY = (rext.y_origin + h) * (1 << FRAC_BITS);
+
+                bbox = Rect(0, 0, w, h);
+
+                if(w <= MAX_CACHED_GLYPH_SIZE && h <= MAX_CACHED_GLYPH_SIZE)
+                {
+                    compressCharacter(bitmap_buf, bitmap_step, Size(w, h),
+                                      cached->rlebuf, cached->bbox,
+                                      0 //&cached->crc
+                                      );
+                    addToCache(key, *cached);
+                }
+            }
+            else
+            {
+                if(render)
+                {
+                    CV_Assert(decompressCharacter(cached->rlebuf, cached->bbox,
+                                                  pixbuf, 0 //&cached->crc
+                                                  ));
+                }
+                bitmap_buf = pixbuf.empty() ? 0 : &pixbuf[0];
+                bitmap_step = cached->bbox.width;
+                bbox = cached->bbox;
+            }
+
+            const hb_glyph_position_t& pos = glyph.pos;
+            // Advances are 26.6 fixed point. Round each advance to the nearest
+            // whole pixel and keep the pen on integer pixels (rather than flooring
+            // with >>6): glyphs are rasterized/cached at integer positions, so a
+            // sub-pixel pen would only add jitter to the inter-glyph gaps, while
+            // flooring every advance systematically tightens the spacing. Rounding
+            // the advance keeps the gaps even and removes that bias.
+            int dx = roundFixPt(pos.x_advance, FRAC_BITS);
+            int dy = roundFixPt(pos.y_advance, FRAC_BITS);
+            int new_pen_x = pen.x + dx*alignSign;
+            nextline_dy = max(nextline_dy, cached->linegap);
+            // TODO: this wrapping algorithm is quite dumb,
+            // preferably should split text at word boundary
+            if( wrap && imgsize.width > 0 && new_pen_x*alignSign > x1*alignSign )
+            {
+                pen.y += nextline_dy;
+                dy = 0;
+                pen.x = x0;
+                wrapped = true;
+                //max_baseline = 0;
+                if(glyph.index == space_glyph) continue;
+                new_pen_x = pen.x + dx*alignSign;
+            }
+
+            if(!wrapped)
+                max_dy = std::max(max_dy, cached->ascent);
+            int baseline = cached->height - (cached->horiBearingY >> FRAC_BITS);
+            max_baseline = std::max(max_baseline, baseline);
+
+            if(alignment == PUT_TEXT_ALIGN_RIGHT)
+                pen.x = new_pen_x;
+
+            int x = pen.x + bbox.x + ((pos.x_offset + cached->horiBearingX) >> FRAC_BITS);
+            int y = pen.y + (bottom_left ? 1 : -1)*(((pos.y_offset +
+                                                      cached->horiBearingY) >> FRAC_BITS) - bbox.y);
+
+            if( render )
+            {
+                //circle(img, pen, 2, Scalar(0, 0, 128), -1, LINE_AA);
+                drawCharacter(img, color, bitmap_buf, bitmap_step, bbox.size(), x, y, bottom_left);
+            }
+
+            pen.x = new_pen_x;
+            pen.y += dy;
+            min_x = std::min(min_x, pen.x);
+            max_x = std::max(max_x, pen.x);
+        }
+
+        if(len > 0 && (pen.x != x0 || segments.empty()))
+        {
+            pen.x = x0;
+            pen.y += nextline_dy;
+            prev_dy = nextline_dy;
+        }
+    }
+
+    if(bbox_)
+    {
+        if(flags & PUT_TEXT_ORIGIN_BL)
+            *bbox_ = Rect(min_x, org.y - max_baseline, max_x - min_x + 1, pen.y - org.y + max_dy + max_baseline);
+        else
+            *bbox_ = Rect(min_x, org.y - max_dy, max_x - min_x + 1, pen.y - org.y + max_dy + max_baseline);
+    }
+
+    return pen;
+}
+
+
+Point putText(InputOutputArray img_, const String& str,
+             Point org, Scalar color_,
+             FontFace& fontface, int size,
+             int weight, PutTextFlags flags, Range wrap)
+{
+    uchar color[] =
+    {
+        saturate_cast<uchar>(color_[0]), saturate_cast<uchar>(color_[1]),
+        saturate_cast<uchar>(color_[2]), saturate_cast<uchar>(color_[3])
+    };
+    Mat img = img_.getMat();
+    int nch = img.channels();
+    CV_Assert(img.depth() == CV_8U);
+    CV_Assert(nch == 1 || nch == 3 || nch == 4);
+
+    return fontRenderEngine.putText_(img, img.size(), str, org, color, fontface, size,
+                                     weight, flags, wrap, true, 0);
+}
+
+
+Rect getTextSize(Size imgsize, const String& str, Point org,
+                 FontFace& fontface, int size,
+                 int weight, PutTextFlags flags, Range wrap)
+{
+    Mat img;
+    Rect bbox;
+    fontRenderEngine.putText_(img, imgsize, str, org, 0, fontface, size,
+                              weight, flags, wrap, false, &bbox);
+    return bbox;
+}
+
+} // namespace cv
+
+#else // HAVE_HARFBUZZ
+
+namespace cv
+{
+
+// Text rendering is implemented entirely on top of HarfBuzz. When OpenCV is
+// built without it, the public text API is present but throws.
+struct FontFace::Impl {};
+
+FontFace::FontFace() {}
+FontFace::FontFace(const String&) {}
+bool FontFace::set(const String&) { return false; }
+String FontFace::getName() const { return String(); }
+FontFace::Impl* FontFace::operator -> () { return impl.get(); }
+FontFace::~FontFace() {}
+bool FontFace::setInstance(const std::vector<int>&) { return false; }
+bool FontFace::getInstance(std::vector<int>&) const { return false; }
+bool FontFace::getBuiltinFontData(const String&, const uchar*&, size_t&) { return false; }
+bool FontFace::setBuiltinFont(const String&, const String&) { return false; }
+
+#define OPENCV_NO_TEXT_RENDERING_MSG \
+    "Text rendering is not supported. Compile OpenCV with WITH_HARFBUZZ=ON."
+
+Point putText(InputOutputArray, const String&, Point, Scalar,
+              FontFace&, int, int, PutTextFlags, Range)
+{
+    CV_Error(Error::StsNotImplemented, OPENCV_NO_TEXT_RENDERING_MSG);
+}
+
+Rect getTextSize(Size, const String&, Point, FontFace&, int, int, PutTextFlags, Range)
+{
+    CV_Error(Error::StsNotImplemented, OPENCV_NO_TEXT_RENDERING_MSG);
+}
+
+} // namespace cv
+
+#endif // HAVE_HARFBUZZ
+
+//////////////////////////// text drawing functions for backward compatibility ///////////////////////////
+
+namespace cv
+{
+
+static void hersheyToTruetype(int fontFace, double fontScale, int thickness,
+                              String& ttname, int& ttsize, int& ttweight)
+{
+    double sf = 0;
+    switch(fontFace & ~FONT_ITALIC)
+    {
+    case FONT_HERSHEY_PLAIN:
+        ttname = "sans";
+        sf = 6.6;
+        ttweight = thickness <= 1 ? 400 : 800;
+        break;
+    case FONT_HERSHEY_SIMPLEX:
+        ttname = "sans";
+        sf = 3.7;
+        ttweight = thickness <= 1 ? 400 : 600;
+        break;
+    case FONT_HERSHEY_DUPLEX:
+        ttname = "sans";
+        sf = 3.7;
+        ttweight = thickness <= 1 ? 600 : 800;
+        break;
+    case FONT_HERSHEY_COMPLEX:
+        ttname = "serif";
+        sf = 3.7;
+        ttweight = thickness <= 1 ? 400 : 800;
+        break;
+    case FONT_HERSHEY_TRIPLEX:
+        ttname = "serif";
+        sf = 3.7;
+        ttweight = thickness <= 1 ? 600 : 800;
+        break;
+    case FONT_HERSHEY_COMPLEX_SMALL:
+        ttname = "serif";
+        sf = 4.6;
+        ttweight = thickness <= 1 ? 400 : 800;
+        break;
+    case FONT_HERSHEY_SCRIPT_COMPLEX:
+        ttname = "italic";
+        sf = 4.0;
+        ttweight = thickness <= 1 ? 400 : 600;
+        break;
+    case FONT_HERSHEY_SCRIPT_SIMPLEX:
+        ttname = "italic";
+        sf = 4.0;
+        ttweight = thickness <= 1 ? 300 : 500;
+        break;
+    default:
+        CV_Error(Error::StsBadArg, "Unknown font");
+    }
+
+    ttsize = cvRound(100*fontScale/sf);
+}
+
+void putText( InputOutputArray _img, const String& text, Point org,
+              int fontFace, double fontScale, Scalar color,
+              int thickness, int, bool bottomLeftOrigin )
+
+{
+    String ttname;
+    int ttsize = 0;
+    int ttweight = 0;
+    hersheyToTruetype(fontFace, fontScale, thickness, ttname, ttsize, ttweight);
+    FontFace fface(ttname);
+    PutTextFlags flags = bottomLeftOrigin ? PUT_TEXT_ORIGIN_BL : PUT_TEXT_ORIGIN_TL;
+    putText(_img, text, org, color, fface, ttsize, ttweight, flags);
+}
+
+Size getTextSize(const String& text, int fontFace, double fontScale, int thickness, int* _base_line)
+{
+    String ttname;
+    int ttsize = 0;
+    int ttweight = 0;
+    hersheyToTruetype(fontFace, fontScale, thickness, ttname, ttsize, ttweight);
+
+    FontFace fface(ttname);
+    Rect r = getTextSize(Size(), text, Point(), fface, ttsize, ttweight, PUT_TEXT_ALIGN_LEFT);
+
+    int baseline = r.y + r.height;
+    if(_base_line)
+        *_base_line = baseline;
+    return Size(r.width, r.height - baseline);
+}
+
+double getFontScaleFromHeight(const int fontFace, const int pixelHeight, const int thickness)
+{
+    String ttname;
+    int ttsize = 0;
+    int ttweight = 0;
+    hersheyToTruetype(fontFace, 1.0, thickness, ttname, ttsize, ttweight);
+    return (double)pixelHeight/ttsize;
+}
+
+} // namespace cv

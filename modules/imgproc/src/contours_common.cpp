@@ -6,6 +6,8 @@
 #include "contours_common.hpp"
 #include <map>
 #include <limits>
+#include "opencv2/core/hal/intrin.hpp"
+#include "opencv2/core/check.hpp"
 
 using namespace std;
 using namespace cv;

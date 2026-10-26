@@ -1483,7 +1483,7 @@ typedef ArithmTestBase Normalize;
 
 OCL_TEST_P(Normalize, Mat)
 {
-    static int modes[] = { CV_MINMAX, CV_L2, CV_L1, CV_C };
+    static int modes[] = { NORM_MINMAX, NORM_L2, NORM_L1, NORM_INF };
 
     for (int j = 0; j < test_loop_times; j++)
     {
@@ -1694,9 +1694,9 @@ OCL_TEST_P(ConvertFp16, Mat)
     for (int j = 0; j < test_loop_times; j++)
     {
         generateTestData();
-
-        OCL_OFF(cv::convertFp16(src_roi, dst_roi));
-        OCL_ON(cv::convertFp16(usrc_roi, udst_roi));
+        int cvt_code = src_roi.depth() == CV_32F ? CV_16F : CV_32F;
+        OCL_OFF(src_roi.convertTo(dst_roi, cvt_code));
+        OCL_ON(usrc_roi.convertTo(udst_roi, cvt_code));
 
         Near(1);
     }
@@ -1721,8 +1721,36 @@ OCL_TEST_P(ScaleAdd, Mat)
 
 //////////////////////////////// PatchNans ////////////////////////////////////////////////
 
-PARAM_TEST_CASE(PatchNaNs, Channels, bool)
+template<typename _Tp>
+_Tp randomNan(RNG& rng);
+
+template<>
+float randomNan(RNG& rng)
 {
+    uint32_t r = rng.next();
+    Cv32suf v;
+    v.u = r;
+    // exp & set a bit to avoid zero mantissa
+    v.u = v.u | 0x7f800001;
+    return v.f;
+}
+
+template<>
+double randomNan(RNG& rng)
+{
+    uint32_t r0 = rng.next();
+    uint32_t r1 = rng.next();
+    Cv64suf v;
+    v.u = (uint64_t(r0) << 32) | uint64_t(r1);
+    // exp &set a bit to avoid zero mantissa
+    v.u = v.u | 0x7ff0000000000001;
+    return v.f;
+}
+
+
+PARAM_TEST_CASE(PatchNaNs, MatDepth, Channels, bool)
+{
+    int ftype;
     int cn;
     bool use_roi;
     double value;
@@ -1731,13 +1759,14 @@ PARAM_TEST_CASE(PatchNaNs, Channels, bool)
 
     virtual void SetUp()
     {
-        cn = GET_PARAM(0);
-        use_roi = GET_PARAM(1);
+        ftype = GET_PARAM(0);
+        cn = GET_PARAM(1);
+        use_roi = GET_PARAM(2);
     }
 
     void generateTestData()
     {
-        const int type = CV_MAKE_TYPE(CV_32F, cn);
+        const int type = CV_MAKE_TYPE(ftype, cn);
 
         Size roiSize = randomSize(1, 10);
         Border srcBorder = randomBorder(0, use_roi ? MAX_VALUE : 0);
@@ -1747,9 +1776,19 @@ PARAM_TEST_CASE(PatchNaNs, Channels, bool)
         roiSize.width *= cn;
         for (int y = 0; y < roiSize.height; ++y)
         {
-            float * const ptr = src_roi.ptr<float>(y);
+            float  *const ptrf = src_roi.ptr<float >(y);
+            double *const ptrd = src_roi.ptr<double>(y);
             for (int x = 0; x < roiSize.width; ++x)
-                ptr[x] = randomInt(-1, 1) == 0 ? std::numeric_limits<float>::quiet_NaN() : ptr[x];
+            {
+                if (ftype == CV_32F)
+                {
+                    ptrf[x] = randomInt(-1, 1) == 0 ? randomNan<float >(rng) : ptrf[x];
+                }
+                else if (ftype == CV_64F)
+                {
+                    ptrd[x] = randomInt(-1, 1) == 0 ? randomNan<double>(rng) : ptrd[x];
+                }
+            }
         }
 
         value = randomDouble(-100, 100);
@@ -1775,6 +1814,84 @@ OCL_TEST_P(PatchNaNs, Mat)
         Near();
     }
 }
+
+//////////////////////////////// finiteMask /////////////////////////////////////////////
+
+
+PARAM_TEST_CASE(FiniteMask, MatDepth, Channels, bool)
+{
+    int ftype;
+    int cn;
+    bool use_roi;
+
+    TEST_DECLARE_INPUT_PARAMETER(src);
+    TEST_DECLARE_OUTPUT_PARAMETER(mask);
+
+    virtual void SetUp()
+    {
+        ftype = GET_PARAM(0);
+        cn = GET_PARAM(1);
+        use_roi = GET_PARAM(2);
+    }
+
+    void generateTestData()
+    {
+        const int type = CV_MAKE_TYPE(ftype, cn);
+
+        Size roiSize = randomSize(1, MAX_VALUE);
+        Border srcBorder = randomBorder(0, use_roi ? MAX_VALUE : 0);
+        randomSubMat(src, src_roi, roiSize, srcBorder, type, -40, 40);
+
+        randomSubMat(mask, mask_roi, roiSize, srcBorder, CV_8UC1, 5, 16);
+
+        // generating NaNs
+        const softfloat  fpinf = softfloat ::inf();
+        const softfloat  fninf = softfloat ::inf().setSign(true);
+        const softdouble dpinf = softdouble::inf();
+        const softdouble dninf = softdouble::inf().setSign(true);
+        for (int y = 0; y < roiSize.height; ++y)
+        {
+            float  *const ptrf = src_roi.ptr<float >(y);
+            double *const ptrd = src_roi.ptr<double>(y);
+            for (int x = 0; x < roiSize.width * cn; ++x)
+            {
+                int rem = randomInt(0, 10);
+                if (ftype == CV_32F)
+                {
+                    ptrf[x] = rem <  4 ? randomNan<float >(rng) :
+                              rem == 5 ? (float )((x + y)%2 ? fpinf : fninf) : ptrf[x];
+                }
+                else if (ftype == CV_64F)
+                {
+                    ptrd[x] = rem <  4 ? randomNan<double>(rng) :
+                              rem == 5 ? (double)((x + y)%2 ? dpinf : dninf) : ptrd[x];
+                }
+            }
+        }
+
+        UMAT_UPLOAD_INPUT_PARAMETER(src);
+        UMAT_UPLOAD_OUTPUT_PARAMETER(mask);
+    }
+
+    void Near()
+    {
+        OCL_EXPECT_MATS_NEAR(mask, 0);
+    }
+};
+
+OCL_TEST_P(FiniteMask, Mat)
+{
+    for (int j = 0; j < test_loop_times; j++)
+    {
+        generateTestData();
+
+        OCL_OFF(cv::finiteMask(src_roi, mask_roi));
+        OCL_ON(cv::finiteMask(usrc_roi, umask_roi));
+
+        Near();
+    }
+}
+
 
 //////////////////////////////// Psnr ////////////////////////////////////////////////
 
@@ -1943,14 +2060,15 @@ OCL_INSTANTIATE_TEST_CASE_P(Arithm, Magnitude, Combine(::testing::Values(CV_32F,
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, Flip, Combine(OCL_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, MinMaxIdx, Combine(OCL_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, MinMaxIdx_Mask, Combine(OCL_ALL_DEPTHS, ::testing::Values(Channels(1)), Bool()));
-OCL_INSTANTIATE_TEST_CASE_P(Arithm, Norm, Combine(OCL_ALL_DEPTHS_16F, OCL_ALL_CHANNELS, Bool()));
+OCL_INSTANTIATE_TEST_CASE_P(Arithm, Norm, Combine(OCL_ABSOLUTELY_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, Sqrt, Combine(::testing::Values(CV_32F, CV_64F), OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, Normalize, Combine(OCL_ALL_DEPTHS, Values(Channels(1)), Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, InRange, Combine(OCL_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool(), Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, ConvertScaleAbs, Combine(OCL_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, ConvertFp16, Combine(OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, ScaleAdd, Combine(OCL_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool()));
-OCL_INSTANTIATE_TEST_CASE_P(Arithm, PatchNaNs, Combine(OCL_ALL_CHANNELS, Bool()));
+OCL_INSTANTIATE_TEST_CASE_P(Arithm, PatchNaNs, Combine(::testing::Values(CV_32F, CV_64F), OCL_ALL_CHANNELS, Bool()));
+OCL_INSTANTIATE_TEST_CASE_P(Arithm, FiniteMask, Combine(::testing::Values(CV_32F, CV_64F), OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, Psnr, Combine(::testing::Values((MatDepth)CV_8U), OCL_ALL_CHANNELS, Bool()));
 OCL_INSTANTIATE_TEST_CASE_P(Arithm, UMatDot, Combine(OCL_ALL_DEPTHS, OCL_ALL_CHANNELS, Bool()));
 
@@ -2005,6 +2123,133 @@ OCL_TEST(Normalize, DISABLED_regression_5876_inplace_change_type)
 
     EXPECT_EQ(0, cvtest::norm(um, uresult, NORM_INF));
 }
+
+// Regression: predictOptimalVectorWidth() must handle every depth without
+// reading past its per-depth table.
+OCL_TEST(Arithm, predictOptimalVectorWidth_all_depths)
+{
+    if (!cv::ocl::useOpenCL())
+        return;
+
+    const int depths[] = { CV_8U, CV_8S, CV_16U, CV_16S, CV_32S, CV_32F, CV_64F,
+                           CV_16F, CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U };
+    for (size_t i = 0; i < sizeof(depths) / sizeof(depths[0]); ++i)
+    {
+        const int depth = depths[i];
+        for (int cn = 1; cn <= 4; ++cn)
+        {
+            const int type = CV_MAKE_TYPE(depth, cn);
+            UMat a(11, 13, type), b(11, 13, type);
+            EXPECT_GE(cv::ocl::predictOptimalVectorWidth(a), 1)
+                << "depth=" << depth << " cn=" << cn;
+            EXPECT_GE(cv::ocl::predictOptimalVectorWidth(a, b), 1)
+                << "depth=" << depth << " cn=" << cn;
+        }
+    }
+}
+
+// UMat arithmetic on a depth with no OpenCL type must fall back to the CPU path
+OCL_TEST(Arithm, bf16_falls_back_to_cpu)
+{
+    Mat a32(11, 13, CV_32FC1), b32(11, 13, CV_32FC1);
+    randu(a32, -10, 10);
+    randu(b32, 1, 10);
+
+    Mat a, b;
+    a32.convertTo(a, CV_16BF);
+    b32.convertTo(b, CV_16BF);
+
+    UMat ua = a.getUMat(ACCESS_READ), ub = b.getUMat(ACCESS_READ);
+
+    auto expectSame = [](const char* name, const Mat& dst, const UMat& udst)
+    {
+        Mat d32, u32;
+        dst.convertTo(d32, CV_32F);
+        udst.getMat(ACCESS_READ).convertTo(u32, CV_32F);
+        EXPECT_EQ(0, cvtest::norm(d32, u32, NORM_INF)) << name;
+    };
+
+    Mat dst; UMat udst;
+    cv::add(a, b, dst);                      cv::add(ua, ub, udst);                      expectSame("add", dst, udst);
+    cv::subtract(a, b, dst);                 cv::subtract(ua, ub, udst);                 expectSame("subtract", dst, udst);
+    cv::multiply(a, b, dst);                 cv::multiply(ua, ub, udst);                 expectSame("multiply", dst, udst);
+    cv::divide(a, b, dst);                   cv::divide(ua, ub, udst);                   expectSame("divide", dst, udst);
+    cv::absdiff(a, b, dst);                  cv::absdiff(ua, ub, udst);                  expectSame("absdiff", dst, udst);
+    cv::min(a, b, dst);                      cv::min(ua, ub, udst);                      expectSame("min", dst, udst);
+    cv::max(a, b, dst);                      cv::max(ua, ub, udst);                      expectSame("max", dst, udst);
+    cv::addWeighted(a, 0.5, b, 0.5, 1, dst); cv::addWeighted(ua, 0.5, ub, 0.5, 1, udst); expectSame("addWeighted", dst, udst);
+    cv::add(a, Scalar(2), dst);              cv::add(ua, Scalar(2), udst);              expectSame("add scalar", dst, udst);
+}
+
+// UMat bitwise ops on depths with no OpenCL type name must match Mat (bit-exact)
+PARAM_TEST_CASE(BitwiseNoOclType, MatDepth)
+{
+};
+
+OCL_TEST_P(BitwiseNoOclType, Accuracy)
+{
+    const int depth = GET_PARAM(0);
+
+    Mat a(11, 13, depth), b(11, 13, depth), mask(11, 13, CV_8UC1);
+    // fill the raw bytes; CV_Bool elements must stay 0 or 1
+    const int maxByte = depth == CV_Bool ? 2 : 256;
+    randu(Mat(a.rows, a.cols * (int)a.elemSize(), CV_8UC1, a.data), 0, maxByte);
+    randu(Mat(b.rows, b.cols * (int)b.elemSize(), CV_8UC1, b.data), 0, maxByte);
+    randu(mask, 0, 2);
+    UMat ua = a.getUMat(ACCESS_READ), ub = b.getUMat(ACCESS_READ), umask = mask.getUMat(ACCESS_READ);
+
+    auto expectSameBits = [](const char* name, const Mat& dst, const UMat& udst)
+    {
+        Mat u = udst.getMat(ACCESS_READ);
+        ASSERT_EQ(dst.type(), u.type()) << name;
+        ASSERT_EQ(dst.size(), u.size()) << name;
+        EXPECT_EQ(0, memcmp(dst.data, u.data, dst.total() * dst.elemSize())) << name;
+    };
+
+    Mat dst; UMat udst;
+    cv::bitwise_and(a, b, dst);  cv::bitwise_and(ua, ub, udst);  expectSameBits("and", dst, udst);
+    cv::bitwise_or(a, b, dst);   cv::bitwise_or(ua, ub, udst);   expectSameBits("or", dst, udst);
+    cv::bitwise_xor(a, b, dst);  cv::bitwise_xor(ua, ub, udst);  expectSameBits("xor", dst, udst);
+    cv::bitwise_not(a, dst);     cv::bitwise_not(ua, udst);      expectSameBits("not", dst, udst);
+
+    dst = Mat::zeros(a.size(), depth); udst = UMat::zeros(a.size(), depth);
+    cv::bitwise_and(a, b, dst, mask); cv::bitwise_and(ua, ub, udst, umask); expectSameBits("and mask", dst, udst);
+}
+
+OCL_INSTANTIATE_TEST_CASE_P(Arithm, BitwiseNoOclType,
+                            Values(CV_16BF, CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ));
+
+// UMat compare() with a scalar must match Mat compare() for the 5.x integer depths
+PARAM_TEST_CASE(CompareScalarNewIntDepths, MatDepth, double)
+{
+};
+
+OCL_TEST_P(CompareScalarNewIntDepths, Accuracy)
+{
+    const int depth = GET_PARAM(0);
+    const double scalar = GET_PARAM(1);
+
+    int vals[] = { 0, 1, 2, 3, 4, 5 };
+    Mat src;
+    Mat(1, 6, CV_32S, vals).convertTo(src, depth);
+    UMat usrc = src.getUMat(ACCESS_READ);
+
+    for (int i = 0; i < cmp_num; ++i)
+    {
+        SCOPED_TRACE(cmp_strs[i]);
+
+        Mat dst;
+        UMat udst;
+        OCL_OFF(cv::compare(src, Scalar(scalar), dst, cmp_codes[i]));
+        OCL_ON(cv::compare(usrc, Scalar(scalar), udst, cmp_codes[i]));
+
+        EXPECT_EQ(0, cvtest::norm(dst, udst.getMat(ACCESS_READ), NORM_INF));
+    }
+}
+
+OCL_INSTANTIATE_TEST_CASE_P(Arithm, CompareScalarNewIntDepths, Combine(
+                                Values(CV_32U, CV_64U, CV_64S),
+                                Values(2.5, -1.0, 1e12, 3.0)));
 
 } } // namespace opencv_test::ocl
 

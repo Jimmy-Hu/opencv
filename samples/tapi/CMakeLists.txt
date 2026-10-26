@@ -8,8 +8,9 @@ set(OPENCV_TAPI_SAMPLES_REQUIRED_DEPS
   opencv_videoio
   opencv_highgui
   opencv_objdetect
-  opencv_features2d
-  opencv_calib3d
+  opencv_features
+  opencv_geometry
+  opencv_stereo
   opencv_flann)
 ocv_check_dependencies(${OPENCV_TAPI_SAMPLES_REQUIRED_DEPS})
 

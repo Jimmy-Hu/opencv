@@ -6,7 +6,6 @@
 
 #include "legacy_backend.hpp"
 
-#include "op_halide.hpp"
 #include "op_inf_engine.hpp"
 #include "ie_ngraph.hpp"
 #include "op_vkcom.hpp"
@@ -63,13 +62,6 @@ Ptr<BackendWrapper> wrapMat(int backendId, int targetId, cv::Mat& m)
         else
             CV_Error(Error::StsNotImplemented, "Unknown/unsupported target identifier");
     }
-    else if (backendId == DNN_BACKEND_HALIDE)
-    {
-        CV_Assert(haveHalide());
-#ifdef HAVE_HALIDE
-        return Ptr<BackendWrapper>(new HalideBackendWrapper(targetId, m));
-#endif  // HAVE_HALIDE
-    }
     else if (backendId == DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019)
     {
         CV_ERROR_DNN_BACKEND_INFERENCE_ENGINE_NN_BUILDER_2019;
@@ -98,14 +90,27 @@ Ptr<BackendWrapper> wrapMat(int backendId, int targetId, cv::Mat& m)
         CV_Assert(haveCUDA());
 
 #ifdef HAVE_CUDA
-        switch (targetId)
+        CV_CheckType(m.depth(), m.depth() == CV_32F || m.depth() == CV_8S || m.depth() == CV_8U || m.depth() == CV_32S || m.depth() == CV_64S || m.depth() == CV_Bool, "Unsupported type for CUDA");
+        CV_Assert(IS_DNN_CUDA_TARGET(targetId));
+        switch (m.depth())
         {
-        case DNN_TARGET_CUDA:
-            return CUDABackendWrapperFP32::create(m);
-        case DNN_TARGET_CUDA_FP16:
-            return CUDABackendWrapperFP16::create(m);
+        case CV_32F:
+            if (targetId == DNN_TARGET_CUDA_FP16)
+                return CUDABackendWrapperFP16::create(m);
+            else
+                return CUDABackendWrapperFP32::create(m);
+        case CV_8S:
+            return CUDABackendWrapperINT8::create(m);
+        case CV_8U:
+            return CUDABackendWrapperUINT8::create(m);
+        case CV_32S:
+            return CUDABackendWrapperINT32::create(m);
+        case CV_64S:
+            return CUDABackendWrapperINT64::create(m);
+        case CV_Bool:
+            return CUDABackendWrapperBOOL::create(m);
         default:
-            CV_Assert(IS_DNN_CUDA_TARGET(targetId));
+            CV_Error(Error::BadDepth, "Unsupported mat type for CUDA");
         }
 #endif
     }

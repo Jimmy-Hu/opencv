@@ -57,22 +57,22 @@ Mat sizeCal(const Mat& w, const Mat& h)
 class TrackerDaSiamRPNImpl : public TrackerDaSiamRPN
 {
 public:
-    TrackerDaSiamRPNImpl(const TrackerDaSiamRPN::Params& params)
+    TrackerDaSiamRPNImpl(const TrackerDaSiamRPN::Params& parameters)
     {
-        siamRPN = dnn::readNet(params.model);
-        siamKernelCL1 = dnn::readNet(params.kernel_cls1);
-        siamKernelR1 = dnn::readNet(params.kernel_r1);
+        siamRPN = dnn::readNet(parameters.model);
+        siamKernelCL1 = dnn::readNet(parameters.kernel_cls1);
+        siamKernelR1 = dnn::readNet(parameters.kernel_r1);
 
         CV_Assert(!siamRPN.empty());
         CV_Assert(!siamKernelCL1.empty());
         CV_Assert(!siamKernelR1.empty());
 
-        siamRPN.setPreferableBackend(params.backend);
-        siamRPN.setPreferableTarget(params.target);
-        siamKernelR1.setPreferableBackend(params.backend);
-        siamKernelR1.setPreferableTarget(params.target);
-        siamKernelCL1.setPreferableBackend(params.backend);
-        siamKernelCL1.setPreferableTarget(params.target);
+        siamRPN.setPreferableBackend(parameters.backend);
+        siamRPN.setPreferableTarget(parameters.target);
+        siamKernelR1.setPreferableBackend(parameters.backend);
+        siamKernelR1.setPreferableTarget(parameters.target);
+        siamKernelCL1.setPreferableBackend(parameters.backend);
+        siamKernelCL1.setPreferableTarget(parameters.target);
     }
 
     TrackerDaSiamRPNImpl(const dnn::Net& siam_rpn, const dnn::Net& kernel_cls1, const dnn::Net& kernel_r1)
@@ -176,8 +176,8 @@ void TrackerDaSiamRPNImpl::trackerInit(Mat img)
     Mat r1 = siamKernelR1.forward();
     std::vector<int> r1_shape = { 20, 256, 4, 4 }, cls1_shape = { 10, 256, 4, 4 };
 
-    siamRPN.setParam(siamRPN.getLayerId("onnx_node_output_0!65"), 0, r1.reshape(0, r1_shape));
-    siamRPN.setParam(siamRPN.getLayerId("onnx_node_output_0!68"), 0, cls1.reshape(0, cls1_shape));
+    siamRPN.setParam("onnx_node_output_0!65", 0, r1.reshape(0, r1_shape));
+    siamRPN.setParam("onnx_node_output_0!68", 0, cls1.reshape(0, cls1_shape));
 }
 
 bool TrackerDaSiamRPNImpl::update(InputArray image, Rect& boundingBox)

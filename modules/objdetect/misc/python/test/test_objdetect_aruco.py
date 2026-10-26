@@ -144,6 +144,32 @@ class aruco_objdetect_test(NewOpenCVTests):
 
         self.assertEqual(dist, 0)
 
+    def test_getDistanceToId_cell_pixel_ratio(self):
+        aruco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_50)
+        idx = 7
+        valid_bit_id_threshold = 0.49
+        bit_marker = np.array([[0, 1, 0, 1], [0, 1, 1, 1], [1, 1, 0, 0], [0, 1, 0, 0]], dtype=np.uint8)
+        ratio_marker = bit_marker.astype(np.float32)
+
+        # Same marker as test_getDistanceToId, but passed as float cell ratios.
+        dist = aruco_dict.getDistanceToId(ratio_marker, idx, True, valid_bit_id_threshold)
+        self.assertEqual(dist, 0)
+
+        # A small drift stays within the threshold.
+        accepted_ratio = ratio_marker.copy()
+        accepted_ratio[0, 0] = 0.4
+        dist = aruco_dict.getDistanceToId(accepted_ratio, idx, True, valid_bit_id_threshold)
+        self.assertEqual(dist, 0)
+
+        # A full flip crosses the threshold and counts as one bad cell.
+        erroneous_ratio = ratio_marker.copy()
+        erroneous_ratio[0, 0] = 1.0 - erroneous_ratio[0, 0]
+        dist = aruco_dict.getDistanceToId(onlyCellPixelRatio=erroneous_ratio,
+                                          id=idx,
+                                          allRotations=True,
+                                          validBitIdThreshold=valid_bit_id_threshold)
+        self.assertEqual(dist, 1)
+
     def test_aruco_detector(self):
         aruco_params = cv.aruco.DetectorParameters()
         aruco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_250)
@@ -293,7 +319,7 @@ class aruco_objdetect_test(NewOpenCVTests):
         self.assertEqual(diamond_ids.size, 4)
         self.assertEqual(marker_ids.size, 4)
         for i in range(0, 4):
-            self.assertEqual(diamond_ids[0][0][i], i)
+            self.assertEqual(diamond_ids[0][i], i)
         np.testing.assert_allclose(gold_corners, np.array(diamond_corners, dtype=np.float32).reshape(-1, 2), 0.01, 0.1)
 
     # check no segfault when cameraMatrix or distCoeffs are not initialized
@@ -385,8 +411,8 @@ class aruco_objdetect_test(NewOpenCVTests):
 
         self.assertEqual(aruco_corners.shape[0], obj_points.shape[0])
         self.assertEqual(img_points.shape[0], obj_points.shape[0])
-        self.assertEqual(2, img_points.shape[2])
-        np.testing.assert_array_equal(aruco_corners, obj_points[:, :, :2].reshape(-1, 2))
+        self.assertEqual(2, img_points.shape[1])
+        np.testing.assert_array_equal(aruco_corners, obj_points[:, :2].reshape(-1, 2))
 
     def test_charuco_match_image_points(self):
         aruco_dict = cv.aruco.getPredefinedDictionary(cv.aruco.DICT_4X4_50)
@@ -398,8 +424,8 @@ class aruco_objdetect_test(NewOpenCVTests):
 
         self.assertEqual(chessboard_corners.shape[0], obj_points.shape[0])
         self.assertEqual(img_points.shape[0], obj_points.shape[0])
-        self.assertEqual(2, img_points.shape[2])
-        np.testing.assert_array_equal(chessboard_corners, obj_points[:, :, :2].reshape(-1, 2))
+        self.assertEqual(2, img_points.shape[1])
+        np.testing.assert_array_equal(chessboard_corners, obj_points[:, :2].reshape(-1, 2))
 
     def test_draw_detected_markers(self):
         detected_points = [[[10, 10], [50, 10], [50, 50], [10, 50]]]

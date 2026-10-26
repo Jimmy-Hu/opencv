@@ -69,6 +69,8 @@ public:
 
     void write( const String& key, int value );
 
+    void write( const String& key, bool value );
+
     void write( const String& key, int64_t value );
 
     void write( const String& key, double value );
@@ -97,7 +99,7 @@ public:
 
     FileNode operator[](const char* /*nodename*/) const;
 
-    int getFormat() const;
+    virtual int getFormat() const CV_OVERRIDE;
 
     char* bufferPtr() const;
     char* bufferStart() const;
@@ -150,6 +152,8 @@ public:
         ushort getUInt16();
 
         int getInt32();
+
+        int64_t getInt64();
 
         double getFloat64();
 

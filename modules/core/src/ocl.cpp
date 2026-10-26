@@ -223,7 +223,7 @@ static const bool CV_OPENCL_VALIDATE_BINARY_PROGRAMS_VALUE = utils::getConfigura
 
 // Option to disable calls clEnqueueReadBufferRect / clEnqueueWriteBufferRect / clEnqueueCopyBufferRect
 static const bool CV_OPENCL_DISABLE_BUFFER_RECT_OPERATIONS = utils::getConfigurationParameterBool("OPENCV_OPENCL_DISABLE_BUFFER_RECT_OPERATIONS",
-#ifdef __APPLE__
+#if 1 //def __APPLE__
         true
 #else
         false
@@ -2365,7 +2365,7 @@ class OpenCLSVMBufferPoolImpl;
 
 struct Context::Impl
 {
-    static Context::Impl* get(Context& context) { return context.p; }
+    static Context::Impl* get(Context& context) { return context.getImpl(); }
 
     typedef std::deque<Context::Impl*> container_t;
     static container_t& getGlobalContainer()
@@ -2998,7 +2998,7 @@ Device& Context::device(size_t idx) const
     return !p || idx >= p->devices.size() ? dummy : p->devices[idx];
 }
 
-Context& Context::getDefault(bool initialize)
+Context& Context::getDefault()
 {
     auto& c = OpenCLExecutionContext::getCurrent();
     if (!c.empty())
@@ -3007,7 +3007,6 @@ Context& Context::getDefault(bool initialize)
         return ctx;
     }
 
-    CV_UNUSED(initialize);
     static Context dummy;
     return dummy;
 }
@@ -3098,7 +3097,7 @@ namespace svm {
 
 const SVMCapabilities getSVMCapabilitites(const ocl::Context& context)
 {
-    Context::Impl* i = context.p;
+    Context::Impl* i = context.getImpl();
     CV_Assert(i);
     if (!i->svmInitialized)
         i->svmInit();
@@ -3107,7 +3106,7 @@ const SVMCapabilities getSVMCapabilitites(const ocl::Context& context)
 
 CV_EXPORTS const SVMFunctions* getSVMFunctions(const ocl::Context& context)
 {
-    Context::Impl* i = context.p;
+    Context::Impl* i = context.getImpl();
     CV_Assert(i);
     CV_Assert(i->svmInitialized); // getSVMCapabilitites() must be called first
     CV_Assert(i->svmFunctions.fn_clSVMAlloc != NULL);
@@ -3736,6 +3735,13 @@ int Kernel::set(int i, const UMat& m)
     return set(i, KernelArg(KernelArg::READ_WRITE, (UMat*)&m));
 }
 
+// a CUDA-backed UMat carries a device pointer in u->handle, not a cl_mem
+static bool isCudaBacked(const UMatData* u)
+{
+    const MatAllocator* cudaAllocator = cv::cuda::getCudaAllocator();
+    return u && cudaAllocator && u->currAllocator == cudaAllocator;
+}
+
 int Kernel::set(int i, const KernelArg& arg)
 {
     if( !p || !p->handle )
@@ -3760,6 +3766,16 @@ int Kernel::set(int i, const KernelArg& arg)
             status = clSetKernelArg(p->handle, (cl_uint)i, sizeof(h_null), &h_null);
             CV_OCL_DBG_CHECK_RESULT(status, cv::format("clSetKernelArg('%s', arg_index=%d, cl_mem=NULL)", p->name.c_str(), (int)i).c_str());
             return i + 1;
+        }
+        // a CUDA-backed UMat has no cl_mem; decline so the caller falls back to CPU
+        if (isCudaBacked(arg.m->u))
+        {
+            CV_LOG_DEBUG(NULL, cv::format("OpenCL: Kernel(%s)::set(arg_index=%d): UMat is backed by the CUDA allocator, declining",
+                    p->name.c_str(), (int)i));
+            p->cleanupUMats();
+            p->release();
+            p = 0;
+            return -1;
         }
         cl_mem h = (cl_mem)arg.m->handle(accessFlags);
 
@@ -3879,18 +3895,6 @@ bool Kernel::run_(int dims, size_t _globalsize[], size_t _localsize[],
 }
 
 
-static bool isRaiseErrorOnReuseAsyncKernel()
-{
-    static bool initialized = false;
-    static bool value = false;
-    if (!initialized)
-    {
-        value = cv::utils::getConfigurationParameterBool("OPENCV_OPENCL_RAISE_ERROR_REUSE_ASYNC_KERNEL", false);
-        initialized = true;
-    }
-    return value;
-}
-
 bool Kernel::Impl::run(int dims, size_t globalsize[], size_t localsize[],
         bool sync, int64* timeNS, const Queue& q)
 {
@@ -3904,19 +3908,13 @@ bool Kernel::Impl::run(int dims, size_t globalsize[], size_t localsize[],
 
     if (isAsyncRun)
     {
-        CV_LOG_ERROR(NULL, "OpenCL kernel can't be reused in async mode: " << name);
-        if (isRaiseErrorOnReuseAsyncKernel())
-            CV_Assert(0);
-        return false;  // OpenCV 5.0: raise error
+        CV_Error_(Error::StsError, ("OpenCL kernel can't be reused in async mode: %s", name.c_str()));
     }
     isAsyncRun = !sync;
 
     if (isInProgress)
     {
-        CV_LOG_ERROR(NULL, "Previous OpenCL kernel launch is not finished: " << name);
-        if (isRaiseErrorOnReuseAsyncKernel())
-            CV_Assert(0);
-        return false;  // OpenCV 5.0: raise error
+        CV_Error_(Error::StsError, ("Previous OpenCL kernel launch is not finished: %s", name.c_str()));
     }
 
 #if CV_OPENCL_SYNC_RUN_KERNELS
@@ -6986,7 +6984,7 @@ void getPlatfomsInfo(std::vector<PlatformInfo>& platformsInfo)
 
 const char* typeToStr(int type)
 {
-    static const char* tab[]=
+    static const char* tab[CV_DEPTH_MAX*16]=
     {
         "uchar", "uchar2", "uchar3", "uchar4", 0, 0, 0, "uchar8", 0, 0, 0, 0, 0, 0, 0, "uchar16",
         "char", "char2", "char3", "char4", 0, 0, 0, "char8", 0, 0, 0, 0, 0, 0, 0, "char16",
@@ -6996,7 +6994,11 @@ const char* typeToStr(int type)
         "float", "float2", "float3", "float4", 0, 0, 0, "float8", 0, 0, 0, 0, 0, 0, 0, "float16",
         "double", "double2", "double3", "double4", 0, 0, 0, "double8", 0, 0, 0, 0, 0, 0, 0, "double16",
         "half", "half2", "half3", "half4", 0, 0, 0, "half8", 0, 0, 0, 0, 0, 0, 0, "half16",
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // CV_16BF
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // CV_Bool
+        "ulong", "ulong2", "ulong3", "ulong4", 0, 0, 0, "ulong8", 0, 0, 0, 0, 0, 0, 0, "ulong16",
+        "long", "long2", "long3", "long4", 0, 0, 0, "long8", 0, 0, 0, 0, 0, 0, 0, "long16",
+        "uint", "uint2", "uint3", "uint4", 0, 0, 0, "uint8", 0, 0, 0, 0, 0, 0, 0, "uint16"
     };
     int cn = CV_MAT_CN(type), depth = CV_MAT_DEPTH(type);
     const char* result = cn > 16 ? nullptr : tab[depth*16 + cn-1];
@@ -7006,7 +7008,7 @@ const char* typeToStr(int type)
 
 const char* memopTypeToStr(int type)
 {
-    static const char* tab[] =
+    static const char* tab[CV_DEPTH_MAX*16] =
     {
         "uchar", "uchar2", "uchar3", "uchar4", 0, 0, 0, "uchar8", 0, 0, 0, 0, 0, 0, 0, "uchar16",
         "char", "char2", "char3", "char4", 0, 0, 0, "char8", 0, 0, 0, 0, 0, 0, 0, "char16",
@@ -7016,7 +7018,11 @@ const char* memopTypeToStr(int type)
         "int", "int2", "int3", "int4", 0, 0, 0, "int8", 0, 0, 0, 0, 0, 0, 0, "int16",
         "ulong", "ulong2", "ulong3", "ulong4", 0, 0, 0, "ulong8", 0, 0, 0, 0, 0, 0, 0, "ulong16",
         "short", "short2", "short3", "short4", 0, 0, 0, "short8", 0, 0, 0, 0, 0, 0, 0, "short16",
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // CV_16BF
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // CV_Bool
+        "ulong", "ulong2", "ulong3", "ulong4", 0, 0, 0, "ulong8", 0, 0, 0, 0, 0, 0, 0, "ulong16",
+        "long", "long2", "long3", "long4", 0, 0, 0, "long8", 0, 0, 0, 0, 0, 0, 0, "long16",
+        "uint", "uint2", "uint3", "uint4", 0, 0, 0, "uint8", 0, 0, 0, 0, 0, 0, 0, "uint16"
     };
     int cn = CV_MAT_CN(type), depth = CV_MAT_DEPTH(type);
     const char* result = cn > 16 ? nullptr : tab[depth*16 + cn-1];
@@ -7026,7 +7032,7 @@ const char* memopTypeToStr(int type)
 
 const char* vecopTypeToStr(int type)
 {
-    static const char* tab[] =
+    static const char* tab[CV_DEPTH_MAX*16] =
     {
         "uchar", "short", "uchar3", "int", 0, 0, 0, "int2", 0, 0, 0, 0, 0, 0, 0, "int4",
         "char", "short", "char3", "int", 0, 0, 0, "int2", 0, 0, 0, 0, 0, 0, 0, "int4",
@@ -7036,7 +7042,11 @@ const char* vecopTypeToStr(int type)
         "int", "int2", "int3", "int4", 0, 0, 0, "int8", 0, 0, 0, 0, 0, 0, 0, "int16",
         "ulong", "ulong2", "ulong3", "ulong4", 0, 0, 0, "ulong8", 0, 0, 0, 0, 0, 0, 0, "ulong16",
         "short", "short2", "short3", "short4", 0, 0, 0, "short8", 0, 0, 0, 0, 0, 0, 0, "short16",
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // CV_16BF
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // CV_Bool
+        "ulong", "ulong2", "ulong3", "ulong4", 0, 0, 0, "ulong8", 0, 0, 0, 0, 0, 0, 0, "ulong16",
+        "long", "long2", "long3", "long4", 0, 0, 0, "long8", 0, 0, 0, 0, 0, 0, 0, "long16",
+        "uint", "uint2", "uint3", "uint4", 0, 0, 0, "uint8", 0, 0, 0, 0, 0, 0, 0, "uint16"
     };
     int cn = CV_MAT_CN(type), depth = CV_MAT_DEPTH(type);
     const char* result = cn > 16 ? 0 : tab[depth*16 + cn-1];
@@ -7058,15 +7068,15 @@ const char* convertTypeStr(int sdepth, int ddepth, int cn, char* buf, size_t buf
     if( sdepth == ddepth )
         return "noconvert";
     const char *typestr = typeToStr(CV_MAKETYPE(ddepth, cn));
-    if( ddepth >= CV_32F ||
+    if( CV_IS_FLOAT_TYPE(ddepth) ||
         (ddepth == CV_32S && sdepth < CV_32S) ||
         (ddepth == CV_16S && sdepth <= CV_8S) ||
         (ddepth == CV_16U && sdepth == CV_8U))
     {
         snprintf(buf, buf_size, "convert_%s", typestr);
     }
-    else if( sdepth >= CV_32F )
-        snprintf(buf, buf_size, "convert_%s%s_rte", typestr, (ddepth < CV_32S ? "_sat" : ""));
+    else if( CV_IS_FLOAT_TYPE(sdepth) )
+        snprintf(buf, buf_size, "convert_%s_sat_rte", typestr);
     else
         snprintf(buf, buf_size, "convert_%s_sat", typestr);
 
@@ -7203,12 +7213,17 @@ String kernelToStr(InputArray _kernel, int ddepth, const char * name)
     if (ddepth < 0)
         ddepth = depth;
 
+    // bf16 and fp8 constants have no OpenCL literal form, output them as regular float
+    if (ddepth == CV_16BF || ddepth == CV_8F_E4M3FN || ddepth == CV_8F_E4M3FNUZ)
+        ddepth = CV_32F;
+
     if (ddepth != depth)
         kernel.convertTo(kernel, ddepth);
 
     typedef std::string (* func_t)(const Mat &);
-    static const func_t funcs[] = { kerToStr<uchar>, kerToStr<char>, kerToStr<ushort>, kerToStr<short>,
-                                    kerToStr<int>, kerToStr<float>, kerToStr<double>, kerToStr<hfloat> };
+    static const func_t funcs[CV_DEPTH_MAX] = { kerToStr<uchar>, kerToStr<char>, kerToStr<ushort>, kerToStr<short>,
+                                                kerToStr<int>, kerToStr<float>, kerToStr<double>, kerToStr<hfloat>,
+                                                0, kerToStr<bool>, kerToStr<uint64_t>, kerToStr<int64_t>, kerToStr<unsigned> };
     const func_t func = funcs[ddepth];
     CV_Assert(func != 0);
 
@@ -7244,10 +7259,17 @@ int predictOptimalVectorWidth(InputArray src1, InputArray src2, InputArray src3,
 {
     const ocl::Device & d = ocl::Device::getDefault();
 
-    int vectorWidths[] = { d.preferredVectorWidthChar(), d.preferredVectorWidthChar(),
-        d.preferredVectorWidthShort(), d.preferredVectorWidthShort(),
-        d.preferredVectorWidthInt(), d.preferredVectorWidthFloat(),
-        d.preferredVectorWidthDouble(), d.preferredVectorWidthHalf() };
+    // Indexed by depth: must span CV_DEPTH_MAX. bf16 has no OpenCL vector type.
+    int vectorWidths[CV_DEPTH_MAX] = {
+        d.preferredVectorWidthChar(), d.preferredVectorWidthChar(),   // CV_8U,  CV_8S
+        d.preferredVectorWidthShort(), d.preferredVectorWidthShort(), // CV_16U, CV_16S
+        d.preferredVectorWidthInt(), d.preferredVectorWidthFloat(),   // CV_32S, CV_32F
+        d.preferredVectorWidthDouble(), d.preferredVectorWidthHalf(), // CV_64F, CV_16F
+        1,                                                            // CV_16BF
+        d.preferredVectorWidthChar(),                                 // CV_Bool
+        d.preferredVectorWidthLong(), d.preferredVectorWidthLong(),   // CV_64U, CV_64S
+        d.preferredVectorWidthInt()                                   // CV_32U
+    };
 
     // if the device says don't use vectors
     if (vectorWidths[0] == 1)
@@ -7261,12 +7283,21 @@ int predictOptimalVectorWidth(InputArray src1, InputArray src2, InputArray src3,
     return checkOptimalVectorWidth(vectorWidths, src1, src2, src3, src4, src5, src6, src7, src8, src9, strat);
 }
 
-int checkOptimalVectorWidth(const int *vectorWidths,
-                            InputArray src1, InputArray src2, InputArray src3,
-                            InputArray src4, InputArray src5, InputArray src6,
-                            InputArray src7, InputArray src8, InputArray src9,
-                            OclVectorStrategy strat)
+int checkOptimalVectorWidth([[maybe_unused]] const int *vectorWidths,
+                            [[maybe_unused]] InputArray src1,
+                            [[maybe_unused]] InputArray src2,
+                            [[maybe_unused]] InputArray src3,
+                            [[maybe_unused]] InputArray src4,
+                            [[maybe_unused]] InputArray src5,
+                            [[maybe_unused]] InputArray src6,
+                            [[maybe_unused]] InputArray src7,
+                            [[maybe_unused]] InputArray src8,
+                            [[maybe_unused]] InputArray src9,
+                            [[maybe_unused]] OclVectorStrategy strat)
 {
+#ifdef __APPLE__
+    return 1;
+#else
     CV_Assert(vectorWidths);
 
     int ref_type = src1.type();
@@ -7293,6 +7324,7 @@ int checkOptimalVectorWidth(const int *vectorWidths,
     int kercn = *std::min_element(kercns.begin(), kercns.end());
 
     return kercn;
+#endif
 }
 
 int predictOptimalVectorWidthMax(InputArray src1, InputArray src2, InputArray src3,
@@ -7591,6 +7623,8 @@ bool internal::isPerformanceCheckBypassed()
 
 bool internal::isCLBuffer(UMat& u)
 {
+    if (isCudaBacked(u.u))
+        return false;
     void* h = u.handle(ACCESS_RW);
     if (!h)
         return true;

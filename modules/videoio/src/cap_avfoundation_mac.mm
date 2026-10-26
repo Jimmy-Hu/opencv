@@ -184,7 +184,7 @@ class CvVideoWriter_AVFoundation : public cv::IVideoWriter {
     public:
         CvVideoWriter_AVFoundation(const std::string &filename, int fourcc, double fps, const cv::Size& frame_size, int is_color);
         ~CvVideoWriter_AVFoundation();
-        void write(cv::InputArray image) CV_OVERRIDE;
+        bool write(cv::InputArray image) CV_OVERRIDE;
         int getCaptureDomain() const CV_OVERRIDE { return cv::CAP_AVFOUNDATION; }
         bool isOpened() const CV_OVERRIDE
         {
@@ -234,6 +234,39 @@ cv::Ptr<cv::IVideoWriter> cv::create_AVFoundation_writer(const std::string& file
     if (wrt->isOpened())
         return wrt;
     return NULL;
+}
+
+static NSArray *orderedVideoCaptureDevices()
+{
+    NSArray *devices = [[AVCaptureDevice devicesWithMediaType: AVMediaTypeVideo]
+            arrayByAddingObjectsFromArray:[AVCaptureDevice devicesWithMediaType:AVMediaTypeMuxed]];
+
+    // Preserve devices ordering on the system
+    // see AVCaptureDevice::uniqueID property documentation for more info
+    return [devices
+        sortedArrayUsingComparator:^NSComparisonResult(AVCaptureDevice *d1,
+                                                     AVCaptureDevice *d2) {
+          return [d1.uniqueID compare:d2.uniqueID];
+        }
+    ];
+}
+
+std::vector<cv::VideoDeviceInfo> cv::enumerate_AVFoundation_devices()
+{
+    std::vector<cv::VideoDeviceInfo> result;
+    NSAutoreleasePool *localpool = [[NSAutoreleasePool alloc] init];
+
+    NSArray *devices = orderedVideoCaptureDevices();
+
+    for (NSUInteger i = 0; i < devices.count; i++)
+    {
+        AVCaptureDevice *device = [devices objectAtIndex:i];
+        const char *name = [[device localizedName] UTF8String];
+        result.push_back(cv::makeVideoDeviceInfo((int)i, cv::CAP_AVFOUNDATION, name ? name : ""));
+    }
+
+    [localpool drain];
+    return result;
 }
 
 /********************** Implementation of Classes ****************************/
@@ -359,8 +392,7 @@ int CvCaptureCAM::startCaptureDevice(int cameraNum) {
 #endif
 
     // get capture device
-    NSArray *devices = [[AVCaptureDevice devicesWithMediaType: AVMediaTypeVideo]
-            arrayByAddingObjectsFromArray:[AVCaptureDevice devicesWithMediaType:AVMediaTypeMuxed]];
+    NSArray *devices = orderedVideoCaptureDevices();
 
     if ( devices.count == 0 ) {
         fprintf(stderr, "OpenCV: AVFoundation didn't find any attached Video Input Devices!\n");
@@ -373,15 +405,6 @@ int CvCaptureCAM::startCaptureDevice(int cameraNum) {
         [localpool drain];
         return 0;
     }
-
-    // Preserve devices ordering on the system
-    // see AVCaptureDevice::uniqueID property documentation for more info
-    devices = [devices
-        sortedArrayUsingComparator:^NSComparisonResult(AVCaptureDevice *d1,
-                                                     AVCaptureDevice *d2) {
-          return [d1.uniqueID compare:d2.uniqueID];
-        }
-    ];
 
     mCaptureDevice = devices[cameraNum];
 
@@ -476,7 +499,7 @@ double CvCaptureCAM::getProperty(int property_id) const{
 
     CMFormatDescriptionRef format = mCaptureDevice.activeFormat.formatDescription;
     CMVideoDimensions s1 = CMVideoFormatDescriptionGetDimensions(format);
-    double retval = 0;
+    double retval = cv::CAP_PROP_UNKNOWN;
 
     switch (property_id) {
         case cv::CAP_PROP_FRAME_WIDTH:
@@ -985,7 +1008,7 @@ bool CvCaptureFile::retrieveFrame_(int, cv::OutputArray arr) {
 }
 
 double CvCaptureFile::getProperty_(int property_id) const{
-    if (mAsset == nil) return 0;
+    if (mAsset == nil) return cv::CAP_PROP_UNKNOWN;
 
     CMTime t;
 
@@ -1016,7 +1039,7 @@ double CvCaptureFile::getProperty_(int property_id) const{
             break;
     }
 
-    return 0;
+    return cv::CAP_PROP_UNKNOWN;
 }
 
 bool CvCaptureFile::setProperty_(int property_id, double value) {
@@ -1211,7 +1234,21 @@ CvVideoWriter_AVFoundation::~CvVideoWriter_AVFoundation() {
     if (mMovieWriterInput && mMovieWriter && mMovieWriterAdaptor)
     {
         [mMovieWriterInput markAsFinished];
-        [mMovieWriter finishWriting];
+
+        // Use finishWritingWithCompletionHandler + semaphore to synchronously
+        // wait for the async completion block to finish, avoiding a race
+        // condition where NSOperation KVO observer blocks are dispatched
+        // asynchronously to GCD worker threads and may access already-released
+        // objects after the autorelease pool is drained.
+        // Replaces deprecated finishWriting (sync) which falsely appears safe
+        // but does NOT wait for internal NSOperation KVO callbacks to complete.
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        [mMovieWriter finishWritingWithCompletionHandler:^{
+            dispatch_semaphore_signal(sem);
+        }];
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        dispatch_release(sem);
+
         [mMovieWriter release];
         [mMovieWriterInput release];
         [mMovieWriterAdaptor release];
@@ -1233,14 +1270,14 @@ static void releaseCallback( void *releaseRefCon, const void * ) {
     CFRelease((CFDataRef)releaseRefCon);
 }
 
-void CvVideoWriter_AVFoundation::write(cv::InputArray image) {
+bool CvVideoWriter_AVFoundation::write(cv::InputArray image) {
     NSAutoreleasePool* localpool = [[NSAutoreleasePool alloc] init];
 
     // writer status check
     if (mMovieWriter.status !=  AVAssetWriterStatusWriting ) {
         NSLog(@"mMovieWriter.status: %d. Error: %@", (int)mMovieWriter.status, [mMovieWriter.error localizedDescription]);
         [localpool drain];
-        return;
+        return false;
     }
 
     // Make writeFrame() a blocking call.
@@ -1255,7 +1292,7 @@ void CvVideoWriter_AVFoundation::write(cv::InputArray image) {
     if (image.size().height!=movieSize.height || image.size().width!=movieSize.width){
         fprintf(stderr, "OpenCV: Frame size does not match video size.\n");
         [localpool drain];
-        return;
+        return false;
     }
 
     if (movieColor) {
@@ -1305,6 +1342,7 @@ void CvVideoWriter_AVFoundation::write(cv::InputArray image) {
         NSLog(@"Frame appendPixelBuffer failed.");
     }
 
+    return success;
 }
 
 #pragma clang diagnostic pop

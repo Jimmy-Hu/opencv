@@ -11,8 +11,6 @@ import org.opencv.dnn.Net;
 import org.opencv.test.OpenCVTestCase;
 
 import org.opencv.video.Tracker;
-import org.opencv.video.TrackerGOTURN;
-import org.opencv.video.TrackerGOTURN_Params;
 import org.opencv.video.TrackerNano;
 import org.opencv.video.TrackerNano_Params;
 import org.opencv.video.TrackerVit;
@@ -53,19 +51,6 @@ public class TrackerCreateTest extends OpenCVTestCase {
             if (testDataPath == null)
                 throw new Exception(ENV_OPENCV_TEST_DATA_PATH + " has to be defined!");
         }
-    }
-
-    public void testCreateTrackerGOTURN() {
-        Net net;
-        try {
-            String protoFile = new File(testDataPath, "dnn/gsoc2016-goturn/goturn.prototxt").toString();
-            String weightsFile = new File(modelsDataPath, "dnn/gsoc2016-goturn/goturn.caffemodel").toString();
-            net = Dnn.readNetFromCaffe(protoFile, weightsFile);
-        } catch (CvException e) {
-            return;
-        }
-        Tracker tracker = TrackerGOTURN.create(net);
-        assert(tracker != null);
     }
 
     public void testCreateTrackerNano() {

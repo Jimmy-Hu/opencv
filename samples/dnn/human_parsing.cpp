@@ -2,7 +2,7 @@
 // this sample demonstrates parsing (segmenting) human body parts from an image using opencv's dnn,
 // based on https://github.com/Engineering-Course/LIP_JPPNet
 //
-// get the pretrained model from: https://www.dropbox.com/s/qag9vzambhhkvxr/lip_jppnet_384.pb?dl=0
+// get the pretrained model from: https://huggingface.co/opencv/opencv_contribution/tree/main/human_parsing_jppnet
 //
 
 #include <opencv2/dnn.hpp>
@@ -13,14 +13,15 @@ using namespace cv;
 
 static Mat parse_human(const Mat &image, const std::string &model, int backend=dnn::DNN_BACKEND_DEFAULT, int target=dnn::DNN_TARGET_CPU) {
     // this network expects an image and a flipped copy as input
-    Mat flipped;
-    flip(image, flipped, 1);
+    Mat resized, flipped;
+    resize(image, resized, Size(384, 384));
+    flip(resized, flipped, 1);
     std::vector<Mat> batch;
-    batch.push_back(image);
+    batch.push_back(resized);
     batch.push_back(flipped);
     Mat blob = dnn::blobFromImages(batch, 1.0, Size(), Scalar(104.00698793, 116.66876762, 122.67891434));
 
-    dnn::Net net = dnn::readNet(model);
+    dnn::Net net = dnn::readNetFromONNX(model);
     net.setPreferableBackend(backend);
     net.setPreferableTarget(target);
     net.setInput(blob);
@@ -70,26 +71,28 @@ static Mat parse_human(const Mat &image, const std::string &model, int backend=d
 
 int main(int argc, char**argv)
 {
-    CommandLineParser parser(argc,argv,
+    std::string param_keys =
         "{help    h |                 | show help screen / args}"
         "{image   i |                 | person image to process }"
-        "{model   m |lip_jppnet_384.pb| network model}"
-        "{backend b | 0               | Choose one of computation backends: "
-                                         "0: automatically (by default), "
-                                         "1: Halide language (http://halide-lang.org/), "
-                                         "2: Intel's Deep Learning Inference Engine (https://software.intel.com/openvino-toolkit), "
-                                         "3: OpenCV implementation, "
-                                         "4: VKCOM, "
-                                         "5: CUDA }"
-        "{target  t | 0               | Choose one of target computation devices: "
-                                         "0: CPU target (by default), "
-                                         "1: OpenCL, "
-                                         "2: OpenCL fp16 (half-float precision), "
-                                         "3: VPU, "
-                                         "4: Vulkan, "
-                                         "6: CUDA, "
-                                         "7: CUDA fp16 (half-float preprocess) }"
-    );
+        "{model   m |human_parsing_jppnet_2026sep.onnx| network model}";
+    std::string backend_keys = cv::format(
+        "{ backend  | 0 | Choose one of computation backends: "
+                          "%d: automatically (by default), "
+                          "%d: Intel's Deep Learning Inference Engine (https://software.intel.com/openvino-toolkit), "
+                          "%d: OpenCV implementation, "
+                          "%d: VKCOM, "
+                          "%d: CUDA }", cv::dnn::DNN_BACKEND_DEFAULT, cv::dnn::DNN_BACKEND_INFERENCE_ENGINE, cv::dnn::DNN_BACKEND_OPENCV, cv::dnn::DNN_BACKEND_VKCOM, cv::dnn::DNN_BACKEND_CUDA);
+    std::string target_keys = cv::format(
+    "{ target       | 0 | Choose one of target computation devices: "
+                          "%d: CPU target (by default), "
+                          "%d: OpenCL, "
+                          "%d: OpenCL fp16 (half-float precision), "
+                          "%d: VPU, "
+                          "%d: Vulkan, "
+                          "%d: CUDA, "
+                          "%d: CUDA fp16 (half-float preprocess) }", cv::dnn::DNN_TARGET_CPU, cv::dnn::DNN_TARGET_OPENCL, cv::dnn::DNN_TARGET_OPENCL_FP16, cv::dnn::DNN_TARGET_MYRIAD, cv::dnn::DNN_TARGET_VULKAN, cv::dnn::DNN_TARGET_CUDA, cv::dnn::DNN_TARGET_CUDA_FP16);
+    std::string keys = param_keys + backend_keys + target_keys;
+    CommandLineParser parser(argc, argv, keys);
     if (argc == 1 || parser.has("help"))
     {
         parser.printMessage();

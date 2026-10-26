@@ -74,6 +74,8 @@
 #ifdef CV_CPU_COMPILE_FP16
 #  if defined(__arm__) || defined(__aarch64__) || defined(_M_ARM) || defined(_M_ARM64) || defined(_M_ARM64EC)
 #    include <arm_neon.h>
+#  elif defined(__riscv_vector)
+#    include <riscv_vector.h>
 #  else
 #    include <immintrin.h>
 #  endif
@@ -86,6 +88,10 @@
 #ifdef CV_CPU_COMPILE_AVX2
 #  include <immintrin.h>
 #  define CV_AVX2 1
+#endif
+#ifdef CV_CPU_COMPILE_AVX_VNNI
+#  include <immintrin.h>
+#  define CV_AVX_VNNI 1
 #endif
 #ifdef CV_CPU_COMPILE_AVX_512F
 #  include <immintrin.h>
@@ -254,6 +260,11 @@ struct VZeroUpperGuard {
 #  define CV_FP16 1
 #endif
 
+#if defined(__riscv_zvfhmin) && __riscv_zvfhmin || (defined(__riscv_zvfh) && __riscv_zvfh)
+#  include <riscv_vector.h>
+#  define CV_FP16 1
+#endif
+
 #endif // !__OPENCV_BUILD && !__CUDACC (Compatibility code)
 
 
@@ -293,6 +304,9 @@ struct VZeroUpperGuard {
 #endif
 #ifndef CV_FMA3
 #  define CV_FMA3 0
+#endif
+#ifndef CV_AVX_VNNI
+#  define CV_AVX_VNNI 0
 #endif
 #ifndef CV_AVX_512F
 #  define CV_AVX_512F 0

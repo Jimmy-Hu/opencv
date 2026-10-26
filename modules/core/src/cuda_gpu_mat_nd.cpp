@@ -9,13 +9,13 @@ using namespace cv::cuda;
 
 GpuMatND::~GpuMatND() = default;
 
-GpuMatND::GpuMatND(SizeArray _size, int _type, void* _data, StepArray _step) :
+GpuMatND::GpuMatND(const MatShape& _shape, int _type, void* _data, StepArray _step) :
     flags(0), dims(0), data(static_cast<uchar*>(_data)), offset(0)
 {
-    CV_Assert(_step.empty() || _size.size() == _step.size() + 1 ||
-              (_size.size() == _step.size() && _step.back() == (size_t)CV_ELEM_SIZE(_type)));
+    CV_Assert(_step.empty() || _shape.size() == _step.size() + 1 ||
+              (_shape.size() == _step.size() && _step.back() == (size_t)CV_ELEM_SIZE(_type)));
 
-    setFields(std::move(_size), _type, std::move(_step));
+    setFields(_shape, _type, std::move(_step));
 }
 
 GpuMatND GpuMatND::operator()(const std::vector<Range>& ranges) const
@@ -69,8 +69,20 @@ GpuMat GpuMatND::createGpuMatHeader() const
         return true;
     };
     CV_Assert(Effectively2D(*this));
+    int rows_, cols_ = dims >= 1 ? size[dims - 1] : 1;
+    size_t step_;
+    if (dims >= 2)
+    {
+        rows_ = size[dims - 2];
+        step_ = step[dims - 2];
+    }
+    else
+    {
+        rows_ = 1;
+        step_ = cols_ * elemSize();
+    }
 
-    return GpuMat(size[dims-2], size[dims-1], type(), getDevicePtr(), step[dims-2]);
+    return GpuMat(rows_, cols_, type(), getDevicePtr(), step_);
 }
 
 GpuMat GpuMatND::operator()(IndexArray idx, Range rowRange, Range colRange) const
@@ -83,7 +95,7 @@ GpuMatND::operator GpuMat() const
     return createGpuMatHeader().clone();
 }
 
-void GpuMatND::setFields(SizeArray _size, int _type, StepArray _step)
+void GpuMatND::setFields(MatShape _size, int _type, StepArray _step)
 {
     _type &= Mat::TYPE_MASK;
 
@@ -130,9 +142,9 @@ GpuData::~GpuData()
 {
 }
 
-void GpuMatND::create(SizeArray _size, int _type)
+void GpuMatND::create(const MatShape& _shape, int _type)
 {
-    CV_UNUSED(_size);
+    CV_UNUSED(_shape);
     CV_UNUSED(_type);
     throw_no_cuda();
 }
@@ -177,6 +189,35 @@ void GpuMatND::download(OutputArray dst, Stream& stream) const
     CV_UNUSED(dst);
     CV_UNUSED(stream);
     throw_no_cuda();
+}
+
+void GpuMatND::fit(const MatShape& _shape, int _type)
+{
+    auto elements_nonzero = [](const MatShape& v)
+    {
+        return std::all_of(v.begin(), v.end(), [](int u){ return u > 0; });
+    };
+    CV_Assert(!_shape.empty());
+    CV_Assert(elements_nonzero(_shape));
+
+    _type &= Mat::TYPE_MASK;
+
+    const size_t esz = (size_t)CV_ELEM_SIZE(_type);
+    size_t step0 = esz;
+    for (int i = (int)_shape.size() - 2; i >= 0; --i)
+        step0 *= (size_t)_shape[(size_t)i + 1];
+    const size_t requiredBytes = (size_t)_shape[0] * step0;
+
+    const bool canReuse = !empty() && !external() && isContinuous() && !isSubmatrix() && offset == 0;
+    const size_t oldCapacity = canReuse ? totalMemSize() : 0;
+
+    if (!canReuse || requiredBytes > oldCapacity)
+    {
+        create(_shape, _type);
+        return;
+    }
+
+    setFields(_shape, _type);
 }
 
 #endif

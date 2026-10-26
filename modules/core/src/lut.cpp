@@ -1,12 +1,18 @@
 // This file is part of OpenCV project.
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html
+// Copyright (C) 2026, Advanced Micro Devices, Inc., all rights reserved.
 
 
 #include "precomp.hpp"
 #include "opencl_kernels_core.hpp"
 #include "convert.hpp"
 #include <sys/types.h>
+
+namespace cv {
+void LUT8u_dispatch( const uchar* src, const uchar* lut, uchar* dst, int len, int cn, int lutcn );
+void LUT16u_dispatch( const uchar* src, const ushort* lut, ushort* dst, int len, int cn, int lutcn );
+} // namespace cv
 
 /****************************************************************************************\
 *                                    LUT Transform                                       *
@@ -16,8 +22,11 @@ namespace cv
 {
 
 template<typename Ti, typename T> static void
-LUT_( const Ti* src, const T* lut, T* dst, const int len, const int cn, const int lutcn )
+LUT_( const void* _src, const void* _lut, void* _dst, int len, int cn, int lutcn )
 {
+    const Ti* src = (const Ti*)_src;
+    const T* lut = (const T*)_lut;
+    T* dst = (T*)_dst;
     if( lutcn == 1 )
     {
         for( int i = 0; i < len*cn; i++ )
@@ -31,7 +40,13 @@ LUT_( const Ti* src, const T* lut, T* dst, const int len, const int cn, const in
     }
 }
 
-typedef void (*LUTFunc)( const uchar* src, const uchar* lut, uchar* dst, int len, int cn, int lutcn );
+template<typename T, void (*fn)(const uchar*, const T*, T*, int, int, int)>
+static void lutDispatchWrap( const void* src, const void* lut, void* dst, int len, int cn, int lutcn )
+{
+    fn((const uchar*)src, (const T*)lut, (T*)dst, len, cn, lutcn);
+}
+
+typedef void (*LUTFunc)( const void* src, const void* lut, void* dst, int len, int cn, int lutcn );
 
 static LUTFunc getLUTFunc(const int srcDepth, const int dstDepth)
 {
@@ -40,30 +55,40 @@ static LUTFunc getLUTFunc(const int srcDepth, const int dstDepth)
     {
         switch(dstDepth)
         {
-            case CV_8U:   ret = (LUTFunc)LUT_<uint8_t, uint8_t>;   break;
-            case CV_8S:   ret = (LUTFunc)LUT_<uint8_t, int8_t>;    break;
-            case CV_16U:  ret = (LUTFunc)LUT_<uint8_t, uint16_t>;  break;
-            case CV_16S:  ret = (LUTFunc)LUT_<uint8_t, int16_t>;   break;
-            case CV_32S:  ret = (LUTFunc)LUT_<uint8_t, int32_t>;   break;
-            case CV_32F:  ret = (LUTFunc)LUT_<uint8_t, int32_t>;   break; // float
-            case CV_64F:  ret = (LUTFunc)LUT_<uint8_t, int64_t>;   break; // double
-            case CV_16F:  ret = (LUTFunc)LUT_<uint8_t, int16_t>;   break; // hfloat
-            default:      ret = nullptr;                           break;
+            case CV_8U:   ret = lutDispatchWrap<uchar, LUT8u_dispatch>;   break;
+            case CV_8S:   ret = LUT_<uint8_t, int8_t>;    break;
+            case CV_16U:  ret = lutDispatchWrap<ushort, LUT16u_dispatch>; break;
+            case CV_16S:  ret = LUT_<uint8_t, int16_t>;   break;
+            case CV_32S:  ret = LUT_<uint8_t, int32_t>;   break;
+            case CV_32F:  ret = LUT_<uint8_t, int32_t>;   break; // float
+            case CV_64F:  ret = LUT_<uint8_t, int64_t>;   break; // double
+            case CV_16F:  ret = LUT_<uint8_t, int16_t>;   break; // hfloat
+            case CV_16BF: ret = LUT_<uint8_t, int16_t>;   break; // bfloat
+            case CV_Bool: ret = LUT_<uint8_t, uint8_t>;   break; // bool
+            case CV_64U:  ret = LUT_<uint8_t, uint64_t>;  break;
+            case CV_64S:  ret = LUT_<uint8_t, int64_t>;   break;
+            case CV_32U:  ret = LUT_<uint8_t, uint32_t>;  break;
+            default:      ret = nullptr;                  break;
         }
     }
     else if((srcDepth == CV_16U) || (srcDepth == CV_16S))
     {
         switch(dstDepth)
         {
-            case CV_8U:   ret = (LUTFunc)LUT_<uint16_t, uint8_t>;  break;
-            case CV_8S:   ret = (LUTFunc)LUT_<uint16_t, int8_t>;   break;
-            case CV_16U:  ret = (LUTFunc)LUT_<uint16_t, uint16_t>; break;
-            case CV_16S:  ret = (LUTFunc)LUT_<uint16_t, int16_t>;  break;
-            case CV_32S:  ret = (LUTFunc)LUT_<uint16_t, int32_t>;  break;
-            case CV_32F:  ret = (LUTFunc)LUT_<uint16_t, int32_t>;  break; // float
-            case CV_64F:  ret = (LUTFunc)LUT_<uint16_t, int64_t>;  break; // double
-            case CV_16F:  ret = (LUTFunc)LUT_<uint16_t, int16_t>;  break; // hfloat
-            default:      ret = nullptr;                           break;
+            case CV_8U:   ret = LUT_<uint16_t, uint8_t>;  break;
+            case CV_8S:   ret = LUT_<uint16_t, int8_t>;   break;
+            case CV_16U:  ret = LUT_<uint16_t, uint16_t>; break;
+            case CV_16S:  ret = LUT_<uint16_t, int16_t>;  break;
+            case CV_32S:  ret = LUT_<uint16_t, int32_t>;  break;
+            case CV_32F:  ret = LUT_<uint16_t, int32_t>;  break; // float
+            case CV_64F:  ret = LUT_<uint16_t, int64_t>;  break; // double
+            case CV_16F:  ret = LUT_<uint16_t, int16_t>;  break; // hfloat
+            case CV_16BF: ret = LUT_<uint16_t, int16_t>;  break; // bfloat
+            case CV_Bool: ret = LUT_<uint16_t, uint8_t>;  break; // bool
+            case CV_64U:  ret = LUT_<uint16_t, uint64_t>; break;
+            case CV_64S:  ret = LUT_<uint16_t, int64_t>;  break;
+            case CV_32U:  ret = LUT_<uint16_t, uint32_t>; break;
+            default:      ret = nullptr;                  break;
         }
     }
 
@@ -78,7 +103,7 @@ static bool ocl_LUT(InputArray _src, InputArray _lut, OutputArray _dst)
     int lcn = _lut.channels(), dcn = _src.channels(), ddepth = _lut.depth();
 
     UMat src = _src.getUMat(), lut = _lut.getUMat();
-    _dst.create(src.size(), CV_MAKETYPE(ddepth, dcn));
+    _dst.createSameSize(src, CV_MAKETYPE(ddepth, dcn));
     UMat dst = _dst.getUMat();
     int kercn = lcn == 1 ? std::min(4, ocl::predictOptimalVectorWidth(_src, _dst)) : dcn;
 
@@ -156,7 +181,7 @@ void cv::LUT( InputArray _src, InputArray _lut, OutputArray _dst )
                ocl_LUT(_src, _lut, _dst))
 
     Mat src = _src.getMat(), lut = _lut.getMat();
-    _dst.create(src.dims, src.size, CV_MAKETYPE(_lut.depth(), cn));
+    _dst.createSameSize(_src, CV_MAKETYPE(_lut.depth(), cn));
     Mat dst = _dst.getMat();
 
     if(lut_size == 256)

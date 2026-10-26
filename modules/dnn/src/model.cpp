@@ -10,6 +10,7 @@
 #include <iterator>
 
 #include <opencv2/imgproc.hpp>
+#include <opencv2/geometry/2d.hpp>
 
 namespace cv {
 namespace dnn {
@@ -46,9 +47,19 @@ public:
         net = network;
 
         outNames = net.getUnconnectedOutLayersNames();
+
+        Ptr<Graph> graph = net.getMainGraph();
         std::vector<MatShape> inLayerShapes;
-        std::vector<MatShape> outLayerShapes;
-        net.getLayerShapes(MatShape(), 0, inLayerShapes, outLayerShapes);
+
+        if (graph) {
+            const std::vector<Arg>& inputs = graph->inputs();
+            for (auto inp: inputs) {
+                inLayerShapes.push_back(net.argData(inp).shape);
+            }
+        } else {
+            std::vector<MatShape> outLayerShapes;
+            net.getLayerShapes(MatShape(), CV_32F, 0, inLayerShapes, outLayerShapes);
+        }
         if (!inLayerShapes.empty() && inLayerShapes[0].size() == 4)
             size = Size(inLayerShapes[0][3], inLayerShapes[0][2]);
         else
@@ -114,16 +125,38 @@ public:
         }
         Mat blob = dnn::blobFromImageWithParams(frame, param); // [1, 10, 10, 4]
 
-        net.setInput(blob);
-
         // Faster-RCNN or R-FCN
-        if (net.getLayer(0)->outputNameToIndex("im_info") != -1)
+        if ((net.getMainGraph() && net.haveArg("im_info") && net.argKind(net.getArg("im_info")) == DNN_ARG_INPUT) ||
+            (!net.getMainGraph() && net.getLayer(0)->outputNameToIndex("im_info") != -1))
         {
+            net.setInput(blob, "data");
             Mat imInfo(Matx13f(size.height, size.width, 1.6f));
             net.setInput(imInfo, "im_info");
         }
+        else
+        {
+            net.setInput(blob);
+        }
 
         net.forward(outs, outNames);
+
+        // Every Model subclass post-processes in float, so widen a declared-half output back.
+        for (int i = 0; i < (int)outs.total(); i++)
+        {
+            const int depth = outs.depth(i);
+            if (depth != CV_16F && depth != CV_16BF)
+                continue;
+            if (outs.isUMatVector())
+            {
+                UMat& out = outs.getUMatRef(i);
+                out.convertTo(out, CV_32F);
+            }
+            else
+            {
+                Mat& out = outs.getMatRef(i);
+                out.convertTo(out, CV_32F);
+            }
+        }
     }
 };
 
@@ -507,7 +540,12 @@ void DetectionModel::detect(InputArray frame, CV_OUT std::vector<int>& classIds,
 
     int frameWidth  = frame.cols();
     int frameHeight = frame.rows();
-    if (getNetwork_().getLayer(0)->outputNameToIndex("im_info") != -1)
+    if ((getNetwork_().getMainGraph() &&
+         getNetwork_().haveArg("im_info") &&
+         getNetwork_().argKind(getNetwork_().getArg("im_info")) == DNN_ARG_INPUT)
+        ||
+        (!getNetwork_().getMainGraph() &&
+         getNetwork_().getLayer(0)->outputNameToIndex("im_info") != -1))
     {
         frameWidth = impl->size.width;
         frameHeight = impl->size.height;
@@ -713,19 +751,39 @@ struct TextRecognitionModel_Impl : public Model::Impl
         return decodeSeq;
     }
 
+    static Mat ensureFloat32Prediction(const Mat& prediction)
+    {
+        CV_Assert(!prediction.empty());
+        if (prediction.type() == CV_32FC1)
+            return prediction;
+
+        const int depth = prediction.depth();
+        if (depth == CV_16F || depth == CV_16BF)
+        {
+            Mat prediction32f;
+            prediction.convertTo(prediction32f, CV_32F);
+            return prediction32f;
+        }
+
+        CV_CheckType(prediction.type(), CV_32FC1, "");
+        return prediction;
+    }
+
     virtual
     std::string ctcGreedyDecode(const Mat& prediction)
     {
+        Mat prediction32f = ensureFloat32Prediction(prediction);
+        const Mat& probs = prediction32f;
+
         std::string decodeSeq;
-        CV_CheckEQ(prediction.dims, 3, "");
-        CV_CheckType(prediction.type(), CV_32FC1, "");
+        CV_CheckEQ(probs.dims, 3, "");
         const int vocLength = (int)(vocabulary.size());
-        CV_CheckLE(prediction.size[1], vocLength, "");
+        CV_CheckLE(probs.size[1], vocLength, "");
         bool ctcFlag = true;
         int lastLoc = 0;
-        for (int i = 0; i < prediction.size[0]; i++)
+        for (int i = 0; i < probs.size[0]; i++)
         {
-            const float* pred = prediction.ptr<float>(i);
+            const float* pred = probs.ptr<float>(i);
             int maxLoc = 0;
             float maxScore = pred[0];
             for (int j = 1; j < vocLength + 1; j++)
@@ -834,6 +892,9 @@ struct TextRecognitionModel_Impl : public Model::Impl
 
     virtual
     std::string ctcPrefixBeamSearchDecode(const Mat& prediction) {
+          Mat prediction32f = ensureFloat32Prediction(prediction);
+          const Mat& probs = prediction32f;
+
           // CTC prefix beam search decode.
           // For more detail, refer to:
           // https://distill.pub/2017/ctc/#inference
@@ -841,18 +902,17 @@ struct TextRecognitionModel_Impl : public Model::Impl
           using Beam = std::vector<std::pair<std::vector<int>, PrefixScore>>;
           using BeamInDict = std::unordered_map<std::vector<int>, PrefixScore, PrefixHash>;
 
-          CV_CheckType(prediction.type(), CV_32FC1, "");
-          CV_CheckEQ(prediction.dims, 3, "");
-          CV_CheckEQ(prediction.size[1], 1, "");
-          CV_CheckEQ(prediction.size[2], (int)vocabulary.size() + 1, "");  // Length add 1 for ctc blank
+          CV_CheckEQ(probs.dims, 3, "");
+          CV_CheckEQ(probs.size[1], 1, "");
+          CV_CheckEQ(probs.size[2], (int)vocabulary.size() + 1, "");  // Length add 1 for ctc blank
 
           std::string decodeSeq;
           Beam beam = {std::make_pair(std::vector<int>(), PrefixScore(0.0, kNegativeInfinity))};
-          for (int i = 0; i < prediction.size[0]; i++)
+          for (int i = 0; i < probs.size[0]; i++)
           {
               // Loop over time
               BeamInDict nextBeam;
-              const float* pred = prediction.ptr<float>(i);
+              const float* pred = probs.ptr<float>(i);
               std::vector<std::pair<float, int>> topkPreds =
                   TopK(pred, vocabulary.size() + 1, vocPruneSize);
               for (const auto& each : topkPreds)
@@ -1173,6 +1233,11 @@ struct TextDetectionModel_EAST_Impl : public TextDetectionModel_Impl
         CV_CheckEQ(geometry.dims, 4, "");
         CV_CheckEQ(scoreMap.size[0], 1, "");
         CV_CheckEQ(geometry.size[0], 1, "");
+
+        if (geometry.size[1] == 1 && scoreMap.size[1] == 5) {
+            std::swap(geometry, scoreMap);
+        }
+
         CV_CheckEQ(scoreMap.size[1], 1, "");
         CV_CheckEQ(geometry.size[1], 5, "");
         CV_CheckEQ(scoreMap.size[2], geometry.size[2], "");

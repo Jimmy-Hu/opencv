@@ -7,13 +7,9 @@
 
 #include "precomp.hpp"
 #include "opencv2/objdetect.hpp"
-#include "opencv2/calib3d.hpp"
+#include "opencv2/geometry.hpp"
 #include <opencv2/core/utils/logger.hpp>
 #include "graphical_code_detector_impl.hpp"
-
-#ifdef HAVE_QUIRC
-#include "quirc.h"
-#endif
 
 #include <array>
 #include <limits>
@@ -55,9 +51,10 @@ static void updatePointsResult(OutputArray points_, const vector<Point2f>& point
         int N = int(points.size() / 4);
         if (N > 0)
         {
-            Mat m_p(N, 4, CV_32FC2, (void*)&points[0]);
+            int nrows = points_.kind() == _InputArray::STD_VECTOR ? 1 : N;
+            Mat m_p(nrows, N*4/nrows, CV_32FC2, (void*)&points[0]);
             int points_type = points_.fixedType() ? points_.type() : CV_32FC2;
-            m_p.reshape(2, points_.rows()).convertTo(points_, points_type);  // Mat layout: N x 4 x 2cn
+            m_p.convertTo(points_, points_type);  // Mat layout: N x 4 x 2cn
         }
         else
         {
@@ -2699,8 +2696,22 @@ void QRDecode::detectAlignment() {
             minMaxLoc(resTemplate, &minVal, &maxVal, &minLoc, &maxLoc);
             CV_LOG_DEBUG(NULL, "Alignment maxVal: " << maxVal);
             if (maxVal > 0.65) {
+                // Refine the maximum to sub-pixel precision with a parabolic fit through the
+                // neighbours. The marker is symmetric, so the correlation often has two (almost)
+                // equal maxima at adjacent pixels; the fit gives the position between them
+                // regardless of which one minMaxLoc happens to pick (rounding-dependent).
+                Point2f refined(maxLoc);
+                if (maxLoc.x > 0 && maxLoc.x < resTemplate.cols - 1 && maxLoc.y > 0 && maxLoc.y < resTemplate.rows - 1)
+                {
+                    float c = resTemplate.at<float>(maxLoc.y, maxLoc.x);
+                    float l = resTemplate.at<float>(maxLoc.y, maxLoc.x - 1), r = resTemplate.at<float>(maxLoc.y, maxLoc.x + 1);
+                    float u = resTemplate.at<float>(maxLoc.y - 1, maxLoc.x), d = resTemplate.at<float>(maxLoc.y + 1, maxLoc.x);
+                    float denx = l - 2*c + r, deny = u - 2*c + d;
+                    if (denx < 0) refined.x += std::max(-0.5f, std::min(0.5f, (l - r)/(2*denx)));
+                    if (deny < 0) refined.y += std::max(-0.5f, std::min(0.5f, (u - d)/(2*deny)));
+                }
                 const float templateOffset = static_cast<float>(resizedAlignmentMarker.size().width) / 2.f;
-                Point2f alignmentCoord(Point2f(maxLoc.x + left_top_x + templateOffset, maxLoc.y + left_top_y + templateOffset));
+                Point2f alignmentCoord(Point2f(refined.x + left_top_x + templateOffset, refined.y + left_top_y + templateOffset));
                 alignment_coords.push_back(alignmentCoord);
                 perspectiveTransform(alignment_coords, alignment_coords, homography.inv());
                 CV_LOG_DEBUG(NULL, "Alignment coords: " << alignment_coords);
@@ -2832,40 +2843,7 @@ bool QRDecode::decodingProcess()
 {
     const uint8_t* payload;
     size_t payload_len;
-#ifdef HAVE_QUIRC
-    if (straight.empty()) { return false; }
 
-    quirc_code qr_code;
-    memset(&qr_code, 0, sizeof(qr_code));
-
-    qr_code.size = straight.size().width;
-    for (int x = 0; x < qr_code.size; x++)
-    {
-        for (int y = 0; y < qr_code.size; y++)
-        {
-            int position = y * qr_code.size + x;
-            qr_code.cell_bitmap[position >> 3]
-                |= straight.ptr<uint8_t>(y)[x] ? 0 : (1 << (position & 7));
-        }
-    }
-
-    quirc_data qr_code_data;
-    quirc_decode_error_t errorCode = quirc_decode(&qr_code, &qr_code_data);
-
-    if(errorCode ==  QUIRC_ERROR_DATA_ECC){
-        quirc_flip(&qr_code);
-        errorCode = quirc_decode(&qr_code, &qr_code_data);
-    }
-
-    if (errorCode != 0) { return false; }
-
-    CV_LOG_INFO(NULL, "QR: decoded with .version=" << qr_code_data.version << " .data_type=" << qr_code_data.data_type << " .eci=" << qr_code_data.eci << " .payload_len=" << qr_code_data.payload_len)
-
-    mode = static_cast<QRCodeEncoder::EncodeMode>(qr_code_data.data_type);
-    eci = static_cast<QRCodeEncoder::ECIEncodings>(qr_code_data.eci);
-    payload = qr_code_data.payload;
-    payload_len = qr_code_data.payload_len;
-#else
     auto decoder = QRCodeDecoder::create();
     if (!decoder->decode(straight, result_info))
         return false;
@@ -2876,7 +2854,6 @@ bool QRDecode::decodingProcess()
     structure_info.parity = decoder->parity;
     structure_info.sequence_num = decoder->sequence_num;
     structure_info.total_num = decoder->total_num;
-#endif
 
     // Check output string format
     switch (mode)
@@ -2900,7 +2877,7 @@ bool QRDecode::decodingProcess()
             if (eci == QRCodeEncoder::ECIEncodings::ECI_UTF8) {
                 CV_LOG_INFO(NULL, "QR: payload ECI is UTF-8");
                 if (!checkUTF8(payload, payload_len)) {
-                    CV_LOG_INFO(NULL, "QUIRC_DATA_TYPE_BYTE with UTF-8 ECI must be UTF-8 compatible string");
+                    CV_LOG_INFO(NULL, "QRCode in BYTE mode with UTF-8 ECI must be UTF-8 compatible string");
                     return false;
                 }
                 result_info.assign((const char*)payload, payload_len);
@@ -2912,7 +2889,7 @@ bool QRDecode::decodingProcess()
                 result_info.assign((const char*)payload, payload_len);
             } else {
                 if (checkUTF8(payload, payload_len)) {
-                    CV_LOG_INFO(NULL, "QR: payload QUIRC_DATA_TYPE_BYTE is UTF-8 compatible, return as-is");
+                    CV_LOG_INFO(NULL, "QR: payload bytes are UTF-8 compatible, return as-is");
                     result_info.assign((const char*)payload, payload_len);
                 } else {
                     CV_LOG_INFO(NULL, "QR: assume 1-byte per symbol encoding");

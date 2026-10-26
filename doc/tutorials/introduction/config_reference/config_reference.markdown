@@ -156,17 +156,17 @@ cmake \
 
 Each module is a subdirectory of the `modules` directory. It is possible to disable one module:
 ```.sh
-cmake -DBUILD_opencv_calib3d=OFF ../opencv
+cmake -DBUILD_opencv_geometry=OFF ../opencv
 ```
 
 The opposite option is to build only specified modules and all modules they depend on:
 ```.sh
-cmake -DBUILD_LIST=calib3d,videoio,ts ../opencv
+cmake -DBUILD_LIST=geometry,videoio,ts ../opencv
 ```
 In this example we requested 3 modules and configuration script has determined all dependencies automatically:
 ```
 --   OpenCV modules:
---     To be built:                 calib3d core features2d flann highgui imgcodecs imgproc ts videoio
+--     To be built:                 core features flann geometry highgui imgcodecs imgproc ts videoio
 ```
 
 
@@ -324,7 +324,7 @@ Following formats can be read by OpenCV without help of any third-party library:
 | [PNG](https://en.wikipedia.org/wiki/Portable_Network_Graphics) | [libpng](https://en.wikipedia.org/wiki/Libpng)| `WITH_PNG` | _ON_ | `BUILD_PNG` |
 |^| [libspng(simple png)](https://libspng.org/) | `WITH_SPNG` | _OFF_ | `BUILD_SPNG` |
 | [JPEG](https://en.wikipedia.org/wiki/JPEG) | [libjpeg-turbo](https://en.wikipedia.org/wiki/Libjpeg) | `WITH_JPEG` | _ON_ | `BUILD_JPEG` |
-|^| [libjpeg](https://en.wikipedia.org/wiki/Libjpeg) | `WITH_JPEG` | _OFF_ | `BUILD_JPEG` with `BUILD_JPEG_TURBO_DISABLE` |
+|^| [libjpeg](https://en.wikipedia.org/wiki/Libjpeg) | `WITH_JPEG` | _OFF_ | Not supported. (see note) |
 | [TIFF](https://en.wikipedia.org/wiki/TIFF) | [LibTIFF](https://en.wikipedia.org/wiki/LibTIFF) | `WITH_TIFF` | _ON_ | `BUILD_TIFF` |
 | [WebP](https://en.wikipedia.org/wiki/WebP) || `WITH_WEBP` | _ON_ | `BUILD_WEBP` |
 | [JPEG 2000](https://en.wikipedia.org/wiki/JPEG_2000) | [OpenJPEG](https://en.wikipedia.org/wiki/OpenJPEG) | `WITH_OPENJPEG` | _ON_ | `BUILD_OPENJPEG` |
@@ -339,6 +339,8 @@ Corresponding BUILD_* options will force building and using the bundled librarie
 
 @note (All) Only one library for each image format can be enabled(e.g. In order to use JasPer for JPEG 2000 format, OpenJPEG must be disabled).
 @note (JPEG 2000) OpenJPEG have higher priority than JasPer which is deprecated.
+@note (JPEG) OpenCV 5 doesn't contain libjpeg source code, so `BUILD_JPEG_TURBO_DISABLE` is not supported. Users can use a system-wide installed libjpeg instead of libjpeg-turbo.
+@note (EXR) OpenCV 5 doesn't contain OpenEXR source code, so `BUILD_OPENEXR` is not supported. Users must provide a system-wide installation of libopenexr.
 @note (JPEG XL) OpenCV doesn't contain libjxl source code, so `BUILD_JPEGXL` is not supported. Users must provide a system-wide installation of libjxl.
 @note (AVIF) OpenCV doesn't contain libavif source code, so `BUILD_AVIF` is not supported. Users must provide a system-wide installation of libavif.
 
@@ -379,7 +381,7 @@ Integration with [FFmpeg](https://en.wikipedia.org/wiki/FFmpeg) library for deco
 - _swscale_
 - _avresample_ (optional)
 
-Exception is Windows platform where a prebuilt [plugin library containing FFmpeg](https://github.com/opencv/opencv_3rdparty/tree/ffmpeg/4.x) will be downloaded during a configuration stage and copied to the `bin` folder with all produced libraries.
+Exception is Windows platform where a prebuilt [plugin library containing FFmpeg](https://github.com/opencv/opencv_3rdparty/tree/ffmpeg/5.x) will be downloaded during a configuration stage and copied to the `bin` folder with all produced libraries.
 
 @note [Libav](https://en.wikipedia.org/wiki/Libav) library can be used instead of FFmpeg, but this combination is not actively supported.
 
@@ -520,10 +522,14 @@ OpenCV have own DNN inference module which have own build-in engine, but can als
 | `OPENCV_DNN_OPENCL` | _ON_ | Enable built-in OpenCL inference backend. |
 | `WITH_INF_ENGINE` | _OFF_ | **Deprecated since OpenVINO 2022.1** Enables [Intel Inference Engine (IE)](https://github.com/openvinotoolkit/openvino) backend. Allows to execute networks in IE format (.xml + .bin). Inference Engine must be installed either as part of [OpenVINO toolkit](https://en.wikipedia.org/wiki/OpenVINO), either as a standalone library built from sources. |
 | `INF_ENGINE_RELEASE` | _2020040000_ | **Deprecated since OpenVINO 2022.1** Defines version of Inference Engine library which is tied to OpenVINO toolkit version. Must be a 10-digit string, e.g. _2020040000_ for OpenVINO 2020.4. |
-| `WITH_NGRAPH` | _OFF_ | **Deprecated since OpenVINO 2022.1** Enables Intel NGraph library support. This library is part of Inference Engine backend which allows executing arbitrary networks read from files in multiple formats supported by OpenCV: Caffe, TensorFlow, PyTorch, Darknet, etc.. NGraph library must be installed, it is included into Inference Engine. |
+| `WITH_NGRAPH` | _OFF_ | **Deprecated since OpenVINO 2022.1** Enables Intel NGraph library support. This library is part of Inference Engine backend which allows executing arbitrary networks read from files in multiple formats supported by OpenCV: ONNX, TensorFlow, PyTorch, etc.. NGraph library must be installed, it is included into Inference Engine. |
 | `WITH_OPENVINO` | _OFF_ | Enable Intel OpenVINO Toolkit support. Should be used for OpenVINO>=2022.1 instead of `WITH_INF_ENGINE` and `WITH_NGRAPH`. |
+| `WITH_ONNXRUNTIME` | _OFF_ | Enable Microsoft ONNX Runtime backend support for OpenCV DNN. |
+| `DOWNLOAD_ONNXRUNTIME` | _OFF_ | Download official ONNX Runtime prebuilt binaries when enabled (or when ONNX Runtime is not available in system paths). |
+| `DOWNLOAD_ONNXRUNTIME_GPU` | _OFF_ | Download GPU-enabled ONNX Runtime prebuilt binaries when available (Windows x64 and Linux x64 only). Requires `WITH_ONNXRUNTIME=ON`. |
+| `ONNXRUNTIME_PREFER_STATIC` | _ON_ | Prefer static `libonnxruntime.a` when both static and shared ONNX Runtime libraries are available. |
+| `ONNXRUNTIME_VERSION` | _1.25.1_ | ONNX Runtime version to download for prebuilt packages. |
 | `OPENCV_DNN_CUDA` | _OFF_ | Enable CUDA backend. [CUDA](https://en.wikipedia.org/wiki/CUDA), CUBLAS and [CUDNN](https://developer.nvidia.com/cudnn) must be installed. |
-| `WITH_HALIDE` | _OFF_ | Use experimental [Halide](https://en.wikipedia.org/wiki/Halide_(programming_language)) backend which can generate optimized code for dnn-layers at runtime. Halide must be installed. |
 | `WITH_VULKAN` | _OFF_ | Enable experimental [Vulkan](https://en.wikipedia.org/wiki/Vulkan_(API)) backend. Does not require additional dependencies, but can use external Vulkan headers (`VULKAN_INCLUDE_DIRS`). |
 
 
@@ -596,7 +602,7 @@ Following options can be used to change installation layout for common scenarios
 | Option | Default | Description |
 | ------ | ------- | ----------- |
 | `INSTALL_CREATE_DISTRIB` | _OFF_ | Tune multiple things to produce Windows and Android distributions. |
-| `INSTALL_TO_MANGLED_PATHS` | _OFF_ | Adds one level to several installation locations to allow side-by-side installations. For example, headers will be installed to _/usr/include/opencv-4.4.0_ instead of _/usr/include/opencv4_ with this option enabled. |
+| `INSTALL_TO_MANGLED_PATHS` | _OFF_ | Adds one level to several installation locations to allow side-by-side installations. For example, headers will be installed to _/usr/include/opencv-5.x.y_ instead of _/usr/include/opencv5_ with this option enabled. |
 
 
 # Miscellaneous features {#tutorial_config_reference_misc}
@@ -614,7 +620,6 @@ Following options can be used to change installation layout for common scenarios
 | `ENABLE_FLAKE8` | _ON_ (when docs or examples are enabled) | Enable python scripts check with [Flake8](https://flake8.pycqa.org/) (_check_flake8_ target). Flake8 must be installed. |
 | `BUILD_JAVA` | _ON_ | Enable Java wrappers build. Java SDK and Ant must be installed. |
 | `BUILD_FAT_JAVA_LIB` | _ON_ (for static Android builds) | Build single _opencv_java_ dynamic library containing all library functionality bundled with Java bindings. |
-| `BUILD_opencv_python2` | _ON_ | Build python2 bindings (deprecated). Python with development files and numpy must be installed. |
 | `BUILD_opencv_python3` | _ON_ | Build python3 bindings. Python with development files and numpy must be installed. |
 
 TODO: need separate tutorials covering bindings builds
@@ -656,11 +661,9 @@ Following build options are utilized in `opencv_contrib` modules, as stated [pre
 `WITH_KLEIDICV`
 `WITH_CPUFEATURES`
 `WITH_EIGEN`
-`WITH_OPENVX`
 `WITH_DIRECTX`
 `WITH_VA`
 `WITH_LAPACK`
-`WITH_QUIRC`
 `BUILD_ZLIB`
 `BUILD_ITT`
 `WITH_IPP`

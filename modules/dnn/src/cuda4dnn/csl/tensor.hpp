@@ -28,7 +28,7 @@
 #include <utility>
 
 #ifndef CSL_MAX_TENSOR_RANK
-    #define CSL_MAX_TENSOR_RANK 6
+    #define CSL_MAX_TENSOR_RANK 7
 #endif
 
 namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
@@ -207,14 +207,20 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
         template <class ForwardItr>
         typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, void>
         ::type resize(ForwardItr start, ForwardItr end) {
-            CV_Assert(start != end);
-            CV_Assert(std::distance(start, end) <= CSL_MAX_TENSOR_RANK);
+            if (start != end) {
+                CV_Assert(std::distance(start, end) <= CSL_MAX_TENSOR_RANK);
 
-            using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
-            auto total = std::accumulate(start, end, 1, std::multiplies<ItrValueType>());
-            data.reset(total);
+                using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
+                auto total = std::accumulate(start, end, 1, std::multiplies<ItrValueType>());
+                data.reset(total);
 
-            shape.assign(start, end);
+                shape.assign(start, end);
+            }
+            else {
+                size_type one = 1;
+                shape.assign(&one, &one + 1);
+                data.reset(1);
+            }
         }
 
         /** @brief resizes the tensor
@@ -263,7 +269,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         template <class ForwardItr>
         typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, void>
-        ::type reshape(ForwardItr start, ForwardItr end) {
+        ::type reshape_(ForwardItr start, ForwardItr end) {
             CV_Assert(start != end);
 
             using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
@@ -302,6 +308,18 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             shape.resize(std::distance(start, end));
             std::copy(start, end, shape.begin());
             std::replace(std::begin(shape), std::end(shape), size_type(-1), unknown_size);
+        }
+
+        template <class ForwardItr>
+        typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, void>
+            ::type reshape(ForwardItr start, ForwardItr end) {
+            if (start != end) {
+                reshape_(start, end);
+            }
+            else {
+                size_type one = 1;
+                reshape_(&one, &one + 1);
+            }
         }
 
         /** @brief reshapes the tensor
@@ -448,15 +466,19 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
 
         template <class ForwardItr>
         TensorSpan(pointer ptr_, ForwardItr start, ForwardItr end) : ptr{ ptr_ } {
-            CV_Assert(start != end);
-            CV_Assert(std::distance(start, end) <= CSL_MAX_TENSOR_RANK);
+            if (start != end) {
+                CV_Assert(std::distance(start, end) <= CSL_MAX_TENSOR_RANK);
 
-            using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
-            if (std::any_of(start, end, [](ItrValueType x) { return x <= 0; })) {
-                CV_Error(Error::StsBadArg, "the given shape contains negative or zero size");
+                using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
+                if (std::any_of(start, end, [](ItrValueType x) { return x <= 0; })) {
+                    CV_Error(Error::StsBadArg, "the given shape contains negative or zero size");
+                }
+
+                shape.assign(start, end);
+            } else {
+                size_type one = 1;
+                shape.assign(&one, &one + 1);
             }
-
-            shape.assign(start, end);
         }
 
         /** creates a subspan of a tensor (or span); refer to subspan method for more details */
@@ -577,7 +599,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         template <class ForwardItr>
         typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, void>
-        ::type reshape(ForwardItr start, ForwardItr end) {
+        ::type reshape_(ForwardItr start, ForwardItr end) {
             CV_Assert(start != end);
             CV_Assert(std::distance(start, end) <= rank());
 
@@ -617,6 +639,18 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             shape.resize(std::distance(start, end));
             std::copy(start, end, shape.begin());
             std::replace(std::begin(shape), std::end(shape), size_type(-1), unknown_size);
+        }
+
+        template <class ForwardItr>
+        typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, void>
+            ::type reshape(ForwardItr start, ForwardItr end) {
+            if (start != end) {
+                reshape_(start, end);
+            }
+            else {
+                size_type one = 1;
+                reshape_(&one, &one + 1);
+            }
         }
 
         /** @brief reshapes the tensor
@@ -732,7 +766,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         template <class ForwardItr>
         typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, TensorSpan>
-        ::type subspan(size_type offset, ForwardItr start, ForwardItr end) const {
+        ::type subspan_(size_type offset, ForwardItr start, ForwardItr end) const {
             CV_Assert(start != end);
             CV_Assert(std::distance(start, end) <= rank());
 
@@ -758,6 +792,18 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             temp.shape.assign(start, end);
             temp.ptr = ptr + offset;
             return temp;
+        }
+
+        template <class ForwardItr>
+        typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, TensorSpan>
+            ::type subspan(size_type offset, ForwardItr start, ForwardItr end) const {
+            if (start != end) {
+                subspan_(start, end);
+            }
+            else {
+                size_type one = 1;
+                subspan_(&one, &one + 1);
+            }
         }
 
         /** @brief obtains a subspan of the span
@@ -818,15 +864,20 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
 
         template <class ForwardItr>
         TensorView(const_pointer ptr_, ForwardItr start, ForwardItr end) : ptr{ ptr_ } {
-            CV_Assert(start != end);
-            CV_Assert(std::distance(start, end) <= CSL_MAX_TENSOR_RANK);
+            if (start != end) {
+                CV_Assert(std::distance(start, end) <= CSL_MAX_TENSOR_RANK);
 
-            using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
-            if (std::any_of(start, end, [](ItrValueType x) { return x <= 0; })) {
-                CV_Error(Error::StsBadArg, "the given shape contains negative or zero size");
+                using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
+                if (std::any_of(start, end, [](ItrValueType x) { return x <= 0; })) {
+                    CV_Error(Error::StsBadArg, "the given shape contains negative or zero size");
+                }
+
+                shape.assign(start, end);
             }
-
-            shape.assign(start, end);
+            else {
+                size_type one = 1;
+                shape.assign(&one, &one + 1);
+            }
         }
 
         /** creates a subview of a tensor (or span or view); refer to subview method for more details */
@@ -941,7 +992,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         template <class ForwardItr>
         typename std::enable_if<!std::is_integral<ForwardItr>::value, void>
-        ::type reshape(ForwardItr start, ForwardItr end) {
+        ::type reshape_(ForwardItr start, ForwardItr end) {
             CV_Assert(start != end);
 
             using ItrValueType = typename std::iterator_traits<ForwardItr>::value_type;
@@ -980,6 +1031,18 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             shape.resize(std::distance(start, end));
             std::copy(start, end, shape.begin());
             std::replace(std::begin(shape), std::end(shape), size_type(-1), unknown_size);
+        }
+
+        template <class ForwardItr>
+        typename std::enable_if<!std::is_integral<ForwardItr>::value, void>
+            ::type reshape(ForwardItr start, ForwardItr end) {
+            if (start != end) {
+                reshape_(start, end);
+            }
+            else {
+                size_type one = 1;
+                reshape_(&one, &one + 1);
+            }
         }
 
         /** @brief reshapes the view
@@ -1098,7 +1161,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
          */
         template <class ForwardItr>
         typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, TensorView>
-        ::type subview(size_type offset, ForwardItr start, ForwardItr end) const {
+        ::type subview_(size_type offset, ForwardItr start, ForwardItr end) const {
             CV_Assert(start != end);
             CV_Assert(std::distance(start, end) <= rank());
 
@@ -1124,6 +1187,18 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             temp.shape.assign(start, end);
             temp.ptr = ptr + offset;
             return temp;
+        }
+
+        template <class ForwardItr>
+        typename std::enable_if<cxx_utils::is_forward_iterator<ForwardItr>::value, TensorView>
+            ::type subview(size_type offset, ForwardItr start, ForwardItr end) const {
+            if (start != end) {
+                subview_(offset, start, end);
+            }
+            else {
+                size_type one = 1;
+                subview_(offset, &one, &one + 1);
+            }
         }
 
         /** @brief obtains a subview of the view

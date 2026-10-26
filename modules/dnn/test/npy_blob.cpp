@@ -80,11 +80,31 @@ Mat blobFromNPY(const std::string& path)
     ifs.read(&header[0], header.size());
 
     // Extract data type.
-    CV_Assert(getType(header) == "<f4");
+    int matType;
+    std::string npyType = getType(header);
+    if (npyType == "<f4")
+        matType = CV_32F;
+    else if (npyType == "<f8")
+        matType = CV_64F;
+    else if (npyType == "<i4")
+        matType = CV_32S;
+    else if (npyType == "<i8")
+        matType = CV_64S;
+    else if (npyType == "<u4")
+        matType = CV_32U;
+    else if (npyType == "<u8")
+        matType = CV_64U;
+    else if (npyType == "|i1")
+        matType = CV_8S;
+    else if (npyType == "|u1")
+        matType = CV_8U;
+    else
+        CV_Error(Error::BadDepth, "Unsupported numpy type");
+
     CV_Assert(getFortranOrder(header) == "False");
     std::vector<int> shape = getShape(header);
 
-    Mat blob(shape, CV_32F);
+    Mat blob(shape, matType);
     ifs.read((char*)blob.data, blob.total() * blob.elemSize());
     CV_Assert((size_t)ifs.gcount() == blob.total() * blob.elemSize());
 

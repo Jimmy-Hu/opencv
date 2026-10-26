@@ -743,6 +743,26 @@ public:
         }
         return result;
     }
+    std::string getMSMFDeviceName(UINT32 index) const
+    {
+        std::string result;
+        if (index >= count || !devices[index])
+            return result;
+
+        WCHAR* wname = NULL;
+        UINT32 length = 0;
+        if (FAILED(devices[index]->GetAllocatedString(MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME, &wname, &length)))
+            return result;
+
+        const int size = ::WideCharToMultiByte(CP_UTF8, 0, wname, (int)length, NULL, 0, NULL, NULL);
+        if (size > 0)
+        {
+            result.resize((size_t)size);
+            ::WideCharToMultiByte(CP_UTF8, 0, wname, (int)length, &result[0], size, NULL, NULL);
+        }
+        CoTaskMemFree(wname);
+        return result;
+    }
 private:
     IMFActivate** devices;
     UINT32 count;
@@ -1427,10 +1447,11 @@ bool CvCapture_MSMF::setAudioProperties(const cv::VideoCaptureParameters& params
     }
     if (params.has(CAP_PROP_AUDIO_SAMPLES_PER_SECOND))
     {
+        static const int MSMF_MAX_AUDIO_SAMPLES_PER_SECOND = 384000; // highest rate used by real PCM audio hardware
         int value = params.get<int>(CAP_PROP_AUDIO_SAMPLES_PER_SECOND);
-        if (value < 0)
+        if (value < 0 || value > MSMF_MAX_AUDIO_SAMPLES_PER_SECOND)
         {
-            CV_LOG_ERROR(NULL, "VIDEOIO/MSMF: CAP_PROP_AUDIO_SAMPLES_PER_SECOND parameter can't be negative: " << value);
+            CV_LOG_ERROR(NULL, "VIDEOIO/MSMF: CAP_PROP_AUDIO_SAMPLES_PER_SECOND parameter value is invalid/unsupported: " << value);
             return false;
         }
         else
@@ -1727,7 +1748,7 @@ bool CvCapture_MSMF::grabAudioFrame()
             else if (flags & MF_SOURCE_READERF_ENDOFSTREAM)
             {
                 aEOS = true;
-                if (videoStream != -1 && !vEOS)
+                if (videoStream != -1)
                     returnFlag = true;
                 if (videoStream == -1)
                     audioSamplePos += chunkLengthOfBytes/((captureAudioFormat.bit_per_sample/8)*captureAudioFormat.nChannels);
@@ -2292,7 +2313,7 @@ double CvCapture_MSMF::getProperty( int property_id ) const
         default:
             break;
         }
-    return -1;
+    return CAP_PROP_UNKNOWN;
 }
 
 template <typename CtrlT>
@@ -2471,6 +2492,27 @@ cv::Ptr<cv::IVideoCapture> cv::cvCreateCapture_MSMF(const Ptr<IStreamReader>& st
     return cv::Ptr<cv::IVideoCapture>();
 }
 
+std::vector<cv::VideoDeviceInfo> cv::enumerate_MSMF_devices()
+{
+    std::vector<cv::VideoDeviceInfo> result;
+    DeviceList devices;
+    UINT32 count = 0;
+    try
+    {
+        Media_Foundation::getInstance();
+        count = devices.read();
+    }
+    catch (const cv::Exception& e)
+    {
+        CV_LOG_DEBUG(NULL, "Failed to enumerate MSMF devices: " << e.what());
+        return result;
+    }
+
+    for (UINT32 i = 0; i < count; i++)
+        result.push_back(cv::makeVideoDeviceInfo((int)i, cv::CAP_MSMF, devices.getMSMFDeviceName(i)));
+    return result;
+}
+
 //
 //
 // Media Foundation-based Video Writer
@@ -2485,7 +2527,7 @@ public:
     virtual bool open(const cv::String& filename, int fourcc,
                       double fps, cv::Size frameSize, const cv::VideoWriterParameters& params);
     virtual void close();
-    virtual void write(cv::InputArray);
+    virtual bool write(cv::InputArray);
 
     virtual double getProperty(int) const override;
     virtual bool setProperty(int, double) { return false; }
@@ -2716,12 +2758,12 @@ void CvVideoWriter_MSMF::close()
     }
 }
 
-void CvVideoWriter_MSMF::write(cv::InputArray img)
+bool CvVideoWriter_MSMF::write(cv::InputArray img)
 {
     if (img.empty() ||
         (img.channels() != 1 && img.channels() != 3 && img.channels() != 4) ||
         (UINT32)img.cols() != videoWidth || (UINT32)img.rows() != videoHeight)
-        return;
+        return false;
 
     const LONG cbWidth = 4 * videoWidth;
     const DWORD cbBuffer = cbWidth * videoHeight;
@@ -2749,8 +2791,10 @@ void CvVideoWriter_MSMF::write(cv::InputArray img)
         if (SUCCEEDED(sinkWriter->WriteSample(streamIndex, sample.Get())))
         {
             rtStart += rtDuration;
+            return true;
         }
     }
+    return false;
 }
 
 
@@ -2764,7 +2808,7 @@ double CvVideoWriter_MSMF::getProperty(int propId) const
     {
         return static_cast<double>(va_device);
     }
-    return 0;
+    return VIDEOWRITER_PROP_UNKNOWN;
 }
 
 cv::Ptr<cv::IVideoWriter> cv::cvCreateVideoWriter_MSMF( const std::string& filename, int fourcc,

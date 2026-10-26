@@ -22,8 +22,7 @@ The flat printable pattern may be used:
 1. For camera intrinsics (internal parameters) calibration. See @ref tutorial_camera_calibration.
 2. For stereo or multi-camera system extrinsics (external parameters: rotation and translation
    of each camera) calibration. See cv::stereoCalibrate for details.
-3. Camera pose registration relative to well known point in 3d world. See multiview calibration
-   tutorial in OpenCV 5.x.
+3. Camera pose registration relative to well known point in 3d world. See @ref tutorial_multiview_camera_calibration
 
 Pattern Types
 -------------
@@ -44,7 +43,7 @@ Example code to generate features coordinates for calibration (object points):
         }
     }
 ```
-Printable chessboard pattern: https://github.com/opencv/opencv/blob/4.x/doc/pattern.png
+Printable chessboard pattern: https://github.com/opencv/opencv/blob/5.x/doc/pattern.png
 (9x6 chessboard, page width: 210 mm, page height: 297 mm (A4))
 
 **Circles Grid**. The circles grid is symmetric or asymmetric (each even row shifted) grid of black
@@ -72,7 +71,7 @@ Example code to generate features coordinates for calibration with asymmetric gr
         }
     }
 ```
-Printable asymmetric circles grid pattern: https://github.com/opencv/opencv/blob/4.x/doc/acircles_pattern.png
+Printable asymmetric circles grid pattern: https://github.com/opencv/opencv/blob/5.x/doc/acircles_pattern.png
 (11x4 asymmetric circles grid, page width: 210 mm, page height: 297 mm (A4))
 
 **ChAruco board**. Chessboard unreached with ArUco markers. Each internal corner of the board is
@@ -93,7 +92,7 @@ Example code to generate features coordinates for calibration (object points) fo
         }
     }
 ```
-Printable ChAruco board pattern: https://github.com/opencv/opencv/blob/4.x/doc/charuco_board_pattern.png
+Printable ChAruco board pattern: https://github.com/opencv/opencv/blob/5.x/doc/charuco_board_pattern.png
 (7X5 ChAruco board, square size: 30 mm, marker size: 15 mm, ArUco dict: DICT_5X5_100, page width:
 210 mm, page height: 297 mm (A4))
 

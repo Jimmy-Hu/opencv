@@ -12,7 +12,6 @@ Implementation of padding layer, which adds paddings to input blob.
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_cann.hpp"
@@ -35,7 +34,7 @@ public:
     PaddingLayerImpl(const LayerParams &params)
     {
         setParamsFrom(params);
-        paddingValue = params.get<float>("value", 0);
+        paddingValue = params.get<double>("value", 0);
         inputDims = params.get<int>("input_dims", -1);
         paddingType = params.get<String>("type", "constant");
 
@@ -69,6 +68,21 @@ public:
             outputs[0][offset + i] = inpShape[offset + i] + paddings[i].first + paddings[i].second;
         }
         return false;
+    }
+
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_CheckEQ(inputs.size(), 1u, "");
+        if (preferableTarget == DNN_TARGET_OPENCL_FP16)
+            CV_CheckType(inputs[0], inputs[0] == CV_16F || inputs[0] == CV_8S || inputs[0] == CV_8U || inputs[0] == CV_32S || inputs[0] == CV_64S || inputs[0] == CV_Bool, "");
+        else
+            CV_CheckType(inputs[0], inputs[0] == CV_32F || inputs[0] == CV_8S || inputs[0] == CV_8U || inputs[0] == CV_32S || inputs[0] == CV_64S || inputs[0] == CV_Bool, "");
+
+        outputs.assign(requiredOutputs, inputs[0]);
     }
 
     void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays) CV_OVERRIDE
@@ -114,7 +128,6 @@ public:
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               (backendId == DNN_BACKEND_HALIDE && haveHalide() && dstRanges.size() == 4) ||
                backendId == DNN_BACKEND_CANN;
     }
 
@@ -186,30 +199,12 @@ public:
         else
             CV_Error(Error::StsNotImplemented, "Unsupported padding mode");
 
-        return make_cuda_node<cuda4dnn::PaddingOp>(preferableTarget, std::move(context->stream), ptype, paddingValue, dstRanges);
+        if (inputs[0]->getHostMatDepth() == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::PaddingOp>(std::move(context->stream), ptype, paddingValue, dstRanges);
+        else
+            return make_cuda_node_with_type<cuda4dnn::PaddingOp>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), ptype, paddingValue, dstRanges);
     }
 #endif
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        int inW, inH, inC, inN;
-        int minN = std::max(dstRanges[0].start, 0);
-        int minC = std::max(dstRanges[1].start, 0);
-        int minY = std::max(dstRanges[2].start, 0);
-        int minX = std::max(dstRanges[3].start, 0);
-        Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
-        getCanonicalSize(inputBuffer, &inW, &inH, &inC, &inN);
-
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::Func padded =
-            Halide::BoundaryConditions::constant_exterior(inputBuffer, paddingValue);
-        top(x, y, c, n) = padded(x - minX, y - minY, c - minC, n - minN);
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
 
 #ifdef HAVE_CANN
     virtual Ptr<BackendNode> initCann(const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -271,7 +266,37 @@ public:
         auto padding_below = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{begins.size()}, begins.data());
         auto padding_above = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{ends.size()}, ends.data());
         auto pad_mode = paddingType == "constant" ? ov::op::PadMode::CONSTANT : ov::op::PadMode::REFLECT; // SYMMETRIC
-        auto arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{}, &paddingValue);;
+
+        std::shared_ptr<ov::op::v0::Constant> arg_pad_value;
+        float paddingValueFloat = paddingValue;
+        int8_t paddingValueInt8 = paddingValue;
+        uint8_t paddingValueUInt8 = paddingValue;
+        int32_t paddingValueInt32 = paddingValue;
+        int64_t paddingValueInt64 = paddingValue;
+        bool paddingValueBool = paddingValue;
+        switch(ieInpNode.get_element_type())
+        {
+            case ov::element::f32:
+                arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{}, &paddingValueFloat);
+                break;
+            case ov::element::i8:
+                arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::i8, ov::Shape{}, &paddingValueInt8);
+                break;
+            case ov::element::u8:
+                arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::u8, ov::Shape{}, &paddingValueUInt8);
+                break;
+            case ov::element::i32:
+                arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::i32, ov::Shape{}, &paddingValueInt32);
+                break;
+            case ov::element::i64:
+                arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::i64, ov::Shape{}, &paddingValueInt64);
+                break;
+            case ov::element::boolean:
+                arg_pad_value = std::make_shared<ov::op::v0::Constant>(ov::element::boolean, ov::Shape{}, &paddingValueBool);
+                break;
+            default:
+                CV_Error(Error::BadDepth, "");
+        };
 
         auto pad = paddingType == "constant" ?
              std::make_shared<ov::op::v1::Pad>(ieInpNode, padding_below, padding_above, arg_pad_value, pad_mode) :
@@ -280,21 +305,11 @@ public:
     }
 #endif
 
-    virtual bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                             const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        float outputScale = scales[1][0];
-        int outputZp = zeropoints[1][0];
-        float padValue = outputZp + std::round(params.get<float>("value", 0)/outputScale);
-        params.set("value", padValue);
-        return true;
-    }
-
 private:
     std::vector<std::pair<int, int> > paddings;  // Pairs pad before, pad after.
     std::vector<Range> dstRanges;
     int inputDims;
-    float paddingValue;
+    double paddingValue;
     std::string paddingType;
 };
 

@@ -13,6 +13,7 @@
 // Copyright (C) 2000-2008, Intel Corporation, all rights reserved.
 // Copyright (C) 2009-2011, Willow Garage Inc., all rights reserved.
 // Copyright (C) 2014-2015, Itseez Inc., all rights reserved.
+// Copyright (C) 2026, Advanced Micro Devices, Inc., all rights reserved.
 // Third party copyrights are property of their respective owners.
 //
 // Redistribution and use in source and binary forms, with or without modification,
@@ -49,11 +50,33 @@
 #define CV_MAHALANOBIS_BASELINE_ONLY
 #define CV_MULTRANSPOSED_BASELINE_ONLY
 
+// The SIMD GEMM kernels below reorder floating-point accumulation (and use FMA
+// where the ISA provides it), producing a result that is correct (<1e-9 vs a
+// long-double reference) but differs from the scalar reference in the last bits.
+// The multi-view camera-calibration solver is ill-conditioned - fisheye
+// ComputeHomography forms L^T*L, takes an SVD, then iterates (J^T*J)^-1 - so it
+// amplifies that tiny deviation enough to flip its outcome on some build targets.
+// CI (PR #29472, RegisterCamerasTest) shows this only on the 32-bit x86 (Windows)
+// and macOS-x64 (Intel) jobs; Windows x64, macOS-ARM64 and all Linux targets pass.
+// FP background: on 32-bit x86 the x87 FPU holds intermediates in 80-bit extended
+// precision whereas SIMD accumulates in 64-bit; on modern x86-64 and ARM both
+// scalar and SIMD use strict IEEE-754 width (64-bit double / 32-bit float, no
+// hidden extended precision). The failure is therefore a toolchain/ABI-specific
+// bifurcation rather than a single-feature effect, so we simply keep the
+// reference-matching scalar GEMM path on the affected targets.
+#ifndef CV_GEMM_SIMD_ENABLED
+#if defined(__i386__) || defined(_M_IX86) || (defined(__APPLE__) && defined(__x86_64__))
+#define CV_GEMM_SIMD_ENABLED 0
+#else
+#define CV_GEMM_SIMD_ENABLED 1
+#endif
+#endif
+
 namespace cv {
 
 // forward declarations
-typedef void (*TransformFunc)(const uchar* src, uchar* dst, const uchar* m, int len, int scn, int dcn);
-typedef void (*ScaleAddFunc)(const uchar* src1, const uchar* src2, uchar* dst, int len, const void* alpha);
+typedef void (*TransformFunc)(const void* src, void* dst, const void* m, int len, int scn, int dcn);
+typedef void (*ScaleAddFunc)(const void* src1, const void* src2, void* dst, int len, const void* alpha);
 typedef void (*MulTransposedFunc)(const Mat& src, const/*preallocated*/ Mat& dst, const Mat& delta, double scale);
 typedef double (*MahalanobisImplFunc)(const Mat& v1, const Mat& v2, const Mat& icovar, double *diff_buffer /*[len]*/, int len /*=v1.total()*/);
 
@@ -175,6 +198,337 @@ GEMM_TransposeBlock( const uchar* src, size_t src_step,
     }
 }
 
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+template<typename ST> struct VecTraits;
+
+template<> struct VecTraits<float> {
+    typedef v_float32 VT;
+    static inline VT zero() { return vx_setzero_f32(); }
+    static inline VT load(const float* p) { return vx_load(p); }
+    static inline VT setall(float v) { return vx_setall_f32(v); }
+};
+#endif
+
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+template<> struct VecTraits<double> {
+    typedef v_float64 VT;
+    static inline VT zero() { return vx_setzero_f64(); }
+    static inline VT load(const double* p) { return vx_load(p); }
+    static inline VT setall(double v) { return vx_setall_f64(v); }
+};
+#endif
+
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+template<typename ST>
+static inline ST simdDotProduct(const ST* a, const ST* b, int n, int& k)
+{
+    typedef typename VecTraits<ST>::VT VecT;
+    const int vlanes = VTraits<VecT>::vlanes();
+    const int stride4 = vlanes * 4;
+    VecT vs0 = VecTraits<ST>::zero();
+    VecT vs1 = VecTraits<ST>::zero();
+    VecT vs2 = VecTraits<ST>::zero();
+    VecT vs3 = VecTraits<ST>::zero();
+    for( ; k <= n - stride4; k += stride4 )
+    {
+        vs0 = v_muladd(VecTraits<ST>::load(a + k),              VecTraits<ST>::load(b + k),              vs0);
+        vs1 = v_muladd(VecTraits<ST>::load(a + k + vlanes),     VecTraits<ST>::load(b + k + vlanes),     vs1);
+        vs2 = v_muladd(VecTraits<ST>::load(a + k + vlanes * 2), VecTraits<ST>::load(b + k + vlanes * 2), vs2);
+        vs3 = v_muladd(VecTraits<ST>::load(a + k + vlanes * 3), VecTraits<ST>::load(b + k + vlanes * 3), vs3);
+    }
+    vs0 = v_add(v_add(vs0, vs1), v_add(vs2, vs3));
+    for( ; k <= n - vlanes; k += vlanes )
+        vs0 = v_muladd(VecTraits<ST>::load(a + k), VecTraits<ST>::load(b + k), vs0);
+    return v_reduce_sum(vs0);
+}
+#endif
+
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+// Float input, double accumulation dot product (for 32FC1 where WT=double)
+static inline double simdDotProduct_f32f64(const float* a, const float* b, int n, int& k)
+{
+    const int vlanes_f32 = VTraits<v_float32>::vlanes();
+    const int stride2 = vlanes_f32 * 2;
+    v_float64 vs0 = vx_setzero_f64();
+    v_float64 vs1 = vx_setzero_f64();
+    v_float64 vs2 = vx_setzero_f64();
+    v_float64 vs3 = vx_setzero_f64();
+    for( ; k <= n - stride2; k += stride2 )
+    {
+        v_float32 va0 = vx_load(a + k);
+        v_float32 vb0 = vx_load(b + k);
+        vs0 = v_muladd(v_cvt_f64(va0), v_cvt_f64(vb0), vs0);
+        vs1 = v_muladd(v_cvt_f64_high(va0), v_cvt_f64_high(vb0), vs1);
+
+        v_float32 va1 = vx_load(a + k + vlanes_f32);
+        v_float32 vb1 = vx_load(b + k + vlanes_f32);
+        vs2 = v_muladd(v_cvt_f64(va1), v_cvt_f64(vb1), vs2);
+        vs3 = v_muladd(v_cvt_f64_high(va1), v_cvt_f64_high(vb1), vs3);
+    }
+    vs0 = v_add(v_add(vs0, vs1), v_add(vs2, vs3));
+    for( ; k <= n - vlanes_f32; k += vlanes_f32 )
+    {
+        v_float32 va = vx_load(a + k);
+        v_float32 vb = vx_load(b + k);
+        vs0 = v_muladd(v_cvt_f64(va), v_cvt_f64(vb), vs0);
+        vs0 = v_muladd(v_cvt_f64_high(va), v_cvt_f64_high(vb), vs0);
+    }
+    return v_reduce_sum(vs0);
+}
+
+// Float input, double accumulation GEMM k-outer/j-inner (for 32FC1 where WT=double)
+static inline void simdGEMM_kj_f32f64(
+    const float* a_data, const float* _b_data, size_t b_step,
+    const float* _c_data, size_t c_step1,
+    float* d_data,
+    int n, int m,
+    double alpha, double beta,
+    int& j)
+{
+    const int vlanes_f32 = VTraits<v_float32>::vlanes();
+    const int vlanes_f64 = VTraits<v_float64>::vlanes();
+
+    if( m >= 2 * vlanes_f32 && n >= 64 )
+    {
+        // k-outer / j-inner with double accumulation
+        const int max_m = 1600 / (int)sizeof(float);
+        cv::AutoBuffer<double> _s_buf(max_m);
+        double* s_buf = _s_buf.data();
+
+        {
+            v_float64 vz = vx_setzero_f64();
+            for( j = 0; j <= m - vlanes_f64; j += vlanes_f64 )
+                v_store(s_buf + j, vz);
+            for( ; j < m; j++ )
+                s_buf[j] = 0.0;
+        }
+
+        {
+            const float* b_ptr = _b_data;
+            for( int k = 0; k < n; k++, b_ptr += b_step )
+            {
+                v_float64 va = vx_setall_f64((double)a_data[k]);
+                j = 0;
+                for( ; j <= m - vlanes_f32; j += vlanes_f32 )
+                {
+                    v_float32 vb = vx_load(b_ptr + j);
+                    v_float64 vb_lo = v_cvt_f64(vb);
+                    v_float64 vb_hi = v_cvt_f64_high(vb);
+                    v_float64 vd_lo = vx_load(s_buf + j);
+                    v_float64 vd_hi = vx_load(s_buf + j + vlanes_f64);
+                    vd_lo = v_muladd(va, vb_lo, vd_lo);
+                    vd_hi = v_muladd(va, vb_hi, vd_hi);
+                    v_store(s_buf + j, vd_lo);
+                    v_store(s_buf + j + vlanes_f64, vd_hi);
+                }
+                double a_val = (double)a_data[k];
+                for( ; j < m; j++ )
+                    s_buf[j] += a_val * (double)b_ptr[j];
+            }
+        }
+
+        {
+            v_float64 valpha = vx_setall_f64(alpha);
+            const float* c_data = _c_data;
+            j = 0;
+            if( !_c_data )
+            {
+                for( ; j <= m - vlanes_f32; j += vlanes_f32 )
+                {
+                    v_float64 vs_lo = v_mul(vx_load(s_buf + j), valpha);
+                    v_float64 vs_hi = v_mul(vx_load(s_buf + j + vlanes_f64), valpha);
+                    v_store(d_data + j, v_cvt_f32(vs_lo, vs_hi));
+                }
+                for( ; j < m; j++ )
+                    d_data[j] = (float)(s_buf[j] * alpha);
+            }
+            else if( c_step1 == 1 )
+            {
+                v_float64 vbeta = vx_setall_f64(beta);
+                for( ; j <= m - vlanes_f32; j += vlanes_f32 )
+                {
+                    v_float64 vs_lo = v_mul(vx_load(s_buf + j), valpha);
+                    v_float64 vs_hi = v_mul(vx_load(s_buf + j + vlanes_f64), valpha);
+                    v_float32 vc = vx_load(c_data + j);
+                    vs_lo = v_muladd(v_cvt_f64(vc), vbeta, vs_lo);
+                    vs_hi = v_muladd(v_cvt_f64_high(vc), vbeta, vs_hi);
+                    v_store(d_data + j, v_cvt_f32(vs_lo, vs_hi));
+                }
+                for( ; j < m; j++ )
+                    d_data[j] = (float)(s_buf[j] * alpha + (double)c_data[j] * beta);
+            }
+            else
+            {
+                for( j = 0; j < m; j++, c_data += c_step1 )
+                    d_data[j] = (float)(s_buf[j] * alpha + (double)c_data[0] * beta);
+            }
+        }
+        j = m;
+    }
+    else if( vlanes_f32 * (int)sizeof(float) >= 32 )
+    {
+        // j-outer with SIMD: double accumulation per vlanes_f64 group
+        const float* c_data = _c_data;
+        for( ; j <= m - vlanes_f32; j += vlanes_f32, c_data += vlanes_f32 * c_step1 )
+        {
+            const float* b = _b_data + j;
+            v_float64 vs_lo = vx_setzero_f64();
+            v_float64 vs_hi = vx_setzero_f64();
+            for( int k = 0; k < n; k++, b += b_step )
+            {
+                v_float64 va = vx_setall_f64((double)a_data[k]);
+                v_float32 vb = vx_load(b);
+                vs_lo = v_muladd(va, v_cvt_f64(vb), vs_lo);
+                vs_hi = v_muladd(va, v_cvt_f64_high(vb), vs_hi);
+            }
+            v_float64 valpha = vx_setall_f64(alpha);
+            vs_lo = v_mul(vs_lo, valpha);
+            vs_hi = v_mul(vs_hi, valpha);
+            if( !_c_data )
+            {
+                v_store(d_data + j, v_cvt_f32(vs_lo, vs_hi));
+            }
+            else if( c_step1 == 1 )
+            {
+                v_float64 vbeta = vx_setall_f64(beta);
+                v_float32 vc = vx_load(c_data);
+                vs_lo = v_muladd(v_cvt_f64(vc), vbeta, vs_lo);
+                vs_hi = v_muladd(v_cvt_f64_high(vc), vbeta, vs_hi);
+                v_store(d_data + j, v_cvt_f32(vs_lo, vs_hi));
+            }
+            else
+            {
+                CV_DECL_ALIGNED(CV_SIMD_WIDTH) float buf[VTraits<v_float32>::max_nlanes];
+                v_store_aligned(buf, v_cvt_f32(vs_lo, vs_hi));
+                for( int jj = 0; jj < vlanes_f32; jj++ )
+                    d_data[j + jj] = buf[jj] + c_data[jj * c_step1] * (float)beta;
+            }
+        }
+    }
+}
+#endif
+
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+template<typename ST>
+static inline void simdGEMM_kj(
+    const ST* a_data, const ST* _b_data, size_t b_step,
+    const ST* _c_data, size_t c_step1,
+    ST* d_data,
+    int n, int m,
+    double alpha, double beta,
+    int& j)
+{
+    typedef typename VecTraits<ST>::VT VecT;
+    const int vlanes = VTraits<VecT>::vlanes();
+
+    if( m >= 2 * vlanes && n >= 64 )
+    {
+        // k-outer / j-inner SIMD: sequential B-row access, good for large n
+        const int max_m = 1600 / (int)sizeof(ST);
+        CV_DECL_ALIGNED(CV_SIMD_WIDTH) ST s_buf[max_m];
+
+        {
+            VecT vz = VecTraits<ST>::zero();
+            for( j = 0; j <= m - vlanes; j += vlanes )
+                v_store_aligned(s_buf + j, vz);
+            for( ; j < m; j++ )
+                s_buf[j] = (ST)0;
+        }
+
+        {
+            const ST* b_ptr = _b_data;
+            for( int k = 0; k < n; k++, b_ptr += b_step )
+            {
+                VecT va = VecTraits<ST>::setall(a_data[k]);
+                j = 0;
+                for( ; j <= m - vlanes; j += vlanes )
+                {
+                    VecT vd = vx_load_aligned(s_buf + j);
+                    VecT vb = VecTraits<ST>::load(b_ptr + j);
+                    vd = v_muladd(va, vb, vd);
+                    v_store_aligned(s_buf + j, vd);
+                }
+                ST a_val = a_data[k];
+                for( ; j < m; j++ )
+                    s_buf[j] += a_val * b_ptr[j];
+            }
+        }
+
+        {
+            VecT valpha = VecTraits<ST>::setall((ST)alpha);
+            const ST* c_data = _c_data;
+            j = 0;
+            if( !_c_data )
+            {
+                for( ; j <= m - vlanes; j += vlanes )
+                {
+                    VecT vs = v_mul(vx_load_aligned(s_buf + j), valpha);
+                    v_store(d_data + j, vs);
+                }
+                for( ; j < m; j++ )
+                    d_data[j] = s_buf[j] * (ST)alpha;
+            }
+            else if( c_step1 == 1 )
+            {
+                VecT vbeta = VecTraits<ST>::setall((ST)beta);
+                for( ; j <= m - vlanes; j += vlanes )
+                {
+                    VecT vs = v_mul(vx_load_aligned(s_buf + j), valpha);
+                    VecT vc = VecTraits<ST>::load(c_data + j);
+                    vs = v_muladd(vc, vbeta, vs);
+                    v_store(d_data + j, vs);
+                }
+                for( ; j < m; j++ )
+                    d_data[j] = s_buf[j] * (ST)alpha + c_data[j] * (ST)beta;
+            }
+            else
+            {
+                for( j = 0; j < m; j++, c_data += c_step1 )
+                    d_data[j] = s_buf[j] * (ST)alpha + c_data[0] * (ST)beta;
+            }
+        }
+        j = m; // all columns handled
+    }
+    else if( vlanes * (int)sizeof(ST) >= 32 )
+    {
+        // j-outer with SIMD: process vlanes columns per group
+        // (skip on narrow SIMD where 4-column scalar is faster)
+        VecT valpha = VecTraits<ST>::setall((ST)alpha);
+        const ST* c_data = _c_data;
+        for( ; j <= m - vlanes; j += vlanes, c_data += vlanes * c_step1 )
+        {
+            const ST* b = _b_data + j;
+            VecT vs = VecTraits<ST>::zero();
+            for( int k = 0; k < n; k++, b += b_step )
+            {
+                VecT va = VecTraits<ST>::setall(a_data[k]);
+                VecT vb = VecTraits<ST>::load(b);
+                vs = v_muladd(va, vb, vs);
+            }
+            vs = v_mul(vs, valpha);
+            if( !_c_data )
+            {
+                v_store(d_data + j, vs);
+            }
+            else if( c_step1 == 1 )
+            {
+                VecT vc = VecTraits<ST>::load(c_data);
+                vs = v_muladd(vc, VecTraits<ST>::setall((ST)beta), vs);
+                v_store(d_data + j, vs);
+            }
+            else
+            {
+                CV_DECL_ALIGNED(CV_SIMD_WIDTH) ST buf[VTraits<VecT>::max_nlanes];
+                v_store_aligned(buf, vs);
+                for( int jj = 0; jj < vlanes; jj++ )
+                    d_data[j + jj] = buf[jj] + c_data[jj * c_step1] * (ST)beta;
+            }
+        }
+        // Remaining columns handled by 4-column scalar in caller
+    }
+}
+#endif
+
 
 template<typename T, typename WT> static void
 GEMMSingleMul( const T* a_data, size_t a_step,
@@ -286,20 +640,34 @@ GEMMSingleMul( const T* a_data, size_t a_step,
             for( j = 0; j < d_size.width; j++, b_data += b_step,
                                                c_data += c_step1 )
             {
-                WT s0(0), s1(0), s2(0), s3(0);
+                WT s0(0);
                 k = 0;
-                 #if CV_ENABLE_UNROLLED
-                for( ; k <= n - 4; k += 4 )
+#if CV_SIMD_64F && CV_GEMM_SIMD_ENABLED
+                if( sizeof(WT) == sizeof(double) )
                 {
-                    s0 += WT(a_data[k])*WT(b_data[k]);
-                    s1 += WT(a_data[k+1])*WT(b_data[k+1]);
-                    s2 += WT(a_data[k+2])*WT(b_data[k+2]);
-                    s3 += WT(a_data[k+3])*WT(b_data[k+3]);
+                    if( sizeof(T) == sizeof(double) )
+                        s0 = (WT)simdDotProduct((const double*)a_data, (const double*)b_data, n, k);
+                    else if( sizeof(T) == sizeof(float) )
+                        s0 = (WT)simdDotProduct_f32f64((const float*)a_data, (const float*)b_data, n, k);
                 }
-                #endif
+                else
+#endif
+                {
+                    WT s1(0), s2(0), s3(0);
+                     #if CV_ENABLE_UNROLLED
+                    for( ; k <= n - 4; k += 4 )
+                    {
+                        s0 += WT(a_data[k])*WT(b_data[k]);
+                        s1 += WT(a_data[k+1])*WT(b_data[k+1]);
+                        s2 += WT(a_data[k+2])*WT(b_data[k+2]);
+                        s3 += WT(a_data[k+3])*WT(b_data[k+3]);
+                    }
+                    #endif
+                    s0 += s1 + s2 + s3;
+                }
                 for( ; k < n; k++ )
                     s0 += WT(a_data[k])*WT(b_data[k]);
-                s0 = (s0+s1+s2+s3)*alpha;
+                s0 = s0*alpha;
 
                 if( !c_data )
                     d_data[j] = T(s0);
@@ -323,7 +691,23 @@ GEMMSingleMul( const T* a_data, size_t a_step,
                 a_data = a_buf;
             }
 
-            for( j = 0; j <= m - 4; j += 4, c_data += 4*c_step1 )
+            j = 0;
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F) && CV_GEMM_SIMD_ENABLED
+            if( sizeof(WT) == sizeof(double) )
+            {
+                if( sizeof(T) == sizeof(double) )
+                    simdGEMM_kj((const double*)a_data, (const double*)_b_data, b_step,
+                                        (const double*)_c_data, c_step1,
+                                (double*)d_data, n, m, alpha, beta, j);
+                else if( sizeof(T) == sizeof(float) )
+                    simdGEMM_kj_f32f64((const float*)a_data, (const float*)_b_data, b_step,
+                                        (const float*)_c_data, c_step1,
+                                (float*)d_data, n, m, alpha, beta, j);
+            }
+#endif
+            c_data = _c_data + j * c_step1;
+            // 4-column j-outer with register accumulators for remaining columns
+            for( ; j <= m - 4; j += 4, c_data += 4*c_step1 )
             {
                 const T* b = _b_data + j;
                 WT s0(0), s1(0), s2(0), s3(0);
@@ -394,6 +778,41 @@ GEMMSingleMul( const T* a_data, size_t a_step,
             {
                 WT al(a_data[k]);
                 j=0;
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+                if( sizeof(WT) == sizeof(double) )
+                {
+                    if( sizeof(T) == sizeof(double) )
+                    {
+                        const int vlanes = VTraits<v_float64>::vlanes();
+                        v_float64 val = vx_setall_f64(*((const double*)&al));
+                        for( ; j <= m - vlanes; j += vlanes )
+                        {
+                            v_float64 vd = vx_load((const double*)(d_buf + j));
+                            v_float64 vb = vx_load((const double*)(b_data + j));
+                            vd = v_muladd(vb, val, vd);
+                            v_store((double*)(d_buf + j), vd);
+                        }
+                    }
+                    else
+                    {
+                        const int vlanes_f32 = VTraits<v_float32>::vlanes();
+                        const int vlanes_f64 = VTraits<v_float64>::vlanes();
+                        v_float64 val = vx_setall_f64(*((const double*)&al));
+                        for( ; j <= m - vlanes_f32; j += vlanes_f32 )
+                        {
+                            v_float32 vb = vx_load((const float*)(b_data + j));
+                            v_float64 vb_lo = v_cvt_f64(vb);
+                            v_float64 vb_hi = v_cvt_f64_high(vb);
+                            v_float64 vd_lo = vx_load((const double*)(d_buf + j));
+                            v_float64 vd_hi = vx_load((const double*)(d_buf + j + vlanes_f64));
+                            vd_lo = v_muladd(vb_lo, val, vd_lo);
+                            vd_hi = v_muladd(vb_hi, val, vd_hi);
+                            v_store((double*)(d_buf + j), vd_lo);
+                            v_store((double*)(d_buf + j + vlanes_f64), vd_hi);
+                        }
+                    }
+                }
+#endif
                 for( ; j < m; j++ )
                     d_buf[j] += WT(b_data[j])*al;
             }
@@ -410,7 +829,87 @@ GEMMSingleMul( const T* a_data, size_t a_step,
         }
     }
 }
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+template<typename WT>
+static inline void setDoubleDataZero(WT* d_data, int m, int vlanes)
+{
+    v_float64 vz = vx_setzero_f64();
+    int j = 0;
+    for( ; j <= m - vlanes; j += vlanes )
+        v_store((double*)(d_data + j), vz);
+    for( ; j < m; j++ )
+        d_data[j] = WT(0);
+}
 
+template<typename ST>
+static inline void simdMulAdd(const ST* b, double* d, int m, double a_val);
+
+template<>
+inline void simdMulAdd<float>(
+    const float* b, double* d, int m, double a_val)
+{
+    const int vlanes_f32 = VTraits<v_float32>::vlanes();
+    const int vlanes_f64 = VTraits<v_float64>::vlanes();
+    v_float64 va = vx_setall_f64(a_val);
+    int j = 0;
+    for( ; j <= m - vlanes_f32; j += vlanes_f32 )
+    {
+        v_float32 vb    = vx_load(b + j);
+        v_float64 vb_lo = v_cvt_f64(vb);
+        v_float64 vb_hi = v_cvt_f64_high(vb);
+        v_float64 vd_lo = vx_load(d + j);
+        v_float64 vd_hi = vx_load(d + j + vlanes_f64);
+        vd_lo = v_muladd(va, vb_lo, vd_lo);
+        vd_hi = v_muladd(va, vb_hi, vd_hi);
+        v_store(d + j, vd_lo);
+        v_store(d + j + vlanes_f64, vd_hi);
+    }
+    for( ; j < m; j++ )
+        d[j] += a_val * (double)b[j];
+}
+
+template<>
+inline void simdMulAdd<double>(
+    const double* b, double* d, int m, double a_val)
+{
+    const int vlanes = VTraits<v_float64>::vlanes();
+    const int stride2 = vlanes * 2;
+    v_float64 va = vx_setall_f64(a_val);
+    int j = 0;
+    for( ; j <= m - stride2; j += stride2 )
+    {
+        v_float64 vd0 = vx_load(d + j);
+        v_float64 vb0 = vx_load(b + j);
+        v_float64 vd1 = vx_load(d + j + vlanes);
+        v_float64 vb1 = vx_load(b + j + vlanes);
+        vd0 = v_muladd(va, vb0, vd0);
+        vd1 = v_muladd(va, vb1, vd1);
+        v_store(d + j, vd0);
+        v_store(d + j + vlanes, vd1);
+    }
+    for( ; j <= m - vlanes; j += vlanes )
+    {
+        v_float64 vd = vx_load(d + j);
+        v_float64 vb = vx_load(b + j);
+        vd = v_muladd(va, vb, vd);
+        v_store(d + j, vd);
+    }
+    for( ; j < m; j++ )
+        d[j] += a_val * b[j];
+}
+
+template<typename ST>
+static inline void simdBlockMul_kj(
+    const ST* a_data, const ST* b_data, size_t b_step,
+    double* d_data, int n, int m, bool do_acc)
+{
+    const int vlanes = VTraits<v_float64>::vlanes();
+    if( !do_acc )
+        setDoubleDataZero(d_data, m, vlanes);
+    for( int k = 0; k < n; k++, b_data += b_step )
+        simdMulAdd(b_data, d_data, m, (double)a_data[k]);
+}
+#endif // CV_SIMD_64F || CV_SIMD_SCALABLE_64F
 
 template<typename T, typename WT> static void
 GEMMBlockMul( const T* a_data, size_t a_step,
@@ -456,17 +955,31 @@ GEMMBlockMul( const T* a_data, size_t a_step,
 
             for( j = 0; j < d_size.width; j++, b_data += b_step )
             {
-                WT s0 = do_acc ? d_data[j]:WT(0), s1(0);
-                for( k = 0; k <= n - 2; k += 2 )
+                WT s0 = do_acc ? d_data[j] : WT(0);
+                k = 0;
+#if CV_SIMD_64F && CV_GEMM_SIMD_ENABLED
+                if( sizeof(WT) == sizeof(double) )
                 {
-                    s0 += WT(a_data[k])*WT(b_data[k]);
-                    s1 += WT(a_data[k+1])*WT(b_data[k+1]);
+                    if( sizeof(T) == sizeof(double) )
+                        s0 += (WT)simdDotProduct((const double*)a_data, (const double*)b_data, n, k);
+                    else if( sizeof(T) == sizeof(float) )
+                        s0 += (WT)simdDotProduct_f32f64((const float*)a_data, (const float*)b_data, n, k);
                 }
-
+                else
+#endif
+                {
+                    WT s1(0);
+                    for( ; k <= n - 2; k += 2 )
+                    {
+                        s0 += WT(a_data[k])*WT(b_data[k]);
+                        s1 += WT(a_data[k+1])*WT(b_data[k+1]);
+                    }
+                    s0 += s1;
+                }
                 for( ; k < n; k++ )
                     s0 += WT(a_data[k])*WT(b_data[k]);
 
-                d_data[j] = s0 + s1;
+                d_data[j] = s0;
             }
         }
     }
@@ -482,40 +995,55 @@ GEMMBlockMul( const T* a_data, size_t a_step,
                     a_buf[k] = a_data[a_step1*k];
                 a_data = a_buf;
             }
-
-            for( j = 0; j <= m - 4; j += 4 )
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F) && CV_GEMM_SIMD_ENABLED
+            if( sizeof(WT) == sizeof(double) )
             {
-                WT s0, s1, s2, s3;
-                const T* b = b_data + j;
-
-                if( do_acc )
-                {
-                    s0 = d_data[j]; s1 = d_data[j+1];
-                    s2 = d_data[j+2]; s3 = d_data[j+3];
-                }
+                if( sizeof(T) == sizeof(double) )
+                    simdBlockMul_kj(
+                        (const double*)a_data, (const double*)b_data, b_step,
+                        (double*)d_data, n, m, do_acc != 0);
                 else
-                    s0 = s1 = s2 = s3 = WT(0);
-
-                for( k = 0; k < n; k++, b += b_step )
+                    simdBlockMul_kj(
+                        (const float*)a_data, (const float*)b_data, b_step,
+                        (double*)d_data, n, m, do_acc != 0);
+            }
+            else
+#endif
+            {
+                for( j = 0; j <= m - 4; j += 4 )
                 {
-                    WT a(a_data[k]);
-                    s0 += a * WT(b[0]); s1 += a * WT(b[1]);
-                    s2 += a * WT(b[2]); s3 += a * WT(b[3]);
+                    WT s0, s1, s2, s3;
+                    const T* b = b_data + j;
+
+                    if( do_acc )
+                    {
+                        s0 = d_data[j]; s1 = d_data[j+1];
+                        s2 = d_data[j+2]; s3 = d_data[j+3];
+                    }
+                    else
+                        s0 = s1 = s2 = s3 = WT(0);
+
+                    for( k = 0; k < n; k++, b += b_step )
+                    {
+                        WT a(a_data[k]);
+                        s0 += a * WT(b[0]); s1 += a * WT(b[1]);
+                        s2 += a * WT(b[2]); s3 += a * WT(b[3]);
+                    }
+
+                    d_data[j] = s0; d_data[j+1] = s1;
+                    d_data[j+2] = s2; d_data[j+3] = s3;
                 }
 
-                d_data[j] = s0; d_data[j+1] = s1;
-                d_data[j+2] = s2; d_data[j+3] = s3;
-            }
+                for( ; j < m; j++ )
+                {
+                    const T* b = b_data + j;
+                    WT s0 = do_acc ? d_data[j] : WT(0);
 
-            for( ; j < m; j++ )
-            {
-                const T* b = b_data + j;
-                WT s0 = do_acc ? d_data[j] : WT(0);
+                    for( k = 0; k < n; k++, b += b_step )
+                        s0 += WT(a_data[k]) * WT(b[0]);
 
-                for( k = 0; k < n; k++, b += b_step )
-                    s0 += WT(a_data[k]) * WT(b[0]);
-
-                d_data[j] = s0;
+                    d_data[j] = s0;
+                }
             }
         }
     }
@@ -608,6 +1136,31 @@ typedef void (*GEMMStoreFunc)( const void* src1, size_t step1,
                    const void* src2, size_t step2, void* dst, size_t dststep,
                    Size dstsize, double alpha, double beta, int flags );
 
+template<typename T, typename WT, void (*fn)(const T*, size_t, const T*, size_t, const T*, size_t, T*, size_t, Size, Size, double, double, int)>
+static void gemmSingleMulWrap( const void* src1, size_t step1,
+                   const void* src2, size_t step2, const void* src3, size_t step3,
+                   void* dst, size_t dststep, Size srcsize, Size dstsize,
+                   double alpha, double beta, int flags )
+{
+    fn((const T*)src1, step1, (const T*)src2, step2, (const T*)src3, step3, (T*)dst, dststep, srcsize, dstsize, alpha, beta, flags);
+}
+
+template<typename T, typename WT, void (*fn)(const T*, size_t, const T*, size_t, WT*, size_t, Size, Size, int)>
+static void gemmBlockMulWrap( const void* src1, size_t step1,
+                   const void* src2, size_t step2, void* dst, size_t dststep,
+                   Size srcsize, Size dstsize, int flags )
+{
+    fn((const T*)src1, step1, (const T*)src2, step2, (WT*)dst, dststep, srcsize, dstsize, flags);
+}
+
+template<typename T, typename WT, void (*fn)(const T*, size_t, const WT*, size_t, T*, size_t, Size, double, double, int)>
+static void gemmStoreWrap( const void* src1, size_t step1,
+                   const void* src2, size_t step2, void* dst, size_t dststep,
+                   Size dstsize, double alpha, double beta, int flags )
+{
+    fn((const T*)src1, step1, (const WT*)src2, step2, (T*)dst, dststep, dstsize, alpha, beta, flags);
+}
+
 static void GEMMSingleMul_32f( const float* a_data, size_t a_step,
               const float* b_data, size_t b_step,
               const float* c_data, size_t c_step,
@@ -680,7 +1233,7 @@ static void GEMMBlockMul_32fc( const Complexf* a_data, size_t a_step,
                              Complexd* d_data, size_t d_step,
                              Size a_size, Size d_size, int flags )
 {
-    GEMMBlockMul(a_data, a_step, b_data, b_step, d_data, d_step, a_size, d_size, flags);
+    GEMMBlockMul<Complexf,Complexd>(a_data, a_step, b_data, b_step, d_data, d_step, a_size, d_size, flags);
 }
 
 
@@ -689,7 +1242,7 @@ static void GEMMBlockMul_64fc( const Complexd* a_data, size_t a_step,
                              Complexd* d_data, size_t d_step,
                              Size a_size, Size d_size, int flags )
 {
-    GEMMBlockMul(a_data, a_step, b_data, b_step, d_data, d_step, a_size, d_size, flags);
+    GEMMBlockMul<Complexd,Complexd>(a_data, a_step, b_data, b_step, d_data, d_step, a_size, d_size, flags);
 }
 
 
@@ -1032,28 +1585,28 @@ static void gemmImpl( Mat A, Mat B, double alpha,
 
     if( type == CV_32FC1 )
     {
-        singleMulFunc = (GEMMSingleMulFunc)GEMMSingleMul_32f;
-        blockMulFunc = (GEMMBlockMulFunc)GEMMBlockMul_32f;
-        storeFunc = (GEMMStoreFunc)GEMMStore_32f;
+        singleMulFunc = gemmSingleMulWrap<float, double, GEMMSingleMul_32f>;
+        blockMulFunc = gemmBlockMulWrap<float, double, GEMMBlockMul_32f>;
+        storeFunc = gemmStoreWrap<float, double, GEMMStore_32f>;
     }
     else if( type == CV_64FC1 )
     {
-        singleMulFunc = (GEMMSingleMulFunc)GEMMSingleMul_64f;
-        blockMulFunc = (GEMMBlockMulFunc)GEMMBlockMul_64f;
-        storeFunc = (GEMMStoreFunc)GEMMStore_64f;
+        singleMulFunc = gemmSingleMulWrap<double, double, GEMMSingleMul_64f>;
+        blockMulFunc = gemmBlockMulWrap<double, double, GEMMBlockMul_64f>;
+        storeFunc = gemmStoreWrap<double, double, GEMMStore_64f>;
     }
     else if( type == CV_32FC2 )
     {
-        singleMulFunc = (GEMMSingleMulFunc)GEMMSingleMul_32fc;
-        blockMulFunc = (GEMMBlockMulFunc)GEMMBlockMul_32fc;
-        storeFunc = (GEMMStoreFunc)GEMMStore_32fc;
+        singleMulFunc = gemmSingleMulWrap<Complexf, Complexd, GEMMSingleMul_32fc>;
+        blockMulFunc = gemmBlockMulWrap<Complexf, Complexd, GEMMBlockMul_32fc>;
+        storeFunc = gemmStoreWrap<Complexf, Complexd, GEMMStore_32fc>;
     }
     else
     {
         CV_Assert( type == CV_64FC2 );
-        singleMulFunc = (GEMMSingleMulFunc)GEMMSingleMul_64fc;
-        blockMulFunc = (GEMMBlockMulFunc)GEMMBlockMul_64fc;
-        storeFunc = (GEMMStoreFunc)GEMMStore_64fc;
+        singleMulFunc = gemmSingleMulWrap<Complexd, Complexd, GEMMSingleMul_64fc>;
+        blockMulFunc = gemmBlockMulWrap<Complexd, Complexd, GEMMBlockMul_64fc>;
+        storeFunc = gemmStoreWrap<Complexd, Complexd, GEMMStore_64fc>;
     }
 
     if( (d_size.width == 1 || len == 1) && !(flags & GEMM_2_T) && B.isContinuous() )
@@ -1681,24 +2234,232 @@ transform_32f( const float* src, float* dst, const float* m, int len, int scn, i
 static void
 transform_8s(const schar* src, schar* dst, const float* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    const int BITS = 10, SCALE = 1 << BITS;
+    const float MAX_M = (float)(1 << (15 - BITS));
+
+    if( scn == 3 && dcn == 3 &&
+        std::abs(m[0]) < MAX_M && std::abs(m[1]) < MAX_M && std::abs(m[ 2]) < MAX_M*256 && std::abs(m[ 3]) < MAX_M*256 &&
+        std::abs(m[4]) < MAX_M && std::abs(m[5]) < MAX_M && std::abs(m[ 6]) < MAX_M*256 && std::abs(m[ 7]) < MAX_M*256 &&
+        std::abs(m[8]) < MAX_M && std::abs(m[9]) < MAX_M && std::abs(m[10]) < MAX_M*256 && std::abs(m[11]) < MAX_M*256 )
+    {
+        const int nChannels = 3;
+
+        union {
+            short s[6];
+            int p[3];
+        } m16;
+        m16.s[0] = saturate_cast<short>(m[0] * SCALE); m16.s[1] = saturate_cast<short>(m[1] * SCALE);
+        m16.s[2] = saturate_cast<short>(m[4] * SCALE); m16.s[3] = saturate_cast<short>(m[5] * SCALE);
+        m16.s[4] = saturate_cast<short>(m[8] * SCALE); m16.s[5] = saturate_cast<short>(m[9] * SCALE);
+        int m32[] = {saturate_cast<int>(m[ 2] * SCALE), saturate_cast<int>(m[ 3] * SCALE),
+                     saturate_cast<int>(m[ 6] * SCALE), saturate_cast<int>(m[ 7] * SCALE),
+                     saturate_cast<int>(m[10] * SCALE), saturate_cast<int>(m[11] * SCALE)};
+        v_int16 m01 = v_reinterpret_as_s16(vx_setall_s32(m16.p[0]));
+        v_int32 m2 = vx_setall_s32(m32[0]);
+        v_int32 m3 = vx_setall_s32(m32[1]);
+        v_int16 m45 = v_reinterpret_as_s16(vx_setall_s32(m16.p[1]));
+        v_int32 m6 = vx_setall_s32(m32[2]);
+        v_int32 m7 = vx_setall_s32(m32[3]);
+        v_int16 m89 = v_reinterpret_as_s16(vx_setall_s32(m16.p[2]));
+        v_int32 m10 = vx_setall_s32(m32[4]);
+        v_int32 m11 = vx_setall_s32(m32[5]);
+        int x = 0;
+        for (; x <= (len - VTraits<v_int8>::vlanes()) * nChannels; x += VTraits<v_int8>::vlanes() * nChannels)
+        {
+            v_int8 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_int8 bgl, bgh;
+            v_zip(b, g, bgl, bgh);
+            v_int16 rl, rh;
+            v_expand(r, rl, rh);
+
+            v_int16 dbl, dbh, dgl, dgh, drl, drh;
+            v_int16 p0, p2;
+            v_int32 p1, p3;
+            v_expand(bgl, p0, p2);
+            v_expand(v_reinterpret_as_s16(rl), p1, p3);
+            dbl = v_rshr_pack<BITS>(v_add(v_add(v_dotprod(p0, m01), v_mul(p1, m2)), m3),
+                                    v_add(v_add(v_dotprod(p2, m01), v_mul(p3, m2)), m3));
+            dgl = v_rshr_pack<BITS>(v_add(v_add(v_dotprod(p0, m45), v_mul(p1, m6)), m7),
+                                    v_add(v_add(v_dotprod(p2, m45), v_mul(p3, m6)), m7));
+            drl = v_rshr_pack<BITS>(v_add(v_add(v_dotprod(p0, m89), v_mul(p1, m10)), m11),
+                                    v_add(v_add(v_dotprod(p2, m89), v_mul(p3, m10)), m11));
+            v_expand(bgh, p0, p2);
+            v_expand(v_reinterpret_as_s16(rh), p1, p3);
+            dbh = v_rshr_pack<BITS>(v_add(v_add(v_dotprod(p0, m01), v_mul(p1, m2)), m3),
+                                    v_add(v_add(v_dotprod(p2, m01), v_mul(p3, m2)), m3));
+            dgh = v_rshr_pack<BITS>(v_add(v_add(v_dotprod(p0, m45), v_mul(p1, m6)), m7),
+                                    v_add(v_add(v_dotprod(p2, m45), v_mul(p3, m6)), m7));
+            drh = v_rshr_pack<BITS>(v_add(v_add(v_dotprod(p0, m89), v_mul(p1, m10)), m11),
+                                    v_add(v_add(v_dotprod(p2, m89), v_mul(p3, m10)), m11));
+            v_store_interleave(dst + x, v_pack(dbl, dbh), v_pack(dgl, dgh), v_pack(drl, drh));
+        }
+        m32[1] = saturate_cast<int>((m[3] + 0.5f)*SCALE);
+        m32[3] = saturate_cast<int>((m[7] + 0.5f)*SCALE);
+        m32[5] = saturate_cast<int>((m[11] + 0.5f)*SCALE);
+        for( ; x < len * nChannels; x += nChannels )
+        {
+            int v0 = src[x], v1 = src[x+1], v2 = src[x+2];
+            schar t0 = saturate_cast<schar>((m16.s[0] * v0 + m16.s[1] * v1 + m32[0] * v2 + m32[1]) >> BITS);
+            schar t1 = saturate_cast<schar>((m16.s[2] * v0 + m16.s[3] * v1 + m32[2] * v2 + m32[3]) >> BITS);
+            schar t2 = saturate_cast<schar>((m16.s[4] * v0 + m16.s[5] * v1 + m32[4] * v2 + m32[5]) >> BITS);
+            dst[x] = t0; dst[x+1] = t1; dst[x+2] = t2;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     transform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 transform_16s(const short* src, short* dst, const float* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float32 m0  = vx_setall_f32(m[ 0]);
+        v_float32 m1  = vx_setall_f32(m[ 1]);
+        v_float32 m2  = vx_setall_f32(m[ 2]);
+        v_float32 m3  = vx_setall_f32(m[ 3]);
+        v_float32 m4  = vx_setall_f32(m[ 4]);
+        v_float32 m5  = vx_setall_f32(m[ 5]);
+        v_float32 m6  = vx_setall_f32(m[ 6]);
+        v_float32 m7  = vx_setall_f32(m[ 7]);
+        v_float32 m8  = vx_setall_f32(m[ 8]);
+        v_float32 m9  = vx_setall_f32(m[ 9]);
+        v_float32 m10 = vx_setall_f32(m[10]);
+        v_float32 m11 = vx_setall_f32(m[11]);
+        for (; x <= (len - VTraits<v_int16>::vlanes())*3; x +=  VTraits<v_int16>::vlanes()*3)
+        {
+            v_int16 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_int32 bl, bh, gl, gh, rl, rh;
+            v_expand(b, bl, bh);
+            v_expand(g, gl, gh);
+            v_expand(r, rl, rh);
+
+            v_int16 db, dg, dr;
+            db = v_pack(v_round(v_muladd(v_cvt_f32(bl), m0, v_muladd(v_cvt_f32(gl), m1, v_muladd(v_cvt_f32(rl),  m2,  m3)))),
+                        v_round(v_muladd(v_cvt_f32(bh), m0, v_muladd(v_cvt_f32(gh), m1, v_muladd(v_cvt_f32(rh),  m2,  m3)))));
+            dg = v_pack(v_round(v_muladd(v_cvt_f32(bl), m4, v_muladd(v_cvt_f32(gl), m5, v_muladd(v_cvt_f32(rl),  m6,  m7)))),
+                        v_round(v_muladd(v_cvt_f32(bh), m4, v_muladd(v_cvt_f32(gh), m5, v_muladd(v_cvt_f32(rh),  m6,  m7)))));
+            dr = v_pack(v_round(v_muladd(v_cvt_f32(bl), m8, v_muladd(v_cvt_f32(gl), m9, v_muladd(v_cvt_f32(rl), m10, m11)))),
+                        v_round(v_muladd(v_cvt_f32(bh), m8, v_muladd(v_cvt_f32(gh), m9, v_muladd(v_cvt_f32(rh), m10, m11)))));
+            v_store_interleave(dst + x, db, dg, dr);
+        }
+        for( ; x < len * 3; x += 3 )
+        {
+            float v0 = src[x], v1 = src[x + 1], v2 = src[x + 2];
+            short t0 = saturate_cast<short>(m[0] * v0 + m[1] * v1 + m[ 2] * v2 + m[ 3]);
+            short t1 = saturate_cast<short>(m[4] * v0 + m[5] * v1 + m[ 6] * v2 + m[ 7]);
+            short t2 = saturate_cast<short>(m[8] * v0 + m[9] * v1 + m[10] * v2 + m[11]);
+            dst[x] = t0; dst[x + 1] = t1; dst[x + 2] = t2;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     transform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 transform_32s(const int* src, int* dst, const double* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+    if( scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float64 m0  = vx_setall_f64(m[ 0]);
+        v_float64 m1  = vx_setall_f64(m[ 1]);
+        v_float64 m2  = vx_setall_f64(m[ 2]);
+        v_float64 m3  = vx_setall_f64(m[ 3]);
+        v_float64 m4  = vx_setall_f64(m[ 4]);
+        v_float64 m5  = vx_setall_f64(m[ 5]);
+        v_float64 m6  = vx_setall_f64(m[ 6]);
+        v_float64 m7  = vx_setall_f64(m[ 7]);
+        v_float64 m8  = vx_setall_f64(m[ 8]);
+        v_float64 m9  = vx_setall_f64(m[ 9]);
+        v_float64 m10 = vx_setall_f64(m[10]);
+        v_float64 m11 = vx_setall_f64(m[11]);
+        for (; x <= (len - VTraits<v_int32>::vlanes()) * 3; x += VTraits<v_int32>::vlanes() * 3) {
+            v_int32 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_float64 bh = v_cvt_f64_high(b), bl = v_cvt_f64(b);
+            v_float64 gh = v_cvt_f64_high(g), gl = v_cvt_f64(g);
+            v_float64 rh = v_cvt_f64_high(r), rl = v_cvt_f64(r);
+
+            v_int32 db, dg, dr;
+            db = v_round(v_fma(bl, m0, v_fma(gl, m1, v_fma(rl,  m2,  m3))),
+                         v_fma(bh, m0, v_fma(gh, m1, v_fma(rh,  m2,  m3))));
+            dg = v_round(v_fma(bl, m4, v_fma(gl, m5, v_fma(rl,  m6,  m7))),
+                         v_fma(bh, m4, v_fma(gh, m5, v_fma(rh,  m6,  m7))));
+            dr = v_round(v_fma(bl, m8, v_fma(gl, m9, v_fma(rl, m10, m11))),
+                         v_fma(bh, m8, v_fma(gh, m9, v_fma(rh, m10, m11))));
+
+            v_store_interleave(dst + x, db, dg, dr);
+        }
+        for (; x < len * 3; x += 3) {
+            double b = src[x], g = src[x + 1], r = src[x + 2];
+            int db = saturate_cast<int>(m[0] * b + m[1] * g + m[ 2] * r + m[ 3]);
+            int dg = saturate_cast<int>(m[4] * b + m[5] * g + m[ 6] * r + m[ 7]);
+            int dr = saturate_cast<int>(m[8] * b + m[9] * g + m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     transform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 transform_64f(const double* src, double* dst, const double* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+    if( scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float64 m0  = vx_setall_f64(m[ 0]);
+        v_float64 m1  = vx_setall_f64(m[ 1]);
+        v_float64 m2  = vx_setall_f64(m[ 2]);
+        v_float64 m3  = vx_setall_f64(m[ 3]);
+        v_float64 m4  = vx_setall_f64(m[ 4]);
+        v_float64 m5  = vx_setall_f64(m[ 5]);
+        v_float64 m6  = vx_setall_f64(m[ 6]);
+        v_float64 m7  = vx_setall_f64(m[ 7]);
+        v_float64 m8  = vx_setall_f64(m[ 8]);
+        v_float64 m9  = vx_setall_f64(m[ 9]);
+        v_float64 m10 = vx_setall_f64(m[10]);
+        v_float64 m11 = vx_setall_f64(m[11]);
+        for (; x <= (len - VTraits<v_float64>::vlanes()) * 3; x += VTraits<v_float64>::vlanes() * 3) {
+            v_float64 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+
+            v_float64 db, dg, dr;
+            db = v_fma(b, m0, v_fma(g, m1, v_fma(r,  m2,  m3)));
+            dg = v_fma(b, m4, v_fma(g, m5, v_fma(r,  m6,  m7)));
+            dr = v_fma(b, m8, v_fma(g, m9, v_fma(r, m10, m11)));
+
+            v_store_interleave(dst + x, db, dg, dr);
+        }
+        for (; x < len * 3; x += 3) {
+            double b = src[x], g = src[x + 1], r = src[x + 2];
+            double db = saturate_cast<double>(m[0] * b + m[1] * g + m[ 2] * r + m[ 3]);
+            double dg = saturate_cast<double>(m[4] * b + m[5] * g + m[ 6] * r + m[ 7]);
+            double dr = saturate_cast<double>(m[8] * b + m[9] * g + m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     transform_(src, dst, m, len, scn, dcn);
 }
 
@@ -1752,53 +2513,375 @@ diagtransform_( const T* src, T* dst, const WT* m, int len, int cn, int )
 static void
 diagtransform_8u(const uchar* src, uchar* dst, const float* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float32 m0  = vx_setall_f32(m[ 0]);
+        v_float32 m3  = vx_setall_f32(m[ 3]);
+        v_float32 m5  = vx_setall_f32(m[ 5]);
+        v_float32 m7  = vx_setall_f32(m[ 7]);
+        v_float32 m10 = vx_setall_f32(m[10]);
+        v_float32 m11 = vx_setall_f32(m[11]);
+        for (; x <= (len - VTraits<v_uint8>::vlanes()) * 3; x += VTraits<v_uint8>::vlanes() * 3) {
+            v_uint8 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_uint16 b_u16_l, g_u16_l, r_u16_l;
+            v_uint16 b_u16_h, g_u16_h, r_u16_h;
+            v_expand(b, b_u16_l, b_u16_h);
+            v_expand(g, g_u16_l, g_u16_h);
+            v_expand(r, r_u16_l, r_u16_h);
+
+            v_uint32 b_u32_l0, g_u32_l0, r_u32_l0;
+            v_uint32 b_u32_l1, g_u32_l1, r_u32_l1;
+            v_uint32 b_u32_h0, g_u32_h0, r_u32_h0;
+            v_uint32 b_u32_h1, g_u32_h1, r_u32_h1;
+            v_expand(b_u16_l, b_u32_l0, b_u32_l1);
+            v_expand(b_u16_h, b_u32_h0, b_u32_h1);
+            v_expand(g_u16_l, g_u32_l0, g_u32_l1);
+            v_expand(g_u16_h, g_u32_h0, g_u32_h1);
+            v_expand(r_u16_l, r_u32_l0, r_u32_l1);
+            v_expand(r_u16_h, r_u32_h0, r_u32_h1);
+
+            v_float32 db_f32_l0 = v_fma( m0, v_cvt_f32(v_reinterpret_as_s32(b_u32_l0)),  m3);
+            v_float32 db_f32_l1 = v_fma( m0, v_cvt_f32(v_reinterpret_as_s32(b_u32_l1)),  m3);
+            v_float32 db_f32_h0 = v_fma( m0, v_cvt_f32(v_reinterpret_as_s32(b_u32_h0)),  m3);
+            v_float32 db_f32_h1 = v_fma( m0, v_cvt_f32(v_reinterpret_as_s32(b_u32_h1)),  m3);
+
+            v_float32 dg_f32_l0 = v_fma( m5, v_cvt_f32(v_reinterpret_as_s32(g_u32_l0)),  m7);
+            v_float32 dg_f32_l1 = v_fma( m5, v_cvt_f32(v_reinterpret_as_s32(g_u32_l1)),  m7);
+            v_float32 dg_f32_h0 = v_fma( m5, v_cvt_f32(v_reinterpret_as_s32(g_u32_h0)),  m7);
+            v_float32 dg_f32_h1 = v_fma( m5, v_cvt_f32(v_reinterpret_as_s32(g_u32_h1)),  m7);
+
+            v_float32 dr_f32_l0 = v_fma(m10, v_cvt_f32(v_reinterpret_as_s32(r_u32_l0)), m11);
+            v_float32 dr_f32_l1 = v_fma(m10, v_cvt_f32(v_reinterpret_as_s32(r_u32_l1)), m11);
+            v_float32 dr_f32_h0 = v_fma(m10, v_cvt_f32(v_reinterpret_as_s32(r_u32_h0)), m11);
+            v_float32 dr_f32_h1 = v_fma(m10, v_cvt_f32(v_reinterpret_as_s32(r_u32_h1)), m11);
+
+            v_store_interleave(dst + x,
+                               v_pack(v_pack_u(v_round(db_f32_l0), v_round(db_f32_l1)), v_pack_u(v_round(db_f32_h0), v_round(db_f32_h1))),
+                               v_pack(v_pack_u(v_round(dg_f32_l0), v_round(dg_f32_l1)), v_pack_u(v_round(dg_f32_h0), v_round(dg_f32_h1))),
+                               v_pack(v_pack_u(v_round(dr_f32_l0), v_round(dr_f32_l1)), v_pack_u(v_round(dr_f32_h0), v_round(dr_f32_h1))));
+        }
+        for (; x < len * 3; x += 3) {
+            int b = src[x], g = src[x + 1], r = src[x + 2];
+            uchar db = saturate_cast<uchar>(m[ 0] * b + m[ 3]);
+            uchar dg = saturate_cast<uchar>(m[ 5] * g + m[ 7]);
+            uchar dr = saturate_cast<uchar>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 diagtransform_8s(const schar* src, schar* dst, const float* m, int len, int scn, int dcn)
 {
+    #if (CV_SIMD || CV_SIMD_SCALABLE)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float32 m0  = vx_setall_f32(m[ 0]);
+        v_float32 m3  = vx_setall_f32(m[ 3]);
+        v_float32 m5  = vx_setall_f32(m[ 5]);
+        v_float32 m7  = vx_setall_f32(m[ 7]);
+        v_float32 m10 = vx_setall_f32(m[10]);
+        v_float32 m11 = vx_setall_f32(m[11]);
+        for (; x <= (len - VTraits<v_int8>::vlanes()) * 3; x += VTraits<v_int8>::vlanes() * 3) {
+            v_int8 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_int16 b_u16_l, g_u16_l, r_u16_l;
+            v_int16 b_u16_h, g_u16_h, r_u16_h;
+            v_expand(b, b_u16_l, b_u16_h);
+            v_expand(g, g_u16_l, g_u16_h);
+            v_expand(r, r_u16_l, r_u16_h);
+
+            v_int32 b_u32_l0, g_u32_l0, r_u32_l0;
+            v_int32 b_u32_l1, g_u32_l1, r_u32_l1;
+            v_int32 b_u32_h0, g_u32_h0, r_u32_h0;
+            v_int32 b_u32_h1, g_u32_h1, r_u32_h1;
+            v_expand(b_u16_l, b_u32_l0, b_u32_l1);
+            v_expand(b_u16_h, b_u32_h0, b_u32_h1);
+            v_expand(g_u16_l, g_u32_l0, g_u32_l1);
+            v_expand(g_u16_h, g_u32_h0, g_u32_h1);
+            v_expand(r_u16_l, r_u32_l0, r_u32_l1);
+            v_expand(r_u16_h, r_u32_h0, r_u32_h1);
+
+            v_float32 db_f32_l0 = v_fma( m0, v_cvt_f32(b_u32_l0),  m3);
+            v_float32 db_f32_l1 = v_fma( m0, v_cvt_f32(b_u32_l1),  m3);
+            v_float32 db_f32_h0 = v_fma( m0, v_cvt_f32(b_u32_h0),  m3);
+            v_float32 db_f32_h1 = v_fma( m0, v_cvt_f32(b_u32_h1),  m3);
+
+            v_float32 dg_f32_l0 = v_fma( m5, v_cvt_f32(g_u32_l0),  m7);
+            v_float32 dg_f32_l1 = v_fma( m5, v_cvt_f32(g_u32_l1),  m7);
+            v_float32 dg_f32_h0 = v_fma( m5, v_cvt_f32(g_u32_h0),  m7);
+            v_float32 dg_f32_h1 = v_fma( m5, v_cvt_f32(g_u32_h1),  m7);
+
+            v_float32 dr_f32_l0 = v_fma(m10, v_cvt_f32(r_u32_l0), m11);
+            v_float32 dr_f32_l1 = v_fma(m10, v_cvt_f32(r_u32_l1), m11);
+            v_float32 dr_f32_h0 = v_fma(m10, v_cvt_f32(r_u32_h0), m11);
+            v_float32 dr_f32_h1 = v_fma(m10, v_cvt_f32(r_u32_h1), m11);
+
+            v_store_interleave(dst + x,
+                               v_pack(v_pack(v_round(db_f32_l0), v_round(db_f32_l1)), v_pack(v_round(db_f32_h0), v_round(db_f32_h1))),
+                               v_pack(v_pack(v_round(dg_f32_l0), v_round(dg_f32_l1)), v_pack(v_round(dg_f32_h0), v_round(dg_f32_h1))),
+                               v_pack(v_pack(v_round(dr_f32_l0), v_round(dr_f32_l1)), v_pack(v_round(dr_f32_h0), v_round(dr_f32_h1))));
+        }
+        for (; x < len * 3; x += 3) {
+            int b = src[x], g = src[x + 1], r = src[x + 2];
+            schar db = saturate_cast<schar>(m[ 0] * b + m[ 3]);
+            schar dg = saturate_cast<schar>(m[ 5] * g + m[ 7]);
+            schar dr = saturate_cast<schar>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 diagtransform_16u(const ushort* src, ushort* dst, const float* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float32 m0  = vx_setall_f32(m[ 0]);
+        v_float32 m3  = vx_setall_f32(m[ 3]);
+        v_float32 m5  = vx_setall_f32(m[ 5]);
+        v_float32 m7  = vx_setall_f32(m[ 7]);
+        v_float32 m10 = vx_setall_f32(m[10]);
+        v_float32 m11 = vx_setall_f32(m[11]);
+        for (; x <= (len - VTraits<v_uint16>::vlanes()) * 3; x += VTraits<v_uint16>::vlanes() * 3) {
+            v_uint16 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_uint32 b_u32_l, g_u32_l, r_u32_l;
+            v_uint32 b_u32_h, g_u32_h, r_u32_h;
+            v_expand(b, b_u32_l, b_u32_h);
+            v_expand(g, g_u32_l, g_u32_h);
+            v_expand(r, r_u32_l, r_u32_h);
+
+            v_float32 db_f32_l = v_fma( m0, v_cvt_f32(v_reinterpret_as_s32(b_u32_l)),  m3);
+            v_float32 db_f32_h = v_fma( m0, v_cvt_f32(v_reinterpret_as_s32(b_u32_h)),  m3);
+
+            v_float32 dg_f32_l = v_fma( m5, v_cvt_f32(v_reinterpret_as_s32(g_u32_l)),  m7);
+            v_float32 dg_f32_h = v_fma( m5, v_cvt_f32(v_reinterpret_as_s32(g_u32_h)),  m7);
+
+            v_float32 dr_f32_l = v_fma(m10, v_cvt_f32(v_reinterpret_as_s32(r_u32_l)), m11);
+            v_float32 dr_f32_h = v_fma(m10, v_cvt_f32(v_reinterpret_as_s32(r_u32_h)), m11);
+
+            v_store_interleave(dst + x,
+                               v_pack_u(v_round(db_f32_l), v_round(db_f32_h)),
+                               v_pack_u(v_round(dg_f32_l), v_round(dg_f32_h)),
+                               v_pack_u(v_round(dr_f32_l), v_round(dr_f32_h)));
+        }
+        for (; x < len * 3; x += 3) {
+            int b = src[x], g = src[x + 1], r = src[x + 2];
+            ushort db = saturate_cast<ushort>(m[ 0] * b + m[ 3]);
+            ushort dg = saturate_cast<ushort>(m[ 5] * g + m[ 7]);
+            ushort dr = saturate_cast<ushort>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 diagtransform_16s(const short* src, short* dst, const float* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float32 m0  = vx_setall_f32(m[ 0]);
+        v_float32 m3  = vx_setall_f32(m[ 3]);
+        v_float32 m5  = vx_setall_f32(m[ 5]);
+        v_float32 m7  = vx_setall_f32(m[ 7]);
+        v_float32 m10 = vx_setall_f32(m[10]);
+        v_float32 m11 = vx_setall_f32(m[11]);
+        for (; x <= (len - VTraits<v_int16>::vlanes()) * 3; x += VTraits<v_int16>::vlanes() * 3) {
+            v_int16 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_int32 b_u32_l, g_u32_l, r_u32_l;
+            v_int32 b_u32_h, g_u32_h, r_u32_h;
+            v_expand(b, b_u32_l, b_u32_h);
+            v_expand(g, g_u32_l, g_u32_h);
+            v_expand(r, r_u32_l, r_u32_h);
+
+            v_float32 db_f32_l = v_fma( m0, v_cvt_f32(b_u32_l),  m3);
+            v_float32 db_f32_h = v_fma( m0, v_cvt_f32(b_u32_h),  m3);
+
+            v_float32 dg_f32_l = v_fma( m5, v_cvt_f32(g_u32_l),  m7);
+            v_float32 dg_f32_h = v_fma( m5, v_cvt_f32(g_u32_h),  m7);
+
+            v_float32 dr_f32_l = v_fma(m10, v_cvt_f32(r_u32_l), m11);
+            v_float32 dr_f32_h = v_fma(m10, v_cvt_f32(r_u32_h), m11);
+
+            v_store_interleave(dst + x,
+                               v_pack(v_round(db_f32_l), v_round(db_f32_h)),
+                               v_pack(v_round(dg_f32_l), v_round(dg_f32_h)),
+                               v_pack(v_round(dr_f32_l), v_round(dr_f32_h)));
+        }
+        for (; x < len * 3; x += 3) {
+            int b = src[x], g = src[x + 1], r = src[x + 2];
+            short db = saturate_cast<short>(m[ 0] * b + m[ 3]);
+            short dg = saturate_cast<short>(m[ 5] * g + m[ 7]);
+            short dr = saturate_cast<short>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 diagtransform_32s(const int* src, int* dst, const double* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float64 m0  = vx_setall_f64(m[ 0]);
+        v_float64 m3  = vx_setall_f64(m[ 3]);
+        v_float64 m5  = vx_setall_f64(m[ 5]);
+        v_float64 m7  = vx_setall_f64(m[ 7]);
+        v_float64 m10 = vx_setall_f64(m[10]);
+        v_float64 m11 = vx_setall_f64(m[11]);
+        for (; x <= (len - VTraits<v_float32>::vlanes()) * 3; x += VTraits<v_float32>::vlanes() * 3) {
+            v_int32 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+            v_float64 bh = v_cvt_f64_high(b), bl = v_cvt_f64(b);
+            v_float64 gh = v_cvt_f64_high(g), gl = v_cvt_f64(g);
+            v_float64 rh = v_cvt_f64_high(r), rl = v_cvt_f64(r);
+
+            v_int32 db = v_round(v_fma( m0, bl,  m3),
+                                 v_fma( m0, bh,  m3));
+            v_int32 dg = v_round(v_fma( m5, gl,  m7),
+                                 v_fma( m5, gh,  m7));
+            v_int32 dr = v_round(v_fma(m10, rl, m11),
+                                 v_fma(m10, rh, m11));
+
+            v_store_interleave(dst + x, db, dg, dr);
+        }
+        for (; x < len * 3; x += 3) {
+            int b = src[x], g = src[x + 1], r = src[x + 2];
+            int db = saturate_cast<int>(m[ 0] * b + m[ 3]);
+            int dg = saturate_cast<int>(m[ 5] * g + m[ 7]);
+            int dr = saturate_cast<int>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 diagtransform_32f(const float* src, float* dst, const float* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD || CV_SIMD_SCALABLE)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float32 m0  = vx_setall_f32(m[ 0]);
+        v_float32 m3  = vx_setall_f32(m[ 3]);
+        v_float32 m5  = vx_setall_f32(m[ 5]);
+        v_float32 m7  = vx_setall_f32(m[ 7]);
+        v_float32 m10 = vx_setall_f32(m[10]);
+        v_float32 m11 = vx_setall_f32(m[11]);
+        for (; x <= (len - VTraits<v_float32>::vlanes()) * 3; x += VTraits<v_float32>::vlanes() * 3) {
+            v_float32 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+
+            v_float32 db = v_fma( m0, b,  m3);
+            v_float32 dg = v_fma( m5, g,  m7);
+            v_float32 dr = v_fma(m10, r, m11);
+
+            v_store_interleave(dst + x, db, dg, dr);
+        }
+        for (; x < len * 3; x += 3) {
+            float b = src[x], g = src[x + 1], r = src[x + 2];
+            float db = saturate_cast<float>(m[ 0] * b + m[ 3]);
+            float dg = saturate_cast<float>(m[ 5] * g + m[ 7]);
+            float dr = saturate_cast<float>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
 static void
 diagtransform_64f(const double* src, double* dst, const double* m, int len, int scn, int dcn)
 {
+#if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
+    if (scn == 3 && dcn == 3) {
+        int x = 0;
+
+        v_float64 m0  = vx_setall_f64(m[ 0]);
+        v_float64 m3  = vx_setall_f64(m[ 3]);
+        v_float64 m5  = vx_setall_f64(m[ 5]);
+        v_float64 m7  = vx_setall_f64(m[ 7]);
+        v_float64 m10 = vx_setall_f64(m[10]);
+        v_float64 m11 = vx_setall_f64(m[11]);
+        for (; x <= (len - VTraits<v_float64>::vlanes()) * 3; x += VTraits<v_float64>::vlanes() * 3) {
+            v_float64 b, g, r;
+            v_load_deinterleave(src + x, b, g, r);
+
+            v_float64 db = v_fma( m0, b,  m3);
+            v_float64 dg = v_fma( m5, g,  m7);
+            v_float64 dr = v_fma(m10, r, m11);
+
+            v_store_interleave(dst + x, db, dg, dr);
+        }
+        for (; x < len * 3; x += 3) {
+            double b = src[x], g = src[x + 1], r = src[x + 2];
+            double db = saturate_cast<double>(m[ 0] * b + m[ 3]);
+            double dg = saturate_cast<double>(m[ 5] * g + m[ 7]);
+            double dr = saturate_cast<double>(m[10] * r + m[11]);
+            dst[x] = db; dst[x + 1] = dg; dst[x + 2] = dr;
+        }
+        vx_cleanup();
+        return;
+    }
+#endif
+
     diagtransform_(src, dst, m, len, scn, dcn);
 }
 
+
+template<typename T, typename WT, void (*fn)(const T*, T*, const WT*, int, int, int)>
+static void transformWrap(const void* src, void* dst, const void* m, int len, int scn, int dcn)
+{
+    fn((const T*)src, (T*)dst, (const WT*)m, len, scn, dcn);
+}
 
 TransformFunc getTransformFunc(int depth)
 {
     static TransformFunc transformTab[CV_DEPTH_MAX] =
     {
-        (TransformFunc)transform_8u, (TransformFunc)transform_8s, (TransformFunc)transform_16u,
-        (TransformFunc)transform_16s, (TransformFunc)transform_32s, (TransformFunc)transform_32f,
-        (TransformFunc)transform_64f, 0
+        transformWrap<uchar, float, transform_8u>, transformWrap<schar, float, transform_8s>, transformWrap<ushort, float, transform_16u>,
+        transformWrap<short, float, transform_16s>, transformWrap<int, double, transform_32s>, transformWrap<float, float, transform_32f>,
+        transformWrap<double, double, transform_64f>, 0
     };
 
     return transformTab[depth];
@@ -1808,9 +2891,9 @@ TransformFunc getDiagTransformFunc(int depth)
 {
     static TransformFunc diagTransformTab[CV_DEPTH_MAX] =
     {
-        (TransformFunc)diagtransform_8u, (TransformFunc)diagtransform_8s, (TransformFunc)diagtransform_16u,
-        (TransformFunc)diagtransform_16s, (TransformFunc)diagtransform_32s, (TransformFunc)diagtransform_32f,
-        (TransformFunc)diagtransform_64f, 0
+        transformWrap<uchar, float, diagtransform_8u>, transformWrap<schar, float, diagtransform_8s>, transformWrap<ushort, float, diagtransform_16u>,
+        transformWrap<short, float, diagtransform_16s>, transformWrap<int, double, diagtransform_32s>, transformWrap<float, float, diagtransform_32f>,
+        transformWrap<double, double, diagtransform_64f>, 0
     };
 
     return diagTransformTab[depth];
@@ -1823,8 +2906,11 @@ TransformFunc getDiagTransformFunc(int depth)
 \****************************************************************************************/
 
 template<typename T> static void
-perspectiveTransform_( const T* src, T* dst, const double* m, int len, int scn, int dcn )
+perspectiveTransform_( const void* _src, void* _dst, const void* _m_ptr, int len, int scn, int dcn )
 {
+    const T* src = (const T*)_src;
+    T* dst = (T*)_dst;
+    const double* m = (const double*)_m_ptr;
     const double eps = FLT_EPSILON;
     int i;
 
@@ -1907,24 +2993,12 @@ perspectiveTransform_( const T* src, T* dst, const double* m, int len, int scn, 
     }
 }
 
-static void
-perspectiveTransform_32f(const float* src, float* dst, const double* m, int len, int scn, int dcn)
-{
-    perspectiveTransform_(src, dst, m, len, scn, dcn);
-}
-
-static void
-perspectiveTransform_64f(const double* src, double* dst, const double* m, int len, int scn, int dcn)
-{
-    perspectiveTransform_(src, dst, m, len, scn, dcn);
-}
-
 TransformFunc getPerspectiveTransform(int depth)
 {
     if (depth == CV_32F)
-        return (TransformFunc)perspectiveTransform_32f;
+        return perspectiveTransform_<float>;
     if (depth == CV_64F)
-        return (TransformFunc)perspectiveTransform_64f;
+        return perspectiveTransform_<double>;
     CV_Assert(0 && "Not supported");
 }
 
@@ -1934,10 +3008,13 @@ TransformFunc getPerspectiveTransform(int depth)
 *                                       ScaleAdd                                         *
 \****************************************************************************************/
 
-static void scaleAdd_32f(const float* src1, const float* src2, float* dst,
-                         int len, float* _alpha)
+static void scaleAdd_32f(const void* _src1, const void* _src2, void* _dst,
+                         int len, const void* _alpha)
 {
-    float alpha = *_alpha;
+    const float* src1 = (const float*)_src1;
+    const float* src2 = (const float*)_src2;
+    float* dst = (float*)_dst;
+    float alpha = *(const float*)_alpha;
     int i = 0;
 #if (CV_SIMD || CV_SIMD_SCALABLE)
     v_float32 v_alpha = vx_setall_f32(alpha);
@@ -1951,10 +3028,13 @@ static void scaleAdd_32f(const float* src1, const float* src2, float* dst,
 }
 
 
-static void scaleAdd_64f(const double* src1, const double* src2, double* dst,
-                         int len, double* _alpha)
+static void scaleAdd_64f(const void* _src1, const void* _src2, void* _dst,
+                         int len, const void* _alpha)
 {
-    double alpha = *_alpha;
+    const double* src1 = (const double*)_src1;
+    const double* src2 = (const double*)_src2;
+    double* dst = (double*)_dst;
+    double alpha = *(const double*)_alpha;
     int i = 0;
 #if (CV_SIMD_64F || CV_SIMD_SCALABLE_64F)
     v_float64 a2 = vx_setall_f64(alpha);
@@ -1970,9 +3050,9 @@ static void scaleAdd_64f(const double* src1, const double* src2, double* dst,
 ScaleAddFunc getScaleAddFunc(int depth)
 {
     if (depth == CV_32F)
-        return (ScaleAddFunc)scaleAdd_32f;
+        return scaleAdd_32f;
     if (depth == CV_64F)
-        return (ScaleAddFunc)scaleAdd_64f;
+        return scaleAdd_64f;
     CV_Assert(0 && "Not supported");
 }
 

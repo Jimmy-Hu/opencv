@@ -11,9 +11,9 @@ or multiple test results can be used for input.
 
 ### Example
 
-./report.py  -c min,mean,median -f '(LUT|Match).*640' opencv_perf_core.xml  opencv_perf_features2d.xml
+./report.py  -c min,mean,median -f '(LUT|Match).*640' opencv_perf_core.xml  opencv_perf_features.xml
 
-opencv_perf_features2d.xml, opencv_perf_core.xml
+opencv_perf_features.xml, opencv_perf_core.xml
 
                        Name of Test                            Min        Mean      Median
 KnnMatch::OCL_BruteForceMatcherFixture::(640x480, 32FC1)    1365.04 ms 1368.18 ms 1368.52 ms
@@ -34,7 +34,6 @@ RadiusMatch::OCL_BruteForceMatcherFixture::(640x480, 32FC1) 1372.68 ms 1375.52 m
 --show-all                  - also include empty and "notrun" lines
 """
 
-from __future__ import print_function
 import testlog_parser, sys, os, xml, re, glob
 from table_formatter import *
 from optparse import OptionParser

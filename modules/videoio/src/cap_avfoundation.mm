@@ -37,8 +37,13 @@
 #include "cap_interface.hpp"
 #include <iostream>
 #include <Availability.h>
+#include <TargetConditionals.h>
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/NSException.h>
+
+#ifndef TARGET_OS_VISION
+#define TARGET_OS_VISION 0
+#endif
 
 #define CV_CAP_MODE_BGR CV_FOURCC_MACRO('B','G','R','3')
 #define CV_CAP_MODE_RGB CV_FOURCC_MACRO('R','G','B','3')
@@ -185,7 +190,7 @@ class CvVideoWriter_AVFoundation : public cv::IVideoWriter{
                 int is_color=1);
         ~CvVideoWriter_AVFoundation();
         bool isOpened() const CV_OVERRIDE { return mMovieWriter != NULL && mMovieWriter.status != AVAssetWriterStatusFailed; }
-        void write(cv::InputArray image) CV_OVERRIDE;
+        bool write(cv::InputArray image) CV_OVERRIDE;
         int getCaptureDomain() const CV_OVERRIDE { return cv::CAP_AVFOUNDATION; }
     private:
         cv::Mat argbimage;
@@ -236,6 +241,28 @@ cv::Ptr<cv::IVideoWriter> cv::create_AVFoundation_writer(const std::string& file
     if (wrt->isOpened())
         return wrt;
     return NULL;
+}
+
+
+std::vector<cv::VideoDeviceInfo> cv::enumerate_AVFoundation_devices()
+{
+    std::vector<cv::VideoDeviceInfo> result;
+#if !TARGET_OS_VISION
+    NSAutoreleasePool* localpool = [[NSAutoreleasePool alloc] init];
+
+    NSArray* devices = [[AVCaptureDevice devicesWithMediaType:AVMediaTypeVideo]
+            arrayByAddingObjectsFromArray:[AVCaptureDevice devicesWithMediaType:AVMediaTypeMuxed]];
+
+    for (NSUInteger i = 0; i < devices.count; i++)
+    {
+        AVCaptureDevice* device = [devices objectAtIndex:i];
+        const char* name = [[device localizedName] UTF8String];
+        result.push_back(cv::makeVideoDeviceInfo((int)i, cv::CAP_AVFOUNDATION, name ? name : ""));
+    }
+
+    [localpool drain];
+#endif
+    return result;
 }
 
 /********************** Implementation of Classes ****************************/
@@ -521,7 +548,7 @@ double CvCaptureCAM::getProperty(int property_id) const{
             return mCaptureDevice.torchMode;
 
         default:
-            return 0;
+            return cv::CAP_PROP_UNKNOWN;
     }
 
 
@@ -1056,7 +1083,7 @@ bool CvCaptureFile::retrieveFrame(int, cv::OutputArray arr) {
 }
 
 double CvCaptureFile::getProperty(int property_id) const{
-    if (mAsset == nil) return 0;
+    if (mAsset == nil) return cv::CAP_PROP_UNKNOWN;
 
     CMTime t;
 
@@ -1064,7 +1091,7 @@ double CvCaptureFile::getProperty(int property_id) const{
         case cv::CAP_PROP_POS_MSEC:
             return mFrameTimestamp.value * 1000.0 / mFrameTimestamp.timescale;
         case cv::CAP_PROP_POS_FRAMES:
-            return mAssetTrack.nominalFrameRate > 0 ? mFrameNum : 0;
+            return mAssetTrack.nominalFrameRate > 0 ? mFrameNum : cv::CAP_PROP_UNKNOWN;
         case cv::CAP_PROP_POS_AVI_RATIO:
             t = [mAsset duration];
             return (mFrameTimestamp.value * t.timescale) / double(mFrameTimestamp.timescale * t.value);
@@ -1087,7 +1114,7 @@ double CvCaptureFile::getProperty(int property_id) const{
             break;
     }
 
-    return 0;
+    return cv::CAP_PROP_UNKNOWN;
 }
 
 bool CvCaptureFile::setProperty(int property_id, double value) {
@@ -1293,20 +1320,20 @@ CvVideoWriter_AVFoundation::~CvVideoWriter_AVFoundation() {
     }
 }
 
-void CvVideoWriter_AVFoundation::write(cv::InputArray image) {
+bool CvVideoWriter_AVFoundation::write(cv::InputArray image) {
     @autoreleasepool {
         // writer status check
         if (![mMovieWriterInput isReadyForMoreMediaData] || mMovieWriter.status != AVAssetWriterStatusWriting) {
             NSLog(@"[mMovieWriterInput isReadyForMoreMediaData] Not ready for media data or ...");
             NSLog(@"mMovieWriter.status: %d. Error: %@", (int)mMovieWriter.status, [mMovieWriter.error localizedDescription]);
-            return;
+            return false;
         }
 
         BOOL success = FALSE;
 
         if (image.size().height != movieSize.height || image.size().width != movieSize.width) {
             std::cout << "Frame size does not match video size." << std::endl;
-            return;
+            return false;
         }
 
         if (movieColor) {
@@ -1351,10 +1378,10 @@ void CvVideoWriter_AVFoundation::write(cv::InputArray image) {
 
         if (success) {
             frameCount++;
-            return;
+            return true;
         } else {
             NSLog(@"Frame appendPixelBuffer failed.");
-            return;
+            return false;
         }
     }
 }

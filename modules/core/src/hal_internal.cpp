@@ -47,7 +47,6 @@
 
 #ifdef HAVE_LAPACK
 
-#include <complex.h>
 #include "opencv_lapack.h"
 
 #include <cmath>
@@ -57,8 +56,6 @@
 #include <complex>
 #include <vector>
 
-#define HAL_GEMM_SMALL_COMPLEX_MATRIX_THRESH 100
-#define HAL_GEMM_SMALL_MATRIX_THRESH 100
 #define HAL_SVD_SMALL_MATRIX_THRESH 25
 #define HAL_QR_SMALL_MATRIX_THRESH 30
 #define HAL_LU_SMALL_MATRIX_THRESH 100
@@ -146,17 +143,16 @@ CV_ANNOTATE_NO_SANITIZE_MEMORY lapack_LU(fptype* a, size_t a_step, int m, fptype
         else
         {
             int ldb = (int)(b_step / sizeof(fptype));
-            fptype* tmpB = new fptype[m*n];
+            std::vector<fptype> tmpB(m*n+1);
 
-            transpose(b, ldb, tmpB, m, m, n);
+            transpose(b, ldb, &tmpB[0], m, m, n);
 
             if(typeid(fptype) == typeid(float))
-                sgesv_(&_m, &_n, (float*)a, &lda, piv, (float*)tmpB, &_m, _info);
+                sgesv_(&_m, &_n, (float*)a, &lda, piv, (float*)&tmpB[0], &_m, _info);
             else if(typeid(fptype) == typeid(double))
-                dgesv_(&_m, &_n, (double*)a, &lda, piv, (double*)tmpB, &_m, _info);
+                dgesv_(&_m, &_n, (double*)a, &lda, piv, (double*)&tmpB[0], &_m, _info);
 
-            transpose(tmpB, m, b, ldb, n, m);
-            delete[] tmpB;
+            transpose(&tmpB[0], m, b, ldb, n, m);
         }
     }
     else
@@ -170,6 +166,7 @@ CV_ANNOTATE_NO_SANITIZE_MEMORY lapack_LU(fptype* a, size_t a_step, int m, fptype
 #if defined (ACCELERATE_NEW_LAPACK) && defined (ACCELERATE_LAPACK_ILP64)
     *info = static_cast<int>(_info[0]);
 #endif
+    int retcode = *info >= 0 ? CV_HAL_ERROR_OK : CV_HAL_ERROR_NOT_IMPLEMENTED;
 
     int sign = 0;
     if(*info == 0)
@@ -181,7 +178,7 @@ CV_ANNOTATE_NO_SANITIZE_MEMORY lapack_LU(fptype* a, size_t a_step, int m, fptype
     else
         *info = 0; //in opencv LU function zero means error
 
-    return CV_HAL_ERROR_OK;
+    return retcode;
 }
 
 template <typename fptype> static inline int
@@ -233,7 +230,7 @@ lapack_Cholesky(fptype* a, size_t a_step, int m, fptype* b, size_t b_step, int n
     if(lapackStatus == 0) *info = true;
     else *info = false; //in opencv Cholesky function false means error
 
-    return CV_HAL_ERROR_OK;
+    return lapackStatus >= 0 ? CV_HAL_ERROR_OK : CV_HAL_ERROR_NOT_IMPLEMENTED;
 }
 
 template <typename fptype> static inline int
@@ -257,6 +254,7 @@ lapack_SVD(fptype* a, size_t a_step, fptype *w, fptype* u, size_t u_step, fptype
     cv::AutoBuffer<int> iworkBuf_(8 * std::min(m, n));
 #endif
     auto iworkBuf = iworkBuf_.data();
+    std::vector<fptype> ubuf;
     fptype work1 = 0;
 
     //A already transposed and m>=n
@@ -275,7 +273,8 @@ lapack_SVD(fptype* a, size_t a_step, fptype *w, fptype* u, size_t u_step, fptype
 
     if((flags & CV_HAL_SVD_MODIFY_A) && (flags & CV_HAL_SVD_FULL_UV)) //U stored in a
     {
-        u = new fptype[m*m];
+        ubuf.resize(m*m);
+        u = &ubuf[0];
         ldu = m;
     }
 
@@ -284,18 +283,21 @@ lapack_SVD(fptype* a, size_t a_step, fptype *w, fptype* u, size_t u_step, fptype
     else if(typeid(fptype) == typeid(double))
         OCV_LAPACK_FUNC(dgesdd)(mode, &_m, &_n, (double*)a, &lda, (double*)w, (double*)u, &ldu, (double*)vt, &ldv, (double*)&work1, &lwork, iworkBuf, _info);
 
+    if(*info < 0)
+        return CV_HAL_ERROR_NOT_IMPLEMENTED;
+
     lwork = (int)round(work1); //optimal buffer size
-    fptype* buffer = new fptype[lwork + 1];
+    std::vector<fptype> buffer(lwork + 1);
 
     // Make sure MSAN sees the memory as having been written.
     // MSAN does not think it has been written because a different language is called.
     // Note: we do this here because if dgesdd is C++, MSAN errors can be reported within it.
-    CV_ANNOTATE_MEMORY_IS_INITIALIZED(buffer, sizeof(fptype) * (lwork + 1));
+    CV_ANNOTATE_MEMORY_IS_INITIALIZED(buffer.data(), sizeof(fptype) * (lwork + 1));
 
     if(typeid(fptype) == typeid(float))
-        OCV_LAPACK_FUNC(sgesdd)(mode, &_m, &_n, (float*)a, &lda, (float*)w, (float*)u, &ldu, (float*)vt, &ldv, (float*)buffer, &lwork, iworkBuf, _info);
+        OCV_LAPACK_FUNC(sgesdd)(mode, &_m, &_n, (float*)a, &lda, (float*)w, (float*)u, &ldu, (float*)vt, &ldv, (float*)&buffer[0], &lwork, iworkBuf, _info);
     else if(typeid(fptype) == typeid(double))
-        OCV_LAPACK_FUNC(dgesdd)(mode, &_m, &_n, (double*)a, &lda, (double*)w, (double*)u, &ldu, (double*)vt, &ldv, (double*)buffer, &lwork, iworkBuf, _info);
+        OCV_LAPACK_FUNC(dgesdd)(mode, &_m, &_n, (double*)a, &lda, (double*)w, (double*)u, &ldu, (double*)vt, &ldv, (double*)&buffer[0], &lwork, iworkBuf, _info);
 
 #if defined (ACCELERATE_NEW_LAPACK) && defined (ACCELERATE_LAPACK_ILP64)
     *info = static_cast<int>(_info[0]);
@@ -319,10 +321,10 @@ lapack_SVD(fptype* a, size_t a_step, fptype *w, fptype* u, size_t u_step, fptype
         for(int i = 0; i < m; i++)
             for(int j = 0; j < m; j++)
                 a[i*lda + j] = u[i*m + j];
-        delete[] u;
     }
 
-    delete[] buffer;
+    if(*info < 0)
+        return CV_HAL_ERROR_NOT_IMPLEMENTED;
     return CV_HAL_ERROR_OK;
 }
 
@@ -375,6 +377,10 @@ lapack_QR(fptype* a, size_t a_step, int m, int n, int k, fptype* b, size_t b_ste
             else if (typeid(fptype) == typeid(double))
                 OCV_LAPACK_FUNC(dgels)(mode, &_m, &_n, &_k, (double*)tmpA, &ldtmpA, (double*)b, &_m, (double*)&work1, &lwork, _info);
 
+            CV_ANNOTATE_MEMORY_IS_INITIALIZED(info, sizeof(int));
+            if (*info < 0)
+                return CV_HAL_ERROR_NOT_IMPLEMENTED;
+
             lwork = cvRound(work1); //optimal buffer size
             std::vector<fptype> workBufMemHolder(lwork + 1);
             fptype* buffer = &workBufMemHolder.front();
@@ -396,6 +402,10 @@ lapack_QR(fptype* a, size_t a_step, int m, int n, int k, fptype* b, size_t b_ste
             else if (typeid(fptype) == typeid(double))
                 OCV_LAPACK_FUNC(dgels)(mode, &_m, &_n, &_k, (double*)tmpA, &ldtmpA, (double*)tmpB, &_m, (double*)&work1, &lwork, _info);
 
+            CV_ANNOTATE_MEMORY_IS_INITIALIZED(info, sizeof(int));
+            if (*info < 0)
+                return CV_HAL_ERROR_NOT_IMPLEMENTED;
+
             lwork = cvRound(work1); //optimal buffer size
             std::vector<fptype> workBufMemHolder(lwork + 1);
             fptype* buffer = &workBufMemHolder.front();
@@ -414,6 +424,10 @@ lapack_QR(fptype* a, size_t a_step, int m, int n, int k, fptype* b, size_t b_ste
             sgeqrf_(&_m, &_n, (float*)tmpA, &ldtmpA, (float*)dst, (float*)&work1, &lwork, _info);
         else if (typeid(fptype) == typeid(double))
             dgeqrf_(&_m, &_n, (double*)tmpA, &ldtmpA, (double*)dst, (double*)&work1, &lwork, _info);
+
+        CV_ANNOTATE_MEMORY_IS_INITIALIZED(info, sizeof(int));
+        if (*info < 0)
+            return CV_HAL_ERROR_NOT_IMPLEMENTED;
 
         lwork = cvRound(work1); //optimal buffer size
         std::vector<fptype> workBufMemHolder(lwork + 1);
@@ -645,19 +659,17 @@ int lapack_Cholesky64f(double* a, size_t a_step, int m, double* b, size_t b_step
 
 int lapack_SVD32f(float* a, size_t a_step, float *w, float* u, size_t u_step, float* vt, size_t v_step, int m, int n, int flags)
 {
-
-    if(m < HAL_SVD_SMALL_MATRIX_THRESH)
+    if(m < HAL_SVD_SMALL_MATRIX_THRESH || n <= 0)
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    int info;
+    int info = 0;
     return lapack_SVD(a, a_step, w, u, u_step, vt, v_step, m, n, flags, &info);
 }
 
 int lapack_SVD64f(double* a, size_t a_step, double *w, double* u, size_t u_step, double* vt, size_t v_step, int m, int n, int flags)
 {
-
-    if(m < HAL_SVD_SMALL_MATRIX_THRESH)
+    if(m < HAL_SVD_SMALL_MATRIX_THRESH || n <= 0)
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
-    int info;
+    int info = 0;
     return lapack_SVD(a, a_step, w, u, u_step, vt, v_step, m, n, flags, &info);
 }
 
@@ -675,10 +687,69 @@ int lapack_QR64f(double* src1, size_t src1_step, int m, int n, int k, double* sr
     return lapack_QR(src1, src1_step, m, n, k, src2, src2_step, dst, info);
 }
 
+static inline bool shouldUseLapackGemm(int m, int n, int k, int flags)
+{
+    // Compute effective dimensions:
+    // M = rows of result D
+    // K = contraction (inner) dimension
+    // N = cols of result D
+    const int M = (flags & CV_HAL_GEMM_1_T) ? n : m;
+    const int K = (flags & CV_HAL_GEMM_1_T) ? m : n;
+    const int N = k;
+
+    // 1. Column-vector-like results (N <= 4) have sequential memory accesses
+    // and fit nicely in cache. OpenCV's fallback loops are faster for small sizes,
+    // but LAPACK is significantly faster for larger matrix-vector products (e.g. M >= 128 and K >= 128).
+    if (N <= 4)
+    {
+        return M >= 128 && K >= 128;
+    }
+
+    // 2. Row-vector-like results (M <= 4) have strided memory accesses to B.
+    // OpenCV's fallback is slow, so we should use LAPACK if K is large
+    // enough to amortize call overhead and N is reasonable.
+    if (M <= 4)
+    {
+        return K >= 512 && N >= 16;
+    }
+
+    // 3. Minimum dimension threshold.
+    // SIMD microkernels need at least 16 elements to amortize boundary checks.
+    if (M < 16 || N < 16)
+        return false;
+
+    // For small matrices (M, N, K <= 32), OpenCV's contiguous fallback loops
+    // are extremely fast and avoid LAPACK call overhead if there are no transposes.
+    // However, if there are transpose flags, OpenCV fallback suffers from strided
+    // memory accesses, whereas LAPACK's transpose loaders are much faster.
+    if (M <= 32 && N <= 32 && K <= 32)
+    {
+        return (flags & (CV_HAL_GEMM_1_T | CV_HAL_GEMM_2_T)) != 0;
+    }
+
+    // Outer products and thin contraction dimensions (K < 16):
+    // LAPACK is highly optimized for vector-vector outer products.
+    // If K is very small, we should use LAPACK if M and N are large (>= 64),
+    // and we should bypass the operational volume cutoff for these shapes.
+    if (K < 16)
+    {
+        if (M >= 64 && N >= 64)
+            return true;
+        return false;
+    }
+
+    // 4. Operational volume cutoff (equivalent to ~32x32x32).
+    // Below ~32,000 operations, OpenCV's direct loops without packing are faster.
+    if (static_cast<int64_t>(M) * N * K < 32768)
+        return false;
+
+    return true;
+}
+
 int lapack_gemm32f(const float *src1, size_t src1_step, const float *src2, size_t src2_step, float alpha,
                    const float *src3, size_t src3_step, float beta, float *dst, size_t dst_step, int m, int n, int k, int flags)
 {
-    if(m < HAL_GEMM_SMALL_MATRIX_THRESH)
+    if(!shouldUseLapackGemm(m, n, k, flags))
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
     return lapack_gemm(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
 }
@@ -686,7 +757,7 @@ int lapack_gemm32f(const float *src1, size_t src1_step, const float *src2, size_
 int lapack_gemm64f(const double *src1, size_t src1_step, const double *src2, size_t src2_step, double alpha,
                    const double *src3, size_t src3_step, double beta, double *dst, size_t dst_step, int m, int n, int k, int flags)
 {
-    if(m < HAL_GEMM_SMALL_MATRIX_THRESH)
+    if(!shouldUseLapackGemm(m, n, k, flags))
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
     return lapack_gemm(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
 }
@@ -694,14 +765,14 @@ int lapack_gemm64f(const double *src1, size_t src1_step, const double *src2, siz
 int lapack_gemm32fc(const float *src1, size_t src1_step, const float *src2, size_t src2_step, float alpha,
                    const float *src3, size_t src3_step, float beta, float *dst, size_t dst_step, int m, int n, int k, int flags)
 {
-    if(m < HAL_GEMM_SMALL_COMPLEX_MATRIX_THRESH)
+    if(!shouldUseLapackGemm(m, n, k, flags))
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
     return lapack_gemm_c(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
 }
 int lapack_gemm64fc(const double *src1, size_t src1_step, const double *src2, size_t src2_step, double alpha,
                    const double *src3, size_t src3_step, double beta, double *dst, size_t dst_step, int m, int n, int k, int flags)
 {
-    if(m < HAL_GEMM_SMALL_COMPLEX_MATRIX_THRESH)
+    if(!shouldUseLapackGemm(m, n, k, flags))
         return CV_HAL_ERROR_NOT_IMPLEMENTED;
     return lapack_gemm_c(src1, src1_step, src2, src2_step, alpha, src3, src3_step, beta, dst, dst_step, m, n, k, flags);
 }

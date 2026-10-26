@@ -26,8 +26,15 @@ class Test_Graph_Simplifier : public ::testing::Test {
         std::vector<std::string> layers;
         net.getLayerTypes(layers);
 
-        // remove Const, Identity (output layer), __NetInputLayer__ (input layer)
-        layers.erase(std::remove_if(layers.begin(), layers.end(), [] (const std::string l) { return l == "Const" || l == "Identity" || l == "__NetInputLayer__"; }), layers.end());
+        // remove Const, Identity (output layer), __NetInputLayer__ (input layer),
+        // TransformLayout (inserted by the block layout pass)
+        layers.erase(std::remove_if(layers.begin(), layers.end(), [] (const std::string l) { return l == "Const" || l == "Identity" || l == "__NetInputLayer__" || l == "TransformLayout"; }), layers.end());
+        // Instead of 'Tile', 'Expand' etc. we may now have 'Tile2', 'Expand2' etc.
+        // We should correctly match them with the respective patterns
+        for (auto& l: layers) {
+            if (!l.empty() && l[l.size()-1] == '2')
+                l = l.substr(0, l.size()-1);
+        }
 
         EXPECT_EQ(layers, expected_layers);
     }
@@ -52,18 +59,17 @@ TEST_F(Test_Graph_Simplifier, LayerNormNoFusionSubGraph) {
 }
 
 TEST_F(Test_Graph_Simplifier, ResizeSubgraph) {
-    /* Test for 6 subgraphs:
-        - GatherCastSubgraph
-        - MulCastSubgraph
+    /* Test for 4 subgraphs:
         - UpsampleSubgraph
         - ResizeSubgraph1
         - ResizeSubgraph2
         - ResizeSubgraph3
     */
-    test("upsample_unfused_torch1.2", std::vector<std::string>{"BatchNorm", "Resize"});
-    test("resize_nearest_unfused_opset11_torch1.3", std::vector<std::string>{"BatchNorm", "Convolution", "Resize"});
-    test("resize_nearest_unfused_opset11_torch1.4", std::vector<std::string>{"BatchNorm", "Convolution", "Resize"});
-    test("upsample_unfused_opset9_torch1.4", std::vector<std::string>{"BatchNorm", "Convolution", "Resize"});
+    test("upsample_unfused_torch1.2", std::vector<std::string>{"BatchNorm", "Cast", "Concat", "Floor", "Gather", "NaryEltwise", "Resize", "Shape", "Slice", "Unsqueeze"});
+    // In the models below the BatchNorm is folded into the preceding convolution by fuseBN().
+    test("resize_nearest_unfused_opset11_torch1.3", std::vector<std::string>{"Cast", "Concat", "Conv", "Floor", "Gather", "NaryEltwise", "Resize", "Shape", "Unsqueeze"});
+    test("resize_nearest_unfused_opset11_torch1.4", std::vector<std::string>{"Cast", "Concat", "Conv", "Floor", "Gather", "NaryEltwise", "Resize", "Shape", "Slice", "Unsqueeze"});
+    test("upsample_unfused_opset9_torch1.4", std::vector<std::string>{"Cast", "Concat", "Conv", "Floor", "Gather", "NaryEltwise", "Resize", "Shape", "Slice", "Unsqueeze"});
     test("two_resizes_with_shared_subgraphs", std::vector<std::string>{"NaryEltwise", "Resize"});
 }
 
@@ -147,7 +153,8 @@ TEST_F(Test_Graph_Simplifier, BiasedMatMulSubgraph) {
     /* Test for 1 subgraphs
         - BiasedMatMulSubgraph
     */
-    test("biased_matmul", "MatMul");
+    const std::string expected = "Gemm";
+    test("biased_matmul", expected);
 }
 
 }}

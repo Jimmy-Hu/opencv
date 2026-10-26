@@ -78,6 +78,8 @@ public:
                backendId == DNN_BACKEND_CUDA;
     }
 
+    bool isDataShuffling() const CV_OVERRIDE { return true; }
+
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
                          const int requiredOutputs,
                          std::vector<MatShape> &outputs,
@@ -89,6 +91,22 @@ public:
                                outputs, internals);
         return false;
     }
+
+    void getTypes(const std::vector<MatType>& inputs,
+                  const int requiredOutputs,
+                  const int requiredInternals,
+                  std::vector<MatType>& outputs,
+                  std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_CheckEQ(inputs.size(), 1u, "");
+        if (preferableTarget == DNN_TARGET_OPENCL_FP16)
+            CV_CheckType(inputs[0], inputs[0] == CV_16F || inputs[0] == CV_8S || inputs[0] == CV_8U || inputs[0] == CV_32S || inputs[0] == CV_64S || inputs[0] == CV_Bool, "");
+        else
+            CV_CheckType(inputs[0], inputs[0] == CV_32F || inputs[0] == CV_8S || inputs[0] == CV_8U || inputs[0] == CV_32S || inputs[0] == CV_64S || inputs[0] == CV_Bool, "");
+
+        outputs.assign(requiredOutputs, inputs[0]);
+    }
+
 
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
@@ -113,21 +131,13 @@ public:
     ) override
     {
         auto context = reinterpret_cast<csl::CSLContext*>(context_);
-        return make_cuda_node<cuda4dnn::SplitOp>(preferableTarget, std::move(context->stream));
+        if (inputs[0]->getHostMatDepth() == CV_Bool)
+            return make_cuda_node_bool<cuda4dnn::SplitOp>(std::move(context->stream));
+        else
+            return make_cuda_node_with_type<cuda4dnn::SplitOp>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream));
+
     }
 #endif
-
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        const int numOutputs = scales[1].size();
-        for (int i = 0; i < numOutputs; i++)
-        {
-            if (scales[1][i] != scales[0][0])
-             return false;
-        }
-        return true;
-    }
 };
 
 Ptr<SplitLayer> SplitLayer::create(const LayerParams& params)

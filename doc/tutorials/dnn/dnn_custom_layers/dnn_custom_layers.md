@@ -96,138 +96,60 @@ After network was initialized only `forward` method is called for every network'
 reallocate all the internal memory. That leads to efficiency gaps. Try to initialize
 and deploy models using a fixed batch size and image's dimensions.
 
-## Example: custom layer from Caffe
-Let's create a custom layer `Interp` from https://github.com/cdmh/deeplab-public.
-It's just a simple resize that takes an input blob of size `N x C x Hi x Wi` and returns
-an output blob of size `N x C x Ho x Wo` where `N` is a batch size, `C` is a number of channels,
-`Hi x Wi` and `Ho x Wo` are input and output `height x width` correspondingly.
-This layer has no trainable weights but it has hyper-parameters to specify an output size.
+## Example: custom layer from ONNX
+ONNX groups operators into **domains**. The standard operators live in the
+default domain `ai.onnx`; vendors and exporters often place their own ops in a
+named domain such as `my.namespace`. When OpenCV imports an ONNX node, it looks
+the op up in cv::dnn::LayerFactory by:
 
-In example,
-~~~~~~~~~~~~~
-layer {
-  name: "output"
-  type: "Interp"
-  bottom: "input"
-  top: "output"
-  interp_param {
-    height: 9
-    width: 8
-  }
-}
-~~~~~~~~~~~~~
+- the op_type alone, for nodes in the default `ai.onnx` domain (or no domain), and
+- `"<domain>.<op_type>"`, for nodes in any non-default domain.
 
-This way our implementation can look like:
+Node attributes are passed through to the layer constructor as
+cv::dnn::LayerParams entries with the same names. Consider an op `MyCustomOp`
+with attributes `scale` and `bias` that computes `y = scale * x + bias`. The
+implementation can look like:
 
-@snippet dnn/custom_layers.hpp InterpLayer
+@snippet dnn/custom_layer_onnx.cpp CustomScaleBiasLayer
 
-Next we need to register a new layer type and try to import the model.
+To import a model that uses this op, register the layer **before** calling
+cv::dnn::readNetFromONNX. Use cv::dnn::LayerFactory::registerLayer for runtime
+registration (and cv::dnn::LayerFactory::unregisterLayer when done) — pick the
+right key for the domain of the op as described above:
 
-@snippet dnn/custom_layers.hpp Register InterpLayer
+@snippet dnn/custom_layer_onnx.cpp Register CustomScaleBiasLayer
 
-## Example: custom layer from TensorFlow
-This is an example of how to import a network with [tf.image.resize_bilinear](https://www.tensorflow.org/versions/master/api_docs/python/tf/image/resize_bilinear)
-operation. This is also a resize but with an implementation different from OpenCV's or `Interp` above.
-
-Let's create a single layer network:
-~~~~~~~~~~~~~{.py}
-inp = tf.placeholder(tf.float32, [2, 3, 4, 5], 'input')
-resized = tf.image.resize_bilinear(inp, size=[9, 8], name='resize_bilinear')
-~~~~~~~~~~~~~
-OpenCV sees that TensorFlow's graph in the following way:
-
-```
-node {
-  name: "input"
-  op: "Placeholder"
-  attr {
-    key: "dtype"
-    value {
-      type: DT_FLOAT
-    }
-  }
-}
-node {
-  name: "resize_bilinear/size"
-  op: "Const"
-  attr {
-    key: "dtype"
-    value {
-      type: DT_INT32
-    }
-  }
-  attr {
-    key: "value"
-    value {
-      tensor {
-        dtype: DT_INT32
-        tensor_shape {
-          dim {
-            size: 2
-          }
-        }
-        tensor_content: "\t\000\000\000\010\000\000\000"
-      }
-    }
-  }
-}
-node {
-  name: "resize_bilinear"
-  op: "ResizeBilinear"
-  input: "input:0"
-  input: "resize_bilinear/size"
-  attr {
-    key: "T"
-    value {
-      type: DT_FLOAT
-    }
-  }
-  attr {
-    key: "align_corners"
-    value {
-      b: false
-    }
-  }
-}
-library {
-}
-```
-Custom layers import from TensorFlow is designed to put all layer's `attr` into
-cv::dnn::LayerParams but input `Const` blobs into cv::dnn::Layer::blobs.
-In our case resize's output shape will be stored in layer's `blobs[0]`.
-
-@snippet dnn/custom_layers.hpp ResizeBilinearLayer
-
-Next we register a layer and try to import the model.
-
-@snippet dnn/custom_layers.hpp Register ResizeBilinearLayer
+A complete runnable example is available at
+[samples/dnn/custom_layer_onnx.cpp](https://github.com/opencv/opencv/tree/5.x/samples/dnn/custom_layer_onnx.cpp).
+Tiny ONNX models exercising both the default-domain and custom-domain registration
+paths can be generated with
+[generate_custom_layer_models.py](https://github.com/opencv/opencv_extra/tree/5.x/testdata/dnn/onnx/generate_custom_layer_models.py)
+in the opencv_extra repository.
 
 ## Define a custom layer in Python
 The following example shows how to customize OpenCV's layers in Python.
 
-Let's consider [Holistically-Nested Edge Detection](https://arxiv.org/abs/1504.06375)
-deep learning model. That was trained with one and only difference comparing to
-a current version of [Caffe framework](http://caffe.berkeleyvision.org/). `Crop`
-layers that receive two input blobs and crop the first one to match spatial dimensions
-of the second one used to crop from the center. Nowadays Caffe's layer does it
-from the top-left corner. So using the latest version of Caffe or OpenCV you will
-get shifted results with filled borders.
+Let's consider the [Holistically-Nested Edge Detection](https://arxiv.org/abs/1504.06375)
+model. Its `Crop` layers receive two input blobs and crop the first one to match the
+spatial dimensions of the second. OpenCV's built-in `Crop` layer trims from the
+top-left corner, whereas this model expects cropping from the center, so using the
+built-in behaviour directly would produce shifted results with filled borders.
 
 Next we're going to replace OpenCV's `Crop` layer that makes top-left cropping by
 a centric one.
 
 - Create a class with `getMemoryShapes` and `forward` methods
 
-@snippet dnn/edge_detection.py CropLayer
+@snippet dnn/custom_layer.py CropLayer
 
 @note Both methods should return lists.
 
 - Register a new layer.
 
-@snippet dnn/edge_detection.py Register
+@snippet dnn/custom_layer.py Register
 
 That's it! We have replaced an implemented OpenCV's layer to a custom one.
-You may find a full script in the [source code](https://github.com/opencv/opencv/tree/4.x/samples/dnn/edge_detection.py).
+You may find a full script in the [source code](https://github.com/opencv/opencv/tree/5.x/samples/dnn/edge_detection.py).
 
 <table border="0">
 <tr>

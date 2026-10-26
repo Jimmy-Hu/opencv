@@ -46,11 +46,10 @@
 #include "lkpyramid.hpp"
 #include "opencl_kernels_video.hpp"
 #include "opencv2/core/hal/intrin.hpp"
-#ifdef HAVE_OPENCV_CALIB3D
-#include "opencv2/calib3d.hpp"
+#ifdef HAVE_OPENCV_GEOMETRY
+#include "opencv2/geometry.hpp"
 #endif
 
-#include "opencv2/core/openvx/ovx_defs.hpp"
 #include "hal_replacement.hpp"
 
 #define  CV_DESCALE(x,n)     (((x) + (1 << ((n)-1))) >> (n))
@@ -210,6 +209,12 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
         const int16x4_t d29 = vdup_n_s16((int16_t)iw11);
         const int32x4_t q11 = vdupq_n_s32((int32_t)shifter1);
         const int32x4_t q12 = vdupq_n_s32((int32_t)shifter2);
+
+#elif CV_RVV
+        const size_t rvv_lanes_A = __riscv_vsetvlmax_e16m1();
+        vfloat32m2_t rvvA11 = __riscv_vfmv_v_f_f32m2(0.f, rvv_lanes_A);
+        vfloat32m2_t rvvA12 = __riscv_vfmv_v_f_f32m2(0.f, rvv_lanes_A);
+        vfloat32m2_t rvvA22 = __riscv_vfmv_v_f_f32m2(0.f, rvv_lanes_A);
 
 #endif
 
@@ -379,6 +384,96 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                 d8d12.val[0] = d8; d8d12.val[1] = d12;
                 vst2_s16(dIptr, d8d12);
             }
+#elif CV_RVV
+            for( ; x < winSize.width*cn; )
+            {
+                const size_t vl = __riscv_vsetvl_e16m1(winSize.width*cn - x);
+
+                // Bilinear interpolation of the source image. Keep only one widened
+                // pixel vector live at a time to limit vector register pressure.
+                vuint16m1_t pix = __riscv_vwcvtu_x_x_v_u16m1(
+                        __riscv_vle8_v_u8mf2(src + x, vl), vl);
+                vint32m2_t interp = __riscv_vwmul_vx_i32m2(
+                        __riscv_vreinterpret_i16m1(pix), (int16_t)iw00, vl);
+
+                pix = __riscv_vwcvtu_x_x_v_u16m1(
+                        __riscv_vle8_v_u8mf2(src + x + cn, vl), vl);
+                interp = __riscv_vwmacc_vx_i32m2(
+                        interp, (int16_t)iw01, __riscv_vreinterpret_i16m1(pix), vl);
+
+                pix = __riscv_vwcvtu_x_x_v_u16m1(
+                        __riscv_vle8_v_u8mf2(src + x + stepI, vl), vl);
+                interp = __riscv_vwmacc_vx_i32m2(
+                        interp, (int16_t)iw10, __riscv_vreinterpret_i16m1(pix), vl);
+
+                pix = __riscv_vwcvtu_x_x_v_u16m1(
+                        __riscv_vle8_v_u8mf2(src + x + stepI + cn, vl), vl);
+                interp = __riscv_vwmacc_vx_i32m2(
+                        interp, (int16_t)iw11, __riscv_vreinterpret_i16m1(pix), vl);
+
+                interp = __riscv_vsra_vx_i32m2(
+                        __riscv_vadd_vx_i32m2(
+                                interp, 1 << (W_BITS1 - 5 - 1), vl),
+                        W_BITS1 - 5, vl);
+                __riscv_vse16_v_i16m1(
+                        Iptr + x, __riscv_vncvt_x_x_w_i16m1(interp, vl), vl);
+
+                // Interpolate Ix/Iy together. m1 inputs widen to m2 accumulators;
+                // reusing the segment-load temporaries keeps the live register set small.
+                vint16m1x2_t grad = __riscv_vlseg2e16_v_i16m1x2(dsrc, vl);
+                vint16m1_t gx = __riscv_vget_v_i16m1x2_i16m1(grad, 0);
+                vint16m1_t gy = __riscv_vget_v_i16m1x2_i16m1(grad, 1);
+                vint32m2_t ix = __riscv_vwmul_vx_i32m2(gx, (int16_t)iw00, vl);
+                vint32m2_t iy = __riscv_vwmul_vx_i32m2(gy, (int16_t)iw00, vl);
+
+                grad = __riscv_vlseg2e16_v_i16m1x2(dsrc + cn2, vl);
+                gx = __riscv_vget_v_i16m1x2_i16m1(grad, 0);
+                gy = __riscv_vget_v_i16m1x2_i16m1(grad, 1);
+                ix = __riscv_vwmacc_vx_i32m2(ix, (int16_t)iw01, gx, vl);
+                iy = __riscv_vwmacc_vx_i32m2(iy, (int16_t)iw01, gy, vl);
+
+                grad = __riscv_vlseg2e16_v_i16m1x2(dsrc + dstep, vl);
+                gx = __riscv_vget_v_i16m1x2_i16m1(grad, 0);
+                gy = __riscv_vget_v_i16m1x2_i16m1(grad, 1);
+                ix = __riscv_vwmacc_vx_i32m2(ix, (int16_t)iw10, gx, vl);
+                iy = __riscv_vwmacc_vx_i32m2(iy, (int16_t)iw10, gy, vl);
+
+                grad = __riscv_vlseg2e16_v_i16m1x2(dsrc + dstep + cn2, vl);
+                gx = __riscv_vget_v_i16m1x2_i16m1(grad, 0);
+                gy = __riscv_vget_v_i16m1x2_i16m1(grad, 1);
+                ix = __riscv_vwmacc_vx_i32m2(ix, (int16_t)iw11, gx, vl);
+                iy = __riscv_vwmacc_vx_i32m2(iy, (int16_t)iw11, gy, vl);
+
+                ix = __riscv_vsra_vx_i32m2(
+                        __riscv_vadd_vx_i32m2(ix, 1 << (W_BITS1 - 1), vl),
+                        W_BITS1, vl);
+                iy = __riscv_vsra_vx_i32m2(
+                        __riscv_vadd_vx_i32m2(iy, 1 << (W_BITS1 - 1), vl),
+                        W_BITS1, vl);
+
+                {
+                    vint16m1_t ix16 = __riscv_vncvt_x_x_w_i16m1(ix, vl);
+                    vint16m1_t iy16 = __riscv_vncvt_x_x_w_i16m1(iy, vl);
+                    vint16m1x2_t out =
+                            __riscv_vset_v_i16m1_i16m1x2(grad, 0, ix16);
+                    out = __riscv_vset_v_i16m1_i16m1x2(out, 1, iy16);
+                    __riscv_vsseg2e16_v_i16m1x2(dIptr, out, vl);
+                }
+
+                vint32m2_t prod = __riscv_vmul_vv_i32m2(ix, ix, vl);
+                rvvA11 = __riscv_vfadd_tu(
+                        rvvA11, rvvA11, __riscv_vfcvt_f_x_v_f32m2(prod, vl), vl);
+                prod = __riscv_vmul_vv_i32m2(ix, iy, vl);
+                rvvA12 = __riscv_vfadd_tu(
+                        rvvA12, rvvA12, __riscv_vfcvt_f_x_v_f32m2(prod, vl), vl);
+                prod = __riscv_vmul_vv_i32m2(iy, iy, vl);
+                rvvA22 = __riscv_vfadd_tu(
+                        rvvA22, rvvA22, __riscv_vfcvt_f_x_v_f32m2(prod, vl), vl);
+
+                x += (int)vl;
+                dsrc += vl*2;
+                dIptr += vl*2;
+            }
 #endif
 
             for( ; x < winSize.width*cn; x++, dsrc += 2, dIptr += 2 )
@@ -410,6 +505,14 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
         iA11 += nA11[0] + nA11[1] + nA11[2] + nA11[3];
         iA12 += nA12[0] + nA12[1] + nA12[2] + nA12[3];
         iA22 += nA22[0] + nA22[1] + nA22[2] + nA22[3];
+#elif CV_RVV
+        vfloat32m1_t rvvZeroA = __riscv_vfmv_v_f_f32m1(0.f, 1);
+        iA11 += __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredusum_vs_f32m2_f32m1(rvvA11, rvvZeroA, rvv_lanes_A));
+        iA12 += __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredusum_vs_f32m2_f32m1(rvvA12, rvvZeroA, rvv_lanes_A));
+        iA22 += __riscv_vfmv_f_s_f32m1_f32(
+                __riscv_vfredusum_vs_f32m2_f32m1(rvvA22, rvvZeroA, rvv_lanes_A));
 #endif
 
         A11 = iA11*FLT_SCALE;
@@ -470,6 +573,10 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
             const int16x4_t d28_2 = vdup_n_s16((int16_t)iw10);
             const int16x4_t d29_2 = vdup_n_s16((int16_t)iw11);
 
+#elif CV_RVV
+            const size_t rvv_lanes = __riscv_vsetvlmax_e16m1();
+            vfloat32m2_t rvvB1 = __riscv_vfmv_v_f_f32m2(0.f, rvv_lanes);
+            vfloat32m2_t rvvB2 = __riscv_vfmv_v_f_f32m2(0.f, rvv_lanes);
 #endif
 
             for( y = 0; y < winSize.height; y++ )
@@ -579,6 +686,61 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
                     vst1q_f32(nB1, nB1v);
                     vst1q_f32(nB2, nB2v);
                 }
+#elif CV_RVV
+                for( ; x < winSize.width*cn; )
+                {
+                    const size_t vl = __riscv_vsetvl_e16m1(winSize.width*cn - x);
+
+                    vuint16m1_t j00 = __riscv_vwcvtu_x_x_v_u16m1(
+                            __riscv_vle8_v_u8mf2(Jptr + x, vl), vl);
+                    vint32m2_t interp = __riscv_vwmul_vx_i32m2(
+                            __riscv_vreinterpret_i16m1(j00), (int16_t)iw00, vl);
+
+                    vuint16m1_t j01 = __riscv_vwcvtu_x_x_v_u16m1(
+                            __riscv_vle8_v_u8mf2(Jptr + x + cn, vl), vl);
+                    interp = __riscv_vwmacc_vx_i32m2(
+                            interp, (int16_t)iw01, __riscv_vreinterpret_i16m1(j01), vl);
+
+                    vuint16m1_t j10 = __riscv_vwcvtu_x_x_v_u16m1(
+                            __riscv_vle8_v_u8mf2(Jptr + x + stepJ, vl), vl);
+                    interp = __riscv_vwmacc_vx_i32m2(
+                            interp, (int16_t)iw10, __riscv_vreinterpret_i16m1(j10), vl);
+
+                    vuint16m1_t j11 = __riscv_vwcvtu_x_x_v_u16m1(
+                            __riscv_vle8_v_u8mf2(Jptr + x + stepJ + cn, vl), vl);
+                    interp = __riscv_vwmacc_vx_i32m2(
+                            interp, (int16_t)iw11, __riscv_vreinterpret_i16m1(j11), vl);
+
+                    interp = __riscv_vsra_vx_i32m2(
+                            __riscv_vadd_vx_i32m2(
+                                    interp, 1 << (W_BITS1 - 5 - 1), vl),
+                            W_BITS1 - 5, vl);
+                    vint32m2_t diff = __riscv_vsub_vv_i32m2(
+                            interp,
+                            __riscv_vwcvt_x_x_v_i32m2(
+                                    __riscv_vle16_v_i16m1(Iptr + x, vl), vl),
+                            vl);
+
+                    vint16m1x2_t gradient = __riscv_vlseg2e16_v_i16m1x2(dIptr, vl);
+                    vint32m2_t ix = __riscv_vwcvt_x_x_v_i32m2(
+                            __riscv_vget_v_i16m1x2_i16m1(gradient, 0), vl);
+                    vint32m2_t iy = __riscv_vwcvt_x_x_v_i32m2(
+                            __riscv_vget_v_i16m1x2_i16m1(gradient, 1), vl);
+
+                    rvvB1 = __riscv_vfadd_tu(
+                            rvvB1, rvvB1,
+                            __riscv_vfcvt_f_x_v_f32m2(
+                                    __riscv_vmul_vv_i32m2(diff, ix, vl), vl),
+                            vl);
+                    rvvB2 = __riscv_vfadd_tu(
+                            rvvB2, rvvB2,
+                            __riscv_vfcvt_f_x_v_f32m2(
+                                    __riscv_vmul_vv_i32m2(diff, iy, vl), vl),
+                            vl);
+
+                    x += (int)vl;
+                    dIptr += vl*2;
+                }
 #endif
 
                 for( ; x < winSize.width*cn; x++, dIptr += 2 )
@@ -602,6 +764,12 @@ void cv::detail::LKTrackerInvoker::operator()(const Range& range) const
 
             ib1 += (float)(nB1[0] + nB1[1] + nB1[2] + nB1[3]);
             ib2 += (float)(nB2[0] + nB2[1] + nB2[2] + nB2[3]);
+#elif CV_RVV
+            vfloat32m1_t rvvZero = __riscv_vfmv_v_f_f32m1(0.f, 1);
+            ib1 += __riscv_vfmv_f_s_f32m1_f32(
+                    __riscv_vfredusum_vs_f32m2_f32m1(rvvB1, rvvZero, rvv_lanes));
+            ib2 += __riscv_vfmv_f_s_f32m1_f32(
+                    __riscv_vfredusum_vs_f32m2_f32m1(rvvB2, rvvZero, rvv_lanes));
 #endif
 
             b1 = ib1*FLT_SCALE;
@@ -1028,154 +1196,6 @@ namespace
     }
 #endif
 
-#ifdef HAVE_OPENVX
-    bool openvx_pyrlk(InputArray _prevImg, InputArray _nextImg, InputArray _prevPts, InputOutputArray _nextPts,
-                             OutputArray _status, OutputArray _err)
-    {
-        using namespace ivx;
-
-        // Pyramids as inputs are not acceptable because there's no (direct or simple) way
-        // to build vx_pyramid on user data
-        if(_prevImg.kind() != _InputArray::MAT || _nextImg.kind() != _InputArray::MAT)
-            return false;
-
-        Mat prevImgMat = _prevImg.getMat(), nextImgMat = _nextImg.getMat();
-
-        if(prevImgMat.type() != CV_8UC1 || nextImgMat.type() != CV_8UC1)
-            return false;
-
-        if (ovx::skipSmallImages<VX_KERNEL_OPTICAL_FLOW_PYR_LK>(prevImgMat.cols, prevImgMat.rows))
-            return false;
-
-        CV_Assert(prevImgMat.size() == nextImgMat.size());
-        Mat prevPtsMat = _prevPts.getMat();
-        int checkPrev = prevPtsMat.checkVector(2, CV_32F, false);
-        CV_Assert( checkPrev >= 0 );
-        size_t npoints = checkPrev;
-
-        if( !(flags & OPTFLOW_USE_INITIAL_FLOW) )
-            _nextPts.create(prevPtsMat.size(), prevPtsMat.type(), -1, true);
-        Mat nextPtsMat = _nextPts.getMat();
-        CV_Assert( nextPtsMat.checkVector(2, CV_32F, false) == (int)npoints );
-
-        _status.create((int)npoints, 1, CV_8U, -1, true);
-        Mat statusMat = _status.getMat();
-        uchar* status = statusMat.ptr();
-        for(size_t i = 0; i < npoints; i++ )
-            status[i] = true;
-
-        // OpenVX doesn't return detection errors
-        if( _err.needed() )
-        {
-            return false;
-        }
-
-        try
-        {
-            Context context = ovx::getOpenVXContext();
-
-            if(context.vendorID() == VX_ID_KHRONOS)
-            {
-                // PyrLK in OVX 1.0.1 performs vxCommitImagePatch incorrecty and crashes
-                if(VX_VERSION == VX_VERSION_1_0)
-                    return false;
-                // Implementation ignores border mode
-                // So check that minimal size of image in pyramid is big enough
-                int width = prevImgMat.cols, height = prevImgMat.rows;
-                for(int i = 0; i < maxLevel+1; i++)
-                {
-                    if(width < winSize.width + 1 || height < winSize.height + 1)
-                        return false;
-                    else
-                    {
-                        width /= 2; height /= 2;
-                    }
-                }
-            }
-
-            Image prevImg = Image::createFromHandle(context, Image::matTypeToFormat(prevImgMat.type()),
-                                                    Image::createAddressing(prevImgMat), (void*)prevImgMat.data);
-            Image nextImg = Image::createFromHandle(context, Image::matTypeToFormat(nextImgMat.type()),
-                                                    Image::createAddressing(nextImgMat), (void*)nextImgMat.data);
-
-            Graph graph = Graph::create(context);
-
-            Pyramid prevPyr = Pyramid::createVirtual(graph, (vx_size)maxLevel+1, VX_SCALE_PYRAMID_HALF,
-                                                     prevImg.width(), prevImg.height(), prevImg.format());
-            Pyramid nextPyr = Pyramid::createVirtual(graph, (vx_size)maxLevel+1, VX_SCALE_PYRAMID_HALF,
-                                                     nextImg.width(), nextImg.height(), nextImg.format());
-
-            ivx::Node::create(graph, VX_KERNEL_GAUSSIAN_PYRAMID, prevImg, prevPyr);
-            ivx::Node::create(graph, VX_KERNEL_GAUSSIAN_PYRAMID, nextImg, nextPyr);
-
-            Array prevPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
-            Array estimatedPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
-            Array nextPts = Array::create(context, VX_TYPE_KEYPOINT, npoints);
-
-            std::vector<vx_keypoint_t> vxPrevPts(npoints), vxEstPts(npoints), vxNextPts(npoints);
-            for(size_t i = 0; i < npoints; i++)
-            {
-                vx_keypoint_t& prevPt = vxPrevPts[i]; vx_keypoint_t& estPt  = vxEstPts[i];
-                prevPt.x = prevPtsMat.at<Point2f>(i).x; prevPt.y = prevPtsMat.at<Point2f>(i).y;
-                 estPt.x = nextPtsMat.at<Point2f>(i).x;  estPt.y = nextPtsMat.at<Point2f>(i).y;
-                prevPt.tracking_status = estPt.tracking_status = vx_true_e;
-            }
-            prevPts.addItems(vxPrevPts); estimatedPts.addItems(vxEstPts);
-
-            if( (criteria.type & TermCriteria::COUNT) == 0 )
-                criteria.maxCount = 30;
-            else
-                criteria.maxCount = std::min(std::max(criteria.maxCount, 0), 100);
-            if( (criteria.type & TermCriteria::EPS) == 0 )
-                criteria.epsilon = 0.01;
-            else
-                criteria.epsilon = std::min(std::max(criteria.epsilon, 0.), 10.);
-            criteria.epsilon *= criteria.epsilon;
-
-            vx_enum termEnum = (criteria.type == TermCriteria::COUNT) ? VX_TERM_CRITERIA_ITERATIONS :
-                               (criteria.type == TermCriteria::EPS) ? VX_TERM_CRITERIA_EPSILON :
-                               VX_TERM_CRITERIA_BOTH;
-
-            //minEigThreshold is fixed to 0.0001f
-            ivx::Scalar termination = ivx::Scalar::create<VX_TYPE_ENUM>(context, termEnum);
-            ivx::Scalar epsilon = ivx::Scalar::create<VX_TYPE_FLOAT32>(context, criteria.epsilon);
-            ivx::Scalar numIterations = ivx::Scalar::create<VX_TYPE_UINT32>(context, criteria.maxCount);
-            ivx::Scalar useInitial = ivx::Scalar::create<VX_TYPE_BOOL>(context, (vx_bool)(flags & OPTFLOW_USE_INITIAL_FLOW));
-            //assume winSize is square
-            ivx::Scalar windowSize = ivx::Scalar::create<VX_TYPE_SIZE>(context, (vx_size)winSize.width);
-
-            ivx::Node::create(graph, VX_KERNEL_OPTICAL_FLOW_PYR_LK, prevPyr, nextPyr, prevPts, estimatedPts,
-                              nextPts, termination, epsilon, numIterations, useInitial, windowSize);
-
-            graph.verify();
-            graph.process();
-
-            nextPts.copyTo(vxNextPts);
-            for(size_t i = 0; i < npoints; i++)
-            {
-                vx_keypoint_t kp = vxNextPts[i];
-                nextPtsMat.at<Point2f>(i) = Point2f(kp.x, kp.y);
-                statusMat.at<uchar>(i) = (bool)kp.tracking_status;
-            }
-
-#ifdef VX_VERSION_1_1
-        //we should take user memory back before release
-        //(it's not done automatically according to standard)
-        prevImg.swapHandle(); nextImg.swapHandle();
-#endif
-        }
-        catch (const RuntimeError & e)
-        {
-            VX_DbgThrow(e.what());
-        }
-        catch (const WrapperError & e)
-        {
-            VX_DbgThrow(e.what());
-        }
-
-        return true;
-    }
-#endif
 };
 
 
@@ -1190,10 +1210,6 @@ void SparsePyrLKOpticalFlowImpl::calc( InputArray _prevImg, InputArray _nextImg,
                (_prevImg.isUMat() || _nextImg.isUMat()) &&
                ocl::Image2D::isFormatSupported(CV_32F, 1, false),
                ocl_calcOpticalFlowPyrLK(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err))
-
-    // Disabled due to bad accuracy
-    CV_OVX_RUN(false,
-               openvx_pyrlk(_prevImg, _nextImg, _prevPts, _nextPts, _status, _err))
 
     Mat prevPtsMat = _prevPts.getMat();
     const int derivDepth = DataType<cv::detail::deriv_type>::depth;
@@ -1224,7 +1240,7 @@ void SparsePyrLKOpticalFlowImpl::calc( InputArray _prevImg, InputArray _nextImg,
     Mat statusMat = _status.getMat(), errMat;
     CV_Assert( statusMat.isContinuous() );
     uchar* status = statusMat.ptr();
-    float* err = nullptr;
+    float* err = 0;
 
     for( i = 0; i < npoints; i++ )
         status[i] = true;
@@ -1366,9 +1382,9 @@ void cv::calcOpticalFlowPyrLK( InputArray _prevImg, InputArray _nextImg,
 cv::Mat cv::estimateRigidTransform( InputArray src1, InputArray src2, bool fullAffine )
 {
     CV_INSTRUMENT_REGION();
-#ifndef HAVE_OPENCV_CALIB3D
+#ifndef HAVE_OPENCV_GEOMETRY
     CV_UNUSED(src1); CV_UNUSED(src2); CV_UNUSED(fullAffine);
-    CV_Error(Error::StsError, "estimateRigidTransform requires calib3d module");
+    CV_Error(Error::StsError, "estimateRigidTransform requires geometry module");
 #else
     Mat A = src1.getMat(), B = src2.getMat();
 

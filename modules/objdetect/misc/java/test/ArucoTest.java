@@ -107,9 +107,9 @@ public class ArucoTest extends OpenCVTestCase {
         // The fix removes the incorrect +0.5 offset that was added after cornerSubPix
         double eps = 0.2;
         assertArrayEquals(new double[]{cellSize - 0.5, cellSize - 0.5}, charucoCorners.get(0, 0), eps);
-        assertArrayEquals(new double[]{2*cellSize - 0.5, cellSize - 0.5}, charucoCorners.get(1, 0), eps);
-        assertArrayEquals(new double[]{cellSize - 0.5, 2*cellSize - 0.5}, charucoCorners.get(2, 0), eps);
-        assertArrayEquals(new double[]{2*cellSize - 0.5, 2*cellSize - 0.5}, charucoCorners.get(3, 0), eps);
+        assertArrayEquals(new double[]{2*cellSize - 0.5, cellSize - 0.5}, charucoCorners.get(0,1), eps);
+        assertArrayEquals(new double[]{cellSize - 0.5, 2*cellSize - 0.5}, charucoCorners.get(0,2), eps);
+        assertArrayEquals(new double[]{2*cellSize - 0.5, 2*cellSize - 0.5}, charucoCorners.get(0,3), eps);
     }
 
 }

@@ -1,0 +1,126 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html.
+
+// Copyright (C) 2020, Intel Corporation, all rights reserved.
+// Third party copyrights are property of their respective owners.
+
+#ifndef __OPENCV_DNN_KV_CACHE_MANAGER_HPP__
+#define __OPENCV_DNN_KV_CACHE_MANAGER_HPP__
+
+#include <opencv2/core.hpp>
+#include <opencv2/dnn/dnn.hpp>
+
+#include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "layers/cpu_kernels/fast_gemm.hpp"
+
+namespace cv { namespace dnn {
+CV__DNN_INLINE_NS_BEGIN
+
+// Upper bound for reserveKVCache(); keeps the page-count arithmetic in range.
+enum { KV_CACHE_MAX_RESERVED_TOKENS = 1 << 24 };
+
+class KVCache
+{
+    public:
+        virtual ~KVCache() = default;
+        KVCache(FastGemmOpt opt, int nHeads) : nHeads(nHeads),  headDim(-1), offset(0), opt(opt) {}
+        KVCache(FastGemmOpt opt) : nHeads(-1), headDim(-1),offset(0), opt(opt) {}
+        void grow(const Mat& newData);
+        void clear() {
+            pages.clear();
+            nTokens = 0;
+        }
+        // Reserve the page pool for up to maxTokens (static cache); applied at prefill.
+        void reserve(int maxTokens) { reservedTokens = std::max(reservedTokens, maxTokens); }
+        int getActivePageCount() const { return pageSize > 0 ? (nTokens + pageSize - 1) / pageSize : 0; }
+        // Pages holding tokens. The paged kernels size the last page from the page count,
+        // so reserved empty trailing pages must not be passed to them.
+        std::vector<Mat> getActivePages() const {
+            size_t n = std::min((size_t)getActivePageCount(), pages.size());
+            return std::vector<Mat>(pages.begin(), pages.begin() + n);
+        }
+        int getPageSize() const { return pageSize; }
+        int getNumTokens() const { return nTokens; }
+    protected:
+        void growPrefill(const Mat& newData, int T);
+        // Append T (>=1) tokens to a non-empty cache one column at a time.
+        void appendTokens(const Mat& newData, int T);
+
+        virtual void growGenerate(const Mat& newData) = 0;
+        std::vector<Mat> pages;
+
+        int nTokens = 0;
+        int pageSize = -1;
+        int nHeads;
+        int headDim;
+        int batchSize = -1;
+        int offset;
+        int reservedTokens = 0;
+        bool isKCache = false;
+        FastGemmOpt opt;
+};
+
+class VCache : public KVCache
+{
+    public:
+        VCache(FastGemmOpt opt) : KVCache(opt) {
+            isKCache = false;
+            pageSize = fastGemmKC(opt);
+        }
+        VCache(FastGemmOpt opt, int nHeads) : KVCache(opt, nHeads) {
+            isKCache = false;
+            pageSize = fastGemmKC(opt);
+        }
+    protected:
+        void growGenerate(const Mat& newData) CV_OVERRIDE;
+};
+
+class KCache : public KVCache
+{
+    public:
+        KCache(FastGemmOpt opt) : KVCache(opt) {
+            isKCache = true;
+            pageSize = fastGemmNR(opt);
+        }
+        KCache(FastGemmOpt opt, int nHeads) : KVCache(opt, nHeads) {
+            isKCache = true;
+            pageSize = fastGemmNR(opt);
+        }
+    protected:
+        void growGenerate(const Mat& newData) CV_OVERRIDE;
+};
+
+
+struct KVCacheManager
+{
+    Net::Impl* netimpl = nullptr;
+    std::map<std::string, KCache> kData;
+    std::map<std::string, VCache> vData;
+    FastGemmOpt opt;
+    bool isInitialized = false;
+
+    // present.* output arg idx -> past_key_values.* input arg idx
+    std::vector<std::pair<int, int>> presentToPastRoutes;
+    bool hasRoutes = false;
+
+    void init();
+    void buildRoutes();
+    void applyRoutes();
+    void initPastTensors();
+    // Pre-reserve every per-layer K/V cache for up to maxTokens total sequence length.
+    void reserve(int maxTokens);
+    bool empty() const { return kData.empty() && vData.empty(); }
+};
+
+void setKVCacheManager(Ptr<Net::Impl> netimpl);
+
+
+CV__DNN_INLINE_NS_END
+}}
+
+#endif

@@ -373,7 +373,7 @@ void* GpuMat::cudaPtr() const
     return data;
 }
 
-static inline
+inline
 GpuMat createContinuous(int rows, int cols, int type)
 {
     GpuMat m;
@@ -381,13 +381,13 @@ GpuMat createContinuous(int rows, int cols, int type)
     return m;
 }
 
-static inline
+inline
 void createContinuous(Size size, int type, OutputArray arr)
 {
     createContinuous(size.height, size.width, type, arr);
 }
 
-static inline
+inline
 GpuMat createContinuous(Size size, int type)
 {
     GpuMat m;
@@ -395,13 +395,13 @@ GpuMat createContinuous(Size size, int type)
     return m;
 }
 
-static inline
+inline
 void ensureSizeIsEnough(Size size, int type, OutputArray arr)
 {
     ensureSizeIsEnough(size.height, size.width, type, arr);
 }
 
-static inline
+inline
 void swap(GpuMat& a, GpuMat& b)
 {
     a.swap(b);
@@ -418,10 +418,10 @@ GpuMatND::GpuMatND() :
 }
 
 inline
-GpuMatND::GpuMatND(SizeArray _size, int _type) :
+GpuMatND::GpuMatND(const MatShape& _shape, int _type) :
     flags(0), dims(0), data(nullptr), offset(0)
 {
-    create(std::move(_size), _type);
+    create(_shape, _type);
 }
 
 inline
@@ -640,7 +640,7 @@ bool HostMem::empty() const
     return data == 0;
 }
 
-static inline
+inline
 void swap(HostMem& a, HostMem& b)
 {
     a.swap(b);
@@ -751,7 +751,7 @@ namespace cv {
 
 inline
 Mat::Mat(const cuda::GpuMat& m)
-    : flags(0), dims(0), rows(0), cols(0), data(0), datastart(0), dataend(0), datalimit(0), allocator(0), u(0), size(&rows)
+    : flags(0), dims(0), rows(0), cols(0), data(0), datastart(0), dataend(0), datalimit(0), allocator(0), u(0)
 {
     m.download(*this);
 }

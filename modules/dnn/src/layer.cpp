@@ -3,37 +3,53 @@
 // of this distribution and at http://opencv.org/license.html.
 
 #include "precomp.hpp"
+#include "net_impl.hpp"
 
 namespace cv {
 namespace dnn {
 CV__DNN_INLINE_NS_BEGIN
 
 
-Layer::Layer() { preferableTarget = DNN_TARGET_CPU; }
+LayerInfo::LayerInfo() {
+    netimpl = nullptr;
+}
 
-Layer::Layer(const LayerParams& params)
+LayerInfo::LayerInfo(const LayerParams& params)
     : blobs(params.blobs)
     , name(params.name)
     , type(params.type)
 {
-    preferableTarget = DNN_TARGET_CPU;
+    netimpl = nullptr;
 }
 
-void Layer::setParamsFrom(const LayerParams& params)
+LayerInfo::~LayerInfo() {}
+
+void LayerInfo::setParamsFrom(const LayerParams& params)
 {
     blobs = params.blobs;
     name = params.name;
     type = params.type;
 }
 
-int Layer::inputNameToIndex(String)
+int LayerInfo::inputNameToIndex(String)
 {
     return -1;
 }
 
-int Layer::outputNameToIndex(const String&)
+int LayerInfo::outputNameToIndex(const String&)
 {
     return 0;
+}
+
+Layer::Layer() {
+    netimpl = nullptr;
+    preferableTarget = DNN_TARGET_CPU;
+}
+
+Layer::Layer(const LayerParams& params)
+    : LayerInfo(params)
+{
+    preferableTarget = DNN_TARGET_CPU;
 }
 
 bool Layer::supportBackend(int backendId)
@@ -42,9 +58,30 @@ bool Layer::supportBackend(int backendId)
 }
 
 Ptr<BackendNode> Layer::initCUDA(
+        void* context,
+        const std::vector<Ptr<BackendWrapper>>& inputs,
+        const std::vector<Ptr<BackendWrapper>>& outputs)
+{
+#ifdef HAVE_CUDA
+    // Adapt the classic wrapper-based entry point to the array-based one, so ops ported to the
+    // new graph engine only need to override initCUDA(context, inputs, outputs) with UMat.
+    std::vector<UMat> inGpu(inputs.size()), outGpu(outputs.size());
+    for (size_t i = 0; i < inputs.size(); i++)
+        inGpu[i] = inputs[i].dynamicCast<CUDABackendWrapper>()->getDeviceUMat();
+    for (size_t i = 0; i < outputs.size(); i++)
+        outGpu[i] = outputs[i].dynamicCast<CUDABackendWrapper>()->getDeviceUMat();
+    return initCUDA(context, inGpu, outGpu);
+#else
+    CV_UNUSED(context); CV_UNUSED(inputs); CV_UNUSED(outputs);
+    CV_Error(Error::StsNotImplemented, "CUDA pipeline of " + type + " layers is not defined.");
+    return Ptr<BackendNode>();
+#endif
+}
+
+Ptr<BackendNode> Layer::initCUDA(
         void*,
-        const std::vector<Ptr<BackendWrapper>>&,
-        const std::vector<Ptr<BackendWrapper>>&)
+        InputArrayOfArrays,
+        InputArrayOfArrays)
 {
     CV_Error(Error::StsNotImplemented, "CUDA pipeline of " + type + " layers is not defined.");
     return Ptr<BackendNode>();
@@ -54,12 +91,6 @@ Ptr<BackendNode> Layer::initVkCom(const std::vector<Ptr<BackendWrapper> > &input
                                   std::vector<Ptr<BackendWrapper> > &outputs)
 {
     CV_Error(Error::StsNotImplemented, "VkCom pipeline of " + type + " layers is not defined.");
-    return Ptr<BackendNode>();
-}
-
-Ptr<BackendNode> Layer::initHalide(const std::vector<Ptr<BackendWrapper>>&)
-{
-    CV_Error(Error::StsNotImplemented, "Halide pipeline of " + type + " layers is not defined.");
     return Ptr<BackendNode>();
 }
 
@@ -93,20 +124,21 @@ Ptr<BackendNode> Layer::initCann(const std::vector<Ptr<BackendWrapper> > &inputs
     return Ptr<BackendNode>();
 }
 
-Ptr<BackendNode> Layer::tryAttach(const Ptr<BackendNode>& node)
-{
-    return Ptr<BackendNode>();
-}
-
 bool Layer::setActivation(const Ptr<ActivationLayer>&) { return false; }
 bool Layer::tryFuse(Ptr<Layer>&) { return false; }
-void Layer::getScaleShift(Mat& scale, Mat& shift) const
+
+void Layer::forwardCUDA(InputArrayOfArrays, OutputArrayOfArrays, void*)
+{
+    CV_Error(Error::StsNotImplemented, "CUDA forward of " + type + " layers is not defined.");
+}
+
+void LayerInfo::getScaleShift(Mat& scale, Mat& shift) const
 {
     scale = Mat();
     shift = Mat();
 }
 
-void Layer::getScaleZeropoint(float& scale, int& zeropoint) const
+void LayerInfo::getScaleZeropoint(float& scale, int& zeropoint) const
 {
     scale = 1.f;
     zeropoint = 0;
@@ -158,6 +190,10 @@ std::vector<Mat> Layer::finalize(const std::vector<Mat>& inputs)
     return outputs;
 }
 
+void Layer::prepackWeights()
+{
+}
+
 void Layer::forward(std::vector<Mat*>& input, std::vector<Mat>& output, std::vector<Mat>& internals)
 {
     // We kept this method for compatibility. DNN calls it now only to support users' implementations.
@@ -192,20 +228,32 @@ void Layer::forward_fallback(InputArrayOfArrays inputs_arr, OutputArrayOfArrays 
 
         inputs.resize(orig_inputs.size());
         for (size_t i = 0; i < orig_inputs.size(); i++)
-            orig_inputs[i].convertTo(inputs[i], CV_32F);
+            if (orig_inputs[i].depth() == CV_16F)
+                orig_inputs[i].convertTo(inputs[i], CV_32F);
+            else
+                inputs[i] = orig_inputs[i];
 
         outputs.resize(orig_outputs.size());
         for (size_t i = 0; i < orig_outputs.size(); i++)
-            outputs[i].create(shape(orig_outputs[i]), CV_32F);
+            if (orig_outputs[i].depth() == CV_16F)
+                outputs[i].create(shape(orig_outputs[i]), CV_32F);
+            else
+                outputs[i] = orig_outputs[i];
 
         internals.resize(orig_internals.size());
         for (size_t i = 0; i < orig_internals.size(); i++)
-            internals[i].create(shape(orig_internals[i]), CV_32F);
+            if (orig_internals[i].depth() == CV_16F)
+                internals[i].create(shape(orig_internals[i]), CV_32F);
+            else
+                internals[i] = orig_internals[i];
 
         forward(inputs, outputs, internals);
 
         for (size_t i = 0; i < outputs.size(); i++)
-            outputs[i].convertTo(orig_outputs[i], CV_16F);
+            if (orig_outputs[i].depth() == CV_16F)
+                outputs[i].convertTo(orig_outputs[i], CV_16F);
+            else
+                outputs[i] = orig_outputs[i];
 
         // sync results back
         outputs_arr.assign(orig_outputs);
@@ -239,15 +287,9 @@ void Layer::run(const std::vector<Mat>& inputs, std::vector<Mat>& outputs, std::
     this->forward(inputs, outputs, internals);
 }
 
-bool Layer::tryQuantize(const std::vector<std::vector<float>>& scales,
-        const std::vector<std::vector<int>>& zeropoints, LayerParams& params)
-{
-    return false;
-}
-
 Layer::~Layer() {}
 
-bool Layer::getMemoryShapes(const std::vector<MatShape>& inputs,
+bool LayerInfo::getMemoryShapes(const std::vector<MatShape>& inputs,
         const int requiredOutputs,
         std::vector<MatShape>& outputs,
         std::vector<MatShape>& internals) const
@@ -257,9 +299,138 @@ bool Layer::getMemoryShapes(const std::vector<MatShape>& inputs,
     return false;
 }
 
-bool Layer::updateMemoryShapes(const std::vector<MatShape>& inputs)
+void LayerInfo::getTypes(const std::vector<MatType>&inputs,
+                     const int requiredOutputs,
+                     const int requiredInternals,
+                     std::vector<MatType>&outputs,
+                     std::vector<MatType>&internals) const
+{
+    CV_Assert(inputs.size());
+    for (auto input : inputs)
+        CV_CheckType(input, input == CV_32F || input == CV_64F || input == CV_8S || input == CV_8U || input == CV_64S, "");
+
+    outputs.assign(requiredOutputs, inputs[0]);
+    internals.assign(requiredInternals, inputs[0]);
+}
+
+int LayerInfo::getLayouts(const std::vector<DataLayout>& actualInputs,
+                       std::vector<DataLayout>& desiredInputs,
+                       const int requiredOutputs,
+                       std::vector<DataLayout>& outputs) const
+{
+    desiredInputs.assign(actualInputs.size(), DATA_LAYOUT_UNKNOWN);
+    outputs.assign(requiredOutputs, DATA_LAYOUT_UNKNOWN);
+    return 0;
+}
+
+int64 LayerInfo::getFLOPS(const std::vector<MatShape>&,
+                      const std::vector<MatShape>&) const
+{
+    return 0;
+}
+
+bool LayerInfo::updateMemoryShapes(const std::vector<MatShape>& inputs)
 {
     return true;
+}
+
+std::vector<Ptr<Graph> >* LayerInfo::subgraphs() const
+{
+    return nullptr;
+}
+
+bool LayerInfo::alwaysSupportInplace() const
+{
+    return false;
+}
+
+bool LayerInfo::dynamicOutputShapes() const
+{
+    return false;
+}
+
+bool LayerInfo::isDataShuffling() const
+{
+    return false;
+}
+
+std::ostream& LayerInfo::dumpAttrs(std::ostream& strm, int) const
+{
+    return strm;
+}
+
+std::ostream& LayerInfo::dump(std::ostream& strm, int indent, bool comma) const
+{
+    CV_Assert(netimpl);
+    size_t ninputs = inputs.size();
+    size_t noutputs = outputs.size();
+    size_t nblobs = blobs.size();
+    const std::vector<Ptr<Graph> >* subgraphs_ = subgraphs();
+    size_t nsubgraphs = subgraphs_ ? subgraphs_->size() : 0;
+    Net::Impl* netimpl = getNetImpl(this);
+    int delta_indent = netimpl->dump_indent;
+    int subindent = indent + delta_indent;
+    int argindent = subindent + delta_indent;
+    prindent(strm, indent);
+    std::string opname = type;
+    strm << opname << " {\n";
+    prindent(strm, subindent);
+    strm << "name: \"" << name << "\",\n";
+
+    if (!blobs.empty()) {
+        prindent(strm, subindent);
+        strm << "blobs: [\n";
+        for (size_t i = 0; i < nblobs; i++) {
+            if (i > 0)
+                strm << ",\n";
+            const Mat& blob = blobs[i];
+            prindent(strm, argindent);
+            netimpl->dumpTypeShape(strm, blob.type(), blob.shape());
+        }
+        strm << "\n";
+        prindent(strm, subindent);
+        strm << "],\n";
+    }
+    dumpAttrs(strm, subindent);
+    prindent(strm, subindent);
+    strm << "inputs: [\n";
+    for (size_t i = 0; i < ninputs; i++) {
+        netimpl->dumpArg(strm, inputs[i], argindent, i+1 < ninputs, true);
+    }
+    prindent(strm, subindent);
+    strm << "],\n";
+    prindent(strm, subindent);
+    strm << "outputs: [\n";
+    for (size_t i = 0; i < noutputs; i++) {
+        netimpl->dumpArg(strm, outputs[i], argindent, i+1 < noutputs, true);
+    }
+    prindent(strm, subindent);
+    strm << "],\n";
+
+    if (nsubgraphs > 0) {
+        std::vector<std::string> names;
+        if (opname == "If")
+            names = {"then", "else"};
+        else if (opname == "Loop" || opname == "Scan")
+            names = {"body"};
+        else {
+            CV_Error(Error::StsError,
+                     format("unsupported operation '%s' with subgraphs",
+                            std::string(opname).c_str()));
+        }
+        CV_Assert(names.size() == nsubgraphs);
+        for (size_t i = 0; i < nsubgraphs; i++) {
+            prindent(strm, subindent);
+            strm << names[i] << ": ";
+            subgraphs_->at(i)->dump(strm, argindent, i+1 < nsubgraphs);
+        }
+    }
+    prindent(strm, indent);
+    strm << '}';
+    if (comma)
+        strm << ',';
+    strm << '\n';
+    return strm;
 }
 
 CV__DNN_INLINE_NS_END

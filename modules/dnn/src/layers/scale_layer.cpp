@@ -12,7 +12,6 @@ Implementation of Scale layer.
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_webnn.hpp"
@@ -84,7 +83,6 @@ public:
 #endif
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_HALIDE ||
                (backendId == DNN_BACKEND_WEBNN && axis >0);
     }
 
@@ -270,63 +268,6 @@ public:
     }
 #endif
 
-    virtual Ptr<BackendNode> tryAttach(const Ptr<BackendNode>& node) CV_OVERRIDE
-    {
-        switch (node->backendId)
-        {
-            case DNN_BACKEND_HALIDE:
-            {
-#ifdef HAVE_HALIDE
-                auto base = node.dynamicCast<HalideBackendNode>();
-                Halide::Func& input = base->funcs.back();
-                Halide::Var x("x"), y("y"), c("c"), n("n");
-                Halide::Func top = attachHalide(input(x, y, c, n));
-                return Ptr<BackendNode>(new HalideBackendNode(base, top));
-#endif  // HAVE_HALIDE
-                break;
-            }
-        }
-        return Ptr<BackendNode>();
-    }
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        Halide::Buffer<float> input = halideBuffer(inputs[0]);
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = attachHalide(input(x, y, c, n));
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
-
-#ifdef HAVE_HALIDE
-    // attachHalide can work both with Halide::Buffer and Halide::Func. In the
-    // second case it will be a fusion.
-    Halide::Func attachHalide(const Halide::Expr& input)
-    {
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-
-        const int numChannels = blobs[0].total();
-
-        Halide::Expr topExpr = input;
-        if (hasWeights)
-        {
-            auto weights = wrapToHalideBuffer(blobs[0], {numChannels});
-            topExpr *= weights(c);
-        }
-        if (hasBias)
-        {
-            auto bias = wrapToHalideBuffer(blobs.back(), {numChannels});
-            topExpr += bias(c);
-        }
-        top(x, y, c, n) = topExpr;
-        return top;
-    }
-#endif  // HAVE_HALIDE
-
-
 #ifdef HAVE_DNN_NGRAPH
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE
     {
@@ -417,14 +358,6 @@ public:
     {
         scale = (hasWeights && !blobs.empty()) ? blobs[0] : Mat();
         shift = (hasBias && !blobs.empty()) ? blobs.back() : Mat();
-    }
-
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        params.set("input_scales", DictValue::arrayReal(scales[0].data(), scales[0].size()));
-        params.set("input_zeropoints", DictValue::arrayInt(zeropoints[0].data(), zeropoints[0].size()));
-        return true;
     }
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,

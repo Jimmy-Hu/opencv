@@ -83,7 +83,9 @@ static MixChannelsFunc getMixchFunc(int depth)
     {
         mixChannels8u, mixChannels8u, mixChannels16u,
         mixChannels16u, mixChannels32s, mixChannels32s,
-        mixChannels64s, 0
+        mixChannels64s, mixChannels16u, mixChannels16u,
+        mixChannels8u, mixChannels64s, mixChannels64s,
+        mixChannels32s, mixChannels8u, mixChannels8u
     };
 
     return mixchTab[depth];
@@ -112,9 +114,15 @@ void cv::mixChannels( const Mat* src, size_t nsrcs, Mat* dst, size_t ndsts, cons
     int *sdelta = (int*)(tab + npairs*4), *ddelta = sdelta + npairs;
 
     for( i = 0; i < nsrcs; i++ )
+    {
+        CV_Assert( !src[i].empty() && src[i].size == dst[0].size && src[i].depth() == depth );
         arrays[i] = &src[i];
+    }
     for( i = 0; i < ndsts; i++ )
+    {
+        CV_Assert( !dst[i].empty() && dst[i].size == dst[0].size && dst[i].depth() == depth );
         arrays[i + nsrcs] = &dst[i];
+    }
     ptrs[nsrcs + ndsts] = 0;
 
     for( i = 0; i < npairs; i++ )
@@ -430,7 +438,10 @@ void cv::extractChannel(InputArray _src, OutputArray _dst, int coi)
     if (ocl::isOpenCLActivated() && _src.dims() <= 2 && _dst.isUMat())
     {
         UMat src = _src.getUMat();
-        _dst.create(src.dims, &src.size[0], depth);
+        // NB: fetch the source before (re)allocating the destination so that
+        // in-place operation (_src and _dst referencing the same array) keeps
+        // the multi-channel source alive while dst is reshaped to 1 channel.
+        _dst.createSameSize(_src, depth);
         UMat dst = _dst.getUMat();
         mixChannels(std::vector<UMat>(1, src), std::vector<UMat>(1, dst), ch, 1);
         return;
@@ -438,7 +449,7 @@ void cv::extractChannel(InputArray _src, OutputArray _dst, int coi)
 #endif
 
     Mat src = _src.getMat();
-    _dst.create(src.dims, &src.size[0], depth);
+    _dst.createSameSize(_src, depth);
     Mat dst = _dst.getMat();
 
     CV_IPP_RUN_FAST(ipp_extractChannel(src, dst, coi))

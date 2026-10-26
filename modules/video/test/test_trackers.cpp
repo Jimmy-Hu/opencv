@@ -53,17 +53,6 @@ TEST_P(DistanceAndOverlap, Scaled_Data_MIL)
     test.run(numFramesLimit);
 }
 
-TEST_P(DistanceAndOverlap, GOTURN)
-{
-    std::string model = cvtest::findDataFile("dnn/gsoc2016-goturn/goturn.prototxt");
-    std::string weights = cvtest::findDataFile("dnn/gsoc2016-goturn/goturn.caffemodel", false);
-    cv::TrackerGOTURN::Params params;
-    params.modelTxt = model;
-    params.modelBin = weights;
-    TrackerTest<Tracker, Rect> test(TrackerGOTURN::create(params), dataset, 35, .35f, NoTransform);
-    test.run(numFramesLimit);
-}
-
 INSTANTIATE_TEST_CASE_P(Tracking, DistanceAndOverlap,
     testing::Combine(
         TESTSET_NAMES,
@@ -126,18 +115,6 @@ static void checkTrackingAccuracy(cv::Ptr<Tracker>& tracker, double iouThreshold
     }
 }
 
-TEST(GOTURN, accuracy)
-{
-    std::string model = cvtest::findDataFile("dnn/gsoc2016-goturn/goturn.prototxt");
-    std::string weights = cvtest::findDataFile("dnn/gsoc2016-goturn/goturn.caffemodel", false);
-    cv::TrackerGOTURN::Params params;
-    params.modelTxt = model;
-    params.modelBin = weights;
-    cv::Ptr<Tracker> tracker = TrackerGOTURN::create(params);
-    // TODO! GOTURN have low accuracy. Try to remove this api at 5.x.
-    checkTrackingAccuracy(tracker, 0.08);
-}
-
 TEST(DaSiamRPN, accuracy)
 {
     std::string model = cvtest::findDataFile("dnn/onnx/models/dasiamrpn_model.onnx", false);
@@ -182,6 +159,46 @@ TEST(vittrack, accuracy_vittrack)
     params.net = model;
     cv::Ptr<Tracker> tracker = TrackerVit::create(params);
     checkTrackingAccuracy(tracker, 0.64);
+}
+
+TEST(vittrack, bbox_inside_image)
+{
+    std::string model = cvtest::findDataFile("dnn/onnx/models/vitTracker.onnx");
+    cv::TrackerVit::Params params;
+    params.net = model;
+    cv::Ptr<Tracker> tracker = TrackerVit::create(params);
+
+    Mat img0 = imread(findDataFile("tracking/bag/00000001.jpg"), 1);
+    cv::Rect imgRect(0, 0, img0.cols, img0.rows);
+    cv::Rect roi = imgRect;
+    tracker->init(img0, roi);
+
+    for (int i = 2; i <= 6; i++)
+    {
+        Mat img = imread(findDataFile(cv::format("tracking/bag/%08d.jpg", i)), 1);
+        bool res = tracker->update(img, roi);
+        ASSERT_TRUE(res);
+        ASSERT_EQ(roi & imgRect, roi) << cv::format("Fail at img %d.", i);
+    }
+}
+
+TEST(vittrack, bbox_inside_tiny_image)
+{
+    std::string model = cvtest::findDataFile("dnn/onnx/models/vitTracker.onnx");
+    cv::TrackerVit::Params params;
+    params.net = model;
+    params.tracking_score_threshold = 0.f;
+    cv::Ptr<Tracker> tracker = TrackerVit::create(params);
+
+    Mat img;
+    resize(imread(findDataFile("tracking/bag/00000001.jpg"), 1), img, Size(5, 5));
+    cv::Rect imgRect(0, 0, img.cols, img.rows);
+    cv::Rect roi = imgRect;
+    tracker->init(img, roi);
+
+    bool res = tracker->update(img, roi);
+    ASSERT_TRUE(res);
+    ASSERT_EQ(roi & imgRect, roi);
 }
 
 }}  // namespace opencv_test::

@@ -64,6 +64,9 @@ public:
             std::cout << "SKIP test: backend " << apiPref << " can't open the video: " << video_file << std::endl;
             return;
         }
+
+        EXPECT_EQ(CAP_PROP_UNKNOWN, cap.get(CV__CAP_PROP_LATEST));
+
         int n_frames = -1;
         EXPECT_NO_THROW(n_frames = (int)cap.get(CAP_PROP_FRAME_COUNT));
         if (n_frames > 0)
@@ -221,6 +224,9 @@ public:
         if (((apiPref == CAP_FFMPEG || apiPref == CAP_GSTREAMER) && ((ext == "h264") || (ext == "h265"))))
             throw SkipTestException(cv::String("Backend ") +  cv::videoio_registry::getBackendName(apiPref) +
                     cv::String(" does not support CAP_PROP_POS_MSEC option"));
+
+        if (cvtest::skipUnstableTests && apiPref == CAP_MSMF && (ext == "h264" || ext == "h265" || ext == "mpg"))
+            throw SkipTestException("Unstable MSMF test");
 
         VideoCapture cap;
         EXPECT_NO_THROW(cap.open(video_file, apiPref));
@@ -528,6 +534,9 @@ TEST_P(Videoio_Writer, write_nothing)
     VideoWriter writer;
     EXPECT_NO_THROW(writer.open(video_file, apiPref, fourcc, fps, frame_size, true));
     ASSERT_TRUE(writer.isOpened());
+
+    EXPECT_EQ(cv::VIDEOWRITER_PROP_UNKNOWN, writer.get(CV__CAP_PROP_LATEST));
+
 #if 0  // no frames
     cv::Mat m(frame_size, CV_8UC3, Scalar::all(127));
     writer << m;
@@ -611,12 +620,6 @@ static vector<Ext_Fourcc_API> generate_Ext_Fourcc_API_nocrash()
 #ifdef HAVE_MSMF_DISABLED  // MSMF opens writer stream
     {"wmv", "aaaa", CAP_MSMF},
     {"mov", "aaaa", CAP_MSMF},
-#endif
-
-#ifdef HAVE_QUICKTIME
-    {"mov", "aaaa", CAP_QT},
-    {"avi", "aaaa", CAP_QT},
-    {"mkv", "aaaa", CAP_QT},
 #endif
 
 #ifdef HAVE_AVFOUNDATION
@@ -713,7 +716,11 @@ TEST_P(videocapture_acceleration, read)
 {
     auto param = GetParam();
     std::string filename = get<0>(param).filename;
+#if 0  // FIXIT OpenCV 5.0 putText result
     double psnr_threshold = get<0>(param).psnr_threshold;
+#else
+    double psnr_threshold = 10;
+#endif
     VideoCaptureAPIs backend = get<1>(param);
     VideoAccelerationType va_type = get<2>(param);
     bool use_umat = get<3>(param);

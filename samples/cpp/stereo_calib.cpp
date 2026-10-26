@@ -20,10 +20,13 @@
      GitHub:        https://github.com/opencv/opencv/
    ************************************************** */
 
-#include "opencv2/calib3d.hpp"
+#include "opencv2/geometry.hpp"
+#include "opencv2/stereo.hpp"
+#include "opencv2/calib.hpp"
 #include "opencv2/imgcodecs.hpp"
 #include "opencv2/highgui.hpp"
 #include "opencv2/imgproc.hpp"
+#include "opencv2/objdetect.hpp"
 #include "opencv2/objdetect/charuco_detector.hpp"
 
 #include <vector>

@@ -41,7 +41,7 @@ static void broadcast1D2TargetMat(Mat& data, const MatShape& targetShape, int ax
 static void block_repeat(InputArray src, const MatShape& srcShape, int axis, int repetitions, OutputArray dst)
 {
     CV_Assert(src.getObj() != dst.getObj());
-    CV_Check(axis, axis >= 0 && axis < src.dims(), "Axis out of range");
+    CV_Check(axis, axis >= 0 && (axis < src.dims() || (src.dims()==1 && axis==1)), "axis is out of range"); // (src.dims()==1 && axis==1) has been added as a temporary fix for quantized models. Refer issue https://github.com/opencv/opencv_zoo/issues/273
     CV_CheckGT(repetitions, 1, "More than one repetition expected");
 
     Mat src_mat = src.getMat();
@@ -138,6 +138,7 @@ class QuantizeLayerImpl CV_FINAL : public QuantizeLayer
 public:
     int axis;
     int block_size;
+    int outDepth;  // CV_8S (legacy default) or CV_8U; driven by ONNX y_zero_point dtype
     bool is1D;
     Mat scalesMat, zeropointsMat; // Saving the broadcasted scales data.
     bool quantParamExternal = true;  // Indicates if the quantization parameters (scale and zero point) are provided as inputs to the node.
@@ -147,6 +148,7 @@ public:
         is1D = params.get<bool>("is1D", false);
         axis = params.get<int>("axis", 1);
         block_size = params.get<int>("block_size", 0);
+        outDepth = params.get<int>("depth", CV_8S);
 
         if (!is1D)
         {
@@ -185,9 +187,20 @@ public:
                          std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_Check(inputs.size(), inputs.size() >= 1 && inputs.size() <= 3, "Number of inputs must be between 1 and 3 inclusive.");
-        Layer::getMemoryShapes(inputs, requiredOutputs, outputs, internals);
+        CV_Assert(requiredOutputs <= 1);
+        outputs.assign(1, inputs[0]);
         return false;
     }
+
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        outputs.assign(requiredOutputs, outDepth);
+    }
+
 
     virtual void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr) CV_OVERRIDE
     {
@@ -218,7 +231,7 @@ public:
             inputs[0] = inputFp32;  // replace
         }
 
-        inputs[0].convertTo(outputs[0], CV_8S, 1.f/scales[0], zeropoints[0]);
+        inputs[0].convertTo(outputs[0], outDepth, 1.f/scales[0], zeropoints[0]);
         return true;
     }
 #endif
@@ -252,8 +265,8 @@ public:
             }
         }
 
-        if (outputs[0].depth() != CV_8S)
-            outputs[0].convertTo(outputs[0], CV_8S);
+        if (outputs[0].depth() != outDepth)
+            outputs[0].convertTo(outputs[0], outDepth);
     }
 
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
@@ -276,10 +289,10 @@ public:
             divide(inputs[0], scalesMat, inputTmp);
             add(inputTmp, zeropointsMat, inputTmp);
 
-            inputTmp.convertTo(outputs[0], CV_8S);
+            inputTmp.convertTo(outputs[0], outDepth);
         }
         else
-            inputs[0].convertTo(outputs[0], CV_8S, 1.f/scales[0], zeropoints[0]);
+            inputs[0].convertTo(outputs[0], outDepth, 1.f/scales[0], zeropoints[0]);
     }
 
 #ifdef HAVE_DNN_NGRAPH
@@ -346,9 +359,23 @@ public:
                          std::vector<MatShape> &internals) const CV_OVERRIDE
     {
         CV_Check(inputs.size(), inputs.size() >= 1 && inputs.size() <= 3, "Number of inputs must be between 1 and 3 inclusive.");
-        Layer::getMemoryShapes(inputs, requiredOutputs, outputs, internals);
+        CV_Assert(requiredOutputs <= 1);
+        outputs.assign(1, inputs[0]);
         return false;
     }
+
+    void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        if (preferableTarget == DNN_TARGET_OPENCL_FP16)
+            outputs.assign(requiredOutputs, CV_16F);
+        else
+            outputs.assign(requiredOutputs, CV_32F);
+    }
+
 
     virtual void finalize(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr) CV_OVERRIDE
     {

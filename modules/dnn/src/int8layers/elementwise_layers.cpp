@@ -18,8 +18,6 @@ namespace dnn
 class ActivationLayerInt8Impl CV_FINAL : public ActivationLayerInt8
 {
 public:
-    int input_zp, output_zp;
-    float input_sc, output_sc;
     float slope = 0.0f;
 
 #ifdef HAVE_TIMVX
@@ -30,20 +28,30 @@ public:
         setParamsFrom(params);
         activationLUT = !blobs.empty() ? blobs[0] : Mat();
 
-        input_zp = params.get<int>("input_zeropoint");
-        input_sc = params.get<float>("input_scale");
-        output_zp = params.get<int>("zeropoints");
-        output_sc = params.get<float>("scales");
+        input_zp = params.get<int>("input_zeropoint", 0);
+        input_sc = params.get<float>("input_scale", 1.0f);
+        output_zp = params.get<int>("zeropoints", 0);
+        output_sc = params.get<float>("scales", 1.0f);
 
         if (params.has("slope"))
         {
             slope = params.get<float>("slope");
         }
+    }
+
+    ActivationLayerInt8Impl(const ActivationInt8Params &p)
+    {
+        name = p.name;
+        type = p.activationType;
+        input_sc = p.input_sc;
+        input_zp = p.input_zp;
+        output_sc = p.output_sc;
+        output_zp = p.output_zp;
+        activationLUT = p.activationLUT;
 
 #ifdef HAVE_TIMVX
         tvActType = getTimVXActType(type);
 #endif
-
     }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
@@ -299,9 +307,23 @@ public:
                 const int nstripes = getNumThreads();
                 Mat &dst = outputs[i];
                 CV_Assert(src.size == dst.size && src.type() == dst.type() &&
-                          src.isContinuous() && dst.isContinuous() && src.type() == CV_8S);
+                          src.isContinuous() && dst.isContinuous() &&
+                          (src.type() == CV_8S || src.type() == CV_8U));
 
-                Activation::run(src, activationLUT, dst, nstripes);
+                if (src.type() == CV_8S) {
+                    Activation::run(src, activationLUT, dst, nstripes);
+                } else {
+                    const uint8_t* table = activationLUT.ptr<uint8_t>();
+                    const uint8_t* srcptr = src.ptr<uint8_t>();
+                    uint8_t* dstptr = dst.ptr<uint8_t>();
+                    int total = (int)src.total();
+                    parallel_for_(Range(0, nstripes), [&](const Range& r) {
+                        int start = (int)((size_t)r.start * total / nstripes);
+                        int end   = (int)((size_t)r.end   * total / nstripes);
+                        for (int j = start; j < end; j++)
+                            dstptr[j] = table[srcptr[j]];
+                    }, nstripes);
+                }
             }
             else
             {
@@ -355,10 +377,14 @@ public:
 
     }
 
-    Mat activationLUT;
 };
 
 Ptr<ActivationLayerInt8> ActivationLayerInt8::create(const LayerParams& params)
+{
+    return Ptr<ActivationLayerInt8>(new ActivationLayerInt8Impl(params));
+}
+
+Ptr<ActivationLayerInt8> ActivationLayerInt8::create(const ActivationInt8Params& params)
 {
     return Ptr<ActivationLayerInt8>(new ActivationLayerInt8Impl(params));
 }

@@ -22,12 +22,13 @@ public:
     {
         setParamsFrom(params);
 
-        input_sc = params.get<float>("input_scale");
-        input_zp = params.get<int>("input_zeropoint");
-        output_zp = params.get<int>("zeropoints");
-        output_sc = params.get<float>("scales");
+        input_sc = params.get<float>("input_scale", 1.0f);
+        input_zp = params.get<int>("input_zeropoint", 0);
+        output_zp = params.get<int>("zeropoints", 0);
+        output_sc = params.get<float>("scales", 1.0f);
         axis = params.get<int>("axis", 1);
         per_channel = params.get<bool>("per_channel", true);
+        output_type = CV_8S; // default, may be overridden by fusion code
 
         if (blobs.size() == 3)
         {
@@ -40,6 +41,42 @@ public:
             CV_Assert(blobs[0].dims >= 2 && (size_t)(innerSize * numOutput) == blobs[0].total());
             CV_Assert((size_t)numOutput == blobs[1].total());
 
+            weightsMat = blobs[0] = blobs[0].reshape(1, numOutput);
+            int vecsize = weightsMat.cols;
+            if (vecsize % VEC_ALIGN != 0)
+            {
+                int vecsize_aligned = (int)alignSize(vecsize, VEC_ALIGN);
+                Mat weightsBuf(weightsMat.rows, vecsize_aligned, weightsMat.type());
+                Mat wpadding = weightsBuf.colRange(vecsize, vecsize_aligned);
+                wpadding.setTo(Scalar::all(0));
+                weightsMat = weightsBuf.colRange(0, vecsize);
+                blobs[0].copyTo(weightsMat);
+            }
+            biasMat = blobs[1] = blobs[1].reshape(1, 1);
+            outputMultiplier = blobs[2];
+        }
+    }
+
+    FullyConnectedLayerInt8Impl(const InnerProductInt8Params& p)
+    {
+        name = p.name;
+        type = "InnerProductInt8";
+        input_sc = p.input_sc;
+        input_zp = p.input_zp;
+        output_sc = p.output_sc;
+        output_zp = p.output_zp;
+        axis = p.axis;
+        per_channel = p.per_channel;
+        output_type = p.output_type;
+
+        if (!p.weights.empty()) {
+            int numOutput = p.num_output;
+            int innerSize = (int)p.weights.total() / numOutput;
+
+            CV_Assert(p.weights.dims >= 2 && (size_t)(innerSize * numOutput) == p.weights.total());
+            CV_Assert((size_t)numOutput == p.bias.total());
+
+            blobs = { p.weights.clone(), p.bias.clone(), p.outputMultiplier.clone() };
             weightsMat = blobs[0] = blobs[0].reshape(1, numOutput);
             int vecsize = weightsMat.cols;
             if (vecsize % VEC_ALIGN != 0)
@@ -75,6 +112,16 @@ public:
 
         outputs.resize(1, outShape);
         return false;
+    }
+
+    void getTypes(const std::vector<MatType>& inputs,
+                  const int requiredOutputs,
+                  const int requiredInternals,
+                  std::vector<MatType>& outputs,
+                  std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        outputs.assign(requiredOutputs, output_type);
+        internals.clear();
     }
 
     virtual bool supportBackend(int backendId) CV_OVERRIDE
@@ -383,14 +430,22 @@ public:
 
         int axisCan = normalize_axis(axis, input[0].dims);
         int outerSize = input[0].total(0, axisCan);
-        Mat srcMat = input[0].reshape(1, outerSize);
+        Mat srcMat0 = input[0].reshape(1, outerSize);
+        Mat srcMat;
+        if (srcMat0.type() == CV_8U) {
+            // Convert uint8 to int8 by subtracting 128.
+            // Zero-point was adjusted at fusion time to compensate.
+            srcMat0.convertTo(srcMat, CV_8S, 1, -128);
+        } else {
+            srcMat = srcMat0;
+        }
 
         Mat dstMat = output[0].reshape(1, outerSize);
         Mat dstMatInt32= Mat(shape(dstMat), CV_32S);
 
-        const int nstripes = getNumThreads();
+        const int nstripes = outerSize <= 4 ? 1 : getNumThreads();
         FullyConnected::run(srcMat, weightsMat, biasMat, outputMultiplier, activationLUT, dstMatInt32, activ.get(), nstripes, output_zp);
-        dstMatInt32.convertTo(dstMat, CV_8S);
+        dstMatInt32.convertTo(dstMat, output_type);
     }
 
     virtual int64 getFLOPS(const std::vector<MatShape> &inputs,
@@ -485,6 +540,11 @@ public:
 };
 
 Ptr<InnerProductLayerInt8> InnerProductLayerInt8::create(const LayerParams& params)
+{
+    return Ptr<InnerProductLayerInt8>(new FullyConnectedLayerInt8Impl(params));
+}
+
+Ptr<InnerProductLayerInt8> InnerProductLayerInt8::create(const InnerProductInt8Params& params)
 {
     return Ptr<InnerProductLayerInt8>(new FullyConnectedLayerInt8Impl(params));
 }

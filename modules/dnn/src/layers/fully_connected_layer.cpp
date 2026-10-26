@@ -43,7 +43,6 @@
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../op_inf_engine.hpp"
 #include "../ie_ngraph.hpp"
 #include "../op_webnn.hpp"
@@ -168,10 +167,11 @@ public:
             cAxis = normalize_axis(axis, inputsTmp[0]);
         }
 
-        MatShape outShape(cAxis + 1);
+        MatShape outShape((!inputs[0].empty()) ? cAxis + 1 : cAxis);
         for (int i = 0; i < cAxis; ++i)
             outShape[i] = inputsTmp[0][i];
-        outShape.back() = numOutput;
+        if (!inputs[0].empty())
+            outShape.back() = numOutput;
 
         outputs.resize(1, outShape);
         return false;
@@ -182,7 +182,6 @@ public:
         bool tranAorB = transA || transB;
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               (backendId == DNN_BACKEND_HALIDE && haveHalide() && axis == 1 && !tranAorB) ||
                (backendId == DNN_BACKEND_WEBNN && axis == 1 && !tranAorB) ||
                backendId == DNN_BACKEND_CANN ||
                backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
@@ -680,7 +679,7 @@ public:
             CV_Assert(!weightsMat.empty());
             Mat wm;
             weightsMat.copyTo(wm); // to handle the case of isContinuous() == false
-            wm = wm.reshape(1, blobs[0].dims, blobs[0].size);
+            wm = wm.reshape(1, blobs[0].size);
             vkBlobs.push_back(wm.t());
 
             Ptr<VkComBackendWrapper> inputWrap = inputs[0].dynamicCast<VkComBackendWrapper>();
@@ -703,31 +702,6 @@ public:
         return Ptr<BackendNode>(new VkComBackendNode(inputs, op, outputs));
     }
 #endif
-
-
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &inputs) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        int inW, inH, inC, inN, outC = blobs[0].size[0];
-        Halide::Buffer<float> inputBuffer = halideBuffer(inputs[0]);
-        getCanonicalSize(inputBuffer, &inW, &inH, &inC, &inN);
-        auto weights = wrapToHalideBuffer(blobs[0], {inW, inH, inC, outC});
-
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::RDom r(0, inW, 0, inH, 0, inC);
-        Halide::Expr topExpr = sum(inputBuffer(r.x, r.y, r.z, n) *
-                                   weights(r.x, r.y, r.z, c));
-        if (bias)
-        {
-            Halide::Buffer<float> bias = wrapToHalideBuffer(blobs[1], {outC});
-            topExpr += bias(c);
-        }
-        top(x, y, c, n) = topExpr;
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
-        return Ptr<BackendNode>();
-    }
 
 #ifdef HAVE_CANN
     virtual Ptr<BackendNode> initCann(const std::vector<Ptr<BackendWrapper> > &inputs,
@@ -830,57 +804,6 @@ public:
         return Ptr<BackendNode>(new InfEngineNgraphNode(matmul));
     }
 #endif  // HAVE_DNN_NGRAPH
-
-    bool tryQuantize(const std::vector<std::vector<float> > &scales,
-                     const std::vector<std::vector<int> > &zeropoints, LayerParams& params) CV_OVERRIDE
-    {
-        if (blobs.empty())
-            return false;
-
-        int numOutput = blobs[0].size[0];
-        float inputScale = scales[0][0], outputScale = scales[1][0];
-        int inputZp = zeropoints[0][0];
-
-        Mat weightsQuantized(weightsMat.rows, weightsMat.cols, CV_8S);
-        Mat biasQuantized(1, numOutput, CV_32S);
-        Mat outputMultiplier(1, numOutput, CV_32F);
-        bool perChannel = params.get<bool>("per_channel", true);
-
-        if (perChannel) // per-Channel quantization.
-        {
-            for (int i = 0; i < numOutput; i++)
-            {
-                double weightsScale = getWeightScale(weightsMat.row(i));
-
-                weightsMat.row(i).convertTo(weightsQuantized.row(i), CV_8S, 1.f/weightsScale);
-                float biasScale = inputScale * weightsScale;
-                biasQuantized.at<int>(i) = cvRound(biasMat.at<float>(i)/biasScale) - inputZp*(cv::sum(weightsQuantized.row(i))[0]);
-                outputMultiplier.at<float>(i) = biasScale / outputScale;
-            }
-        }
-        else // per-Tensor quantization.
-        {
-            double weightsScale = getWeightScale(weightsMat);
-
-            weightsMat.convertTo(weightsQuantized, CV_8S, 1.f/weightsScale);
-            float biasScale = inputScale * weightsScale;
-
-            for (int i = 0; i < numOutput; i++)
-            {
-                biasQuantized.at<int>(i) = cvRound(biasMat.at<float>(i)/biasScale) - inputZp*(cv::sum(weightsQuantized.row(i))[0]);
-                outputMultiplier.at<float>(i) = biasScale / outputScale;
-            }
-        }
-
-        params.blobs.clear();
-        params.set("per_channel", perChannel);
-        params.blobs.push_back(weightsQuantized.reshape(1, shape(blobs[0])));
-        params.blobs.push_back(biasQuantized);
-        params.blobs.push_back(outputMultiplier);
-        params.set("input_scale", inputScale);
-        params.set("input_zeropoint", inputZp);
-        return true;
-    }
 
 #ifdef HAVE_WEBNN
     virtual Ptr<BackendNode> initWebnn(const std::vector<Ptr<BackendWrapper> >& inputs, const std::vector<Ptr<BackendNode> >& nodes) CV_OVERRIDE

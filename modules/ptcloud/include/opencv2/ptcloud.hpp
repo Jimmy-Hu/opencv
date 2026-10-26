@@ -1,0 +1,602 @@
+// This file is part of OpenCV project.
+// It is subject to the license terms in the LICENSE file found in the top-level directory
+// of this distribution and at http://opencv.org/license.html
+
+#ifndef POINT_CLOUD_MODULE_HPP
+#define POINT_CLOUD_MODULE_HPP
+
+#include "opencv2/core.hpp"
+#include "opencv2/ptcloud/depth.hpp"
+#include "opencv2/ptcloud/volume.hpp"
+#include "opencv2/ptcloud/odometry.hpp"
+#include "opencv2/ptcloud/odometry_frame.hpp"
+#include "opencv2/ptcloud/odometry_settings.hpp"
+#include "opencv2/ptcloud/slam.hpp"
+#include "opencv2/ptcloud/viz3d.hpp"
+
+/**
+@defgroup ptcloud Point Cloud Processing
+
+Point-cloud and mesh processing: reading/writing point clouds and meshes,
+triangle rasterization, octree partitioning, and RGB-D / volumetric 3D
+reconstruction (odometry, TSDF volumes).
+
+@{
+    @defgroup ptcloud_rgbd RGB-D and Volumetric Reconstruction
+@}
+*/
+
+//! @addtogroup ptcloud
+//! @{
+
+namespace cv {
+
+/** @brief Loads a point cloud from a file.
+ *
+ * The function loads point cloud from the specified file and returns it.
+ * If the cloud cannot be read, throws an error.
+ * Vertex coordinates, normals and colors are returned as they are saved in the file
+ * even if these arrays have different sizes and their elements do not correspond to each other
+ * (which is typical for OBJ files for example)
+ *
+ * Currently, the following file formats are supported:
+ * -  [Wavefront obj file *.obj](https://en.wikipedia.org/wiki/Wavefront_.obj_file)
+ * -  [Polygon File Format *.ply](https://en.wikipedia.org/wiki/PLY_(file_format))
+ *
+ * @param filename Name of the file
+ * @param vertices vertex coordinates, each value contains 3 floats
+ * @param normals per-vertex normals, each value contains 3 floats
+ * @param rgb per-vertex colors, each value contains 3 floats
+ */
+CV_EXPORTS_W void loadPointCloud(const String &filename, OutputArray vertices, OutputArray normals = noArray(), OutputArray rgb = noArray());
+
+/** @brief Saves a point cloud to a specified file.
+ *
+ * The function saves point cloud to the specified file.
+ * File format is chosen based on the filename extension.
+ *
+ * @param filename Name of the file
+ * @param vertices vertex coordinates, each value contains 3 floats
+ * @param normals per-vertex normals, each value contains 3 floats
+ * @param rgb per-vertex colors, each value contains 3 floats
+ */
+CV_EXPORTS_W void savePointCloud(const String &filename, InputArray vertices, InputArray normals = noArray(), InputArray rgb = noArray());
+
+/** @brief Removes statistical outliers from a point cloud.
+ *
+ * For each point the mean distance to its @p meanK nearest neighbors is computed. Points whose
+ * mean distance exceeds `global_mean + stddevMulThresh * global_stddev` are treated as outliers
+ * and dropped. This targets sparse noise scattered around the surface.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param outputCloud Output filtered point cloud, Nx1 CV_32FC3.
+ * @param meanK Number of nearest neighbors used to estimate the mean distance of each point.
+ * @param stddevMulThresh Standard-deviation multiplier for the distance threshold.
+ * @param keptIndices Optional output, indices (CV_32S) into the input cloud of the points that were kept.
+ */
+CV_EXPORTS_W void removeStatisticalOutliers(InputArray inputCloud, OutputArray outputCloud,
+        int meanK = 20, double stddevMulThresh = 2.0, OutputArray keptIndices = noArray());
+
+/** @brief Removes radius outliers from a point cloud.
+ *
+ * Any point that has fewer than @p minNeighbors other points within @p radius is treated as an
+ * isolated outlier and dropped.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param outputCloud Output filtered point cloud, Nx1 CV_32FC3.
+ * @param radius Search radius.
+ * @param minNeighbors Minimum number of neighbors (not counting the point itself) required to keep a point.
+ * @param keptIndices Optional output, indices (CV_32S) into the input cloud of the points that were kept.
+ */
+CV_EXPORTS_W void removeRadiusOutliers(InputArray inputCloud, OutputArray outputCloud,
+        double radius, int minNeighbors = 16, OutputArray keptIndices = noArray());
+
+/** @brief Flips point-cloud normals so that they face a given viewpoint.
+ *
+ * Each normal whose direction points away from @p viewpoint is negated. Useful when the sensor
+ * position is known. Estimate the normals first with cv::normalEstimate.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param normals Per-point normals to orient in place, Nx1 CV_32FC3 (as from cv::normalEstimate).
+ * @param viewpoint Point the normals should face towards (e.g. the camera center).
+ */
+CV_EXPORTS_W void orientNormals(InputArray inputCloud, InputOutputArray normals, const Point3f& viewpoint);
+
+/** @brief Orients point-cloud normals consistently across the whole cloud.
+ *
+ * Builds a Riemannian graph over the k nearest neighbors (edge weight 1 - |n_i . n_j|), computes
+ * its minimum spanning tree with cv::buildMST, and propagates a consistent sign along the tree
+ * from a seed point (Hoppe et al. 1992). If the neighbor graph is disconnected the normals are
+ * oriented outward about the centroid instead. Estimate the normals first with cv::normalEstimate.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param normals Per-point normals to orient in place, Nx1 CV_32FC3 (as from cv::normalEstimate).
+ * @param k Number of nearest neighbors used to build the graph.
+ */
+CV_EXPORTS_W void orientNormalsConsistent(InputArray inputCloud, InputOutputArray normals, int k = 30);
+
+/** @brief Estimates the median spacing between neighboring points of a point cloud.
+ *
+ * Returns the median distance from a sampled set of points to their nearest neighbor. Useful for
+ * picking a ball radius for cv::createMeshBPA.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @return Median nearest-neighbor distance, or 0 if the cloud has fewer than 2 points.
+ */
+CV_EXPORTS_W float estimateMedianSpacing(InputArray inputCloud);
+
+/** @brief Reconstructs a triangle mesh from an oriented point cloud using Ball-Pivoting.
+ *
+ * Implements the Ball-Pivoting Algorithm @cite Bernardini1999 : a ball of a given radius is
+ * rolled over the points; whenever it rests on three points without containing any other, those
+ * points form a triangle. Several radii are used in ascending order so larger balls bridge the
+ * gaps left by smaller ones. The algorithm is interpolating — the mesh vertices are the input
+ * points — so estimate and orient the normals first (cv::normalEstimate, cv::orientNormalsConsistent).
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param normals Per-point normals, Nx1 CV_32FC3 (same count as the cloud).
+ * @param vertices Output mesh vertices (a copy of the input points), Nx1 CV_32FC3.
+ * @param triangles Output triangle vertex indices, Mx3 CV_32S.
+ * @param radii Optional ball radii (1D CV_32F/CV_64F). If empty, radii are derived from
+ *              cv::estimateMedianSpacing as {1x, 2x, 4x} the median spacing.
+ */
+CV_EXPORTS_W void createMeshBPA(InputArray inputCloud, InputArray normals, OutputArray vertices,
+        OutputArray triangles, InputArray radii = noArray());
+
+/** @brief Computes the axis-aligned bounding box (AABB) of a point cloud.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param minBound Output minimum corner (x,y,z), 3x1 CV_32F.
+ * @param maxBound Output maximum corner (x,y,z), 3x1 CV_32F.
+ */
+CV_EXPORTS_W void boundingBox3D(InputArray inputCloud, OutputArray minBound, OutputArray maxBound);
+
+/** @brief Computes a PCA-based oriented bounding box (OBB) of a point cloud.
+ *
+ * The box axes are the principal axes of the cloud (covariance eigenvectors). This is the common
+ * practical OBB (as in Open3D); it is not guaranteed to be the minimum-volume OBB.
+ * A point p is inside the box iff `abs(axes * (p - center))` is `<= halfExtents` component-wise.
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param center Output box center (x,y,z), 3x1 CV_32F.
+ * @param axes Output 3x3 CV_32F; each row is a unit box axis.
+ * @param halfExtents Output half-size along each axis, 3x1 CV_32F.
+ */
+CV_EXPORTS_W void orientedBoundingBox3D(InputArray inputCloud, OutputArray center, OutputArray axes,
+        OutputArray halfExtents);
+
+/** @brief Computes an approximate minimum enclosing sphere of a point cloud (Ritter's algorithm).
+ *
+ * @param inputCloud Input point cloud, 3-channel float array (CV_32FC3), or an Nx3 / 3xN CV_32F matrix.
+ * @param center Output sphere center (x,y,z), 3x1 CV_32F.
+ * @return Sphere radius, or 0 if the cloud is empty.
+ */
+CV_EXPORTS_W double approxEnclosingSphere3D(InputArray inputCloud, OutputArray center);
+
+/** @brief Column layout of a decoded 3D Gaussian Splatting scene.
+ *
+ * A decoded scene is a CV_32F matrix with one row per Gaussian and #GAUSSIAN_SPLAT_STRIDE columns.
+ */
+enum GaussianSplatLayout
+{
+    GAUSSIAN_SPLAT_STRIDE = 13, //!< Floats per Gaussian, i.e. the width of a decoded scene.
+    GAUSSIAN_SPLAT_POS    = 0,  //!< First column of the position, 3 floats: x, y, z.
+    GAUSSIAN_SPLAT_COV    = 3,  //!< First column of the covariance upper triangle, 6 floats: xx, xy, xz, yy, yz, zz.
+    GAUSSIAN_SPLAT_RGB    = 9,  //!< First column of the color, 3 floats in [0, 1].
+    GAUSSIAN_SPLAT_ALPHA  = 12  //!< Column of the opacity, 1 float in [0, 1].
+};
+
+/** @brief Returns the PLY vertex property names cv::loadGaussianSplats reads by default.
+ *
+ * The order of the names is the column order cv::decodeGaussianSplats expects. Pass a renamed copy
+ * of this list to cv::loadGaussianSplats to read a scene whose exporter spells the properties
+ * differently, keeping the same order.
+ */
+CV_EXPORTS_W std::vector<String> getGaussianSplatPlyPropNames();
+
+/** @brief Decodes 3D Gaussian Splatting attributes into a renderable scene.
+ *
+ * Scales are exponentiated, opacity is put through a sigmoid, the quaternion and scales are
+ * combined into a 3D covariance, and the zeroth order harmonic is evaluated to an RGB color.
+ *
+ * Use this when the attributes do not come from a file cv::loadGaussianSplats can open, for
+ * instance when they are held in memory, arrive from a training run, or are read from a resource
+ * on a platform without filesystem access.
+ *
+ * @param attributes CV_32F matrix with one row per Gaussian and one column per name of
+ * cv::getGaussianSplatPlyPropNames, in that order.
+ * @param splats Decoded scene, see #GaussianSplatLayout.
+ */
+CV_EXPORTS_W void decodeGaussianSplats(InputArray attributes, OutputArray splats);
+
+/** @brief Decodes the contents of a `.splat` file into a renderable scene.
+ *
+ * A `.splat` file is a headerless array of 32 byte records, one per Gaussian, holding position,
+ * scale, color and rotation. The values are already activated, so only the covariance is built.
+ * Being headerless makes this the in memory counterpart of cv::loadGaussianSplats for platforms
+ * without filesystem access, or for scenes shipped as application resources.
+ *
+ * @param buf CV_8U buffer holding the bytes of a `.splat` file.
+ * @param splats Decoded scene, see #GaussianSplatLayout.
+ */
+CV_EXPORTS_W void decodeGaussianSplatsPacked(InputArray buf, OutputArray splats);
+
+/** @brief Loads a 3D Gaussian Splatting scene from a PLY or `.splat` file.
+ *
+ * Requires a trained scene, i.e. a PLY whose vertices carry `f_dc_0..2`, `opacity`, `scale_0..2`
+ * and `rot_0..3` alongside `x`, `y`, `z`, or a `.splat` file of 32 byte records. Higher order
+ * `f_rest_*` harmonics are ignored.
+ *
+ * The attributes are decoded on load, see cv::decodeGaussianSplats and
+ * cv::decodeGaussianSplatsPacked.
+ *
+ * @param filename Name of the file, the format is chosen from its extension.
+ * @param splats Decoded scene in the layout cv::viz3d::showGaussianSplats expects, see
+ * #GaussianSplatLayout, or empty on failure.
+ * @param ply_properties Vertex property names to read from a PLY file, in the column order of
+ * cv::getGaussianSplatPlyPropNames. Empty selects that default list. Unused for `.splat` files.
+ */
+CV_EXPORTS_W void loadGaussianSplats(const String &filename, OutputArray splats,
+                                     const std::vector<String> &ply_properties = std::vector<String>());
+
+/** @brief Loads a mesh from a file.
+ *
+ * The function loads mesh from the specified file and returns it.
+ * If the mesh cannot be read, throws an error
+ * Vertex attributes (i.e. space and texture coodinates, normals and colors) are returned in same-sized
+ * arrays with corresponding elements having the same indices.
+ * This means that if a face uses a vertex with a normal or a texture coordinate with different indices
+ * (which is typical for OBJ files for example), this vertex will be duplicated for each face it uses.
+ *
+ * Currently, the following file formats are supported:
+ * -  [Wavefront obj file *.obj](https://en.wikipedia.org/wiki/Wavefront_.obj_file) (ONLY TRIANGULATED FACES)
+ * -  [Polygon File Format *.ply](https://en.wikipedia.org/wiki/PLY_(file_format))
+ * @param filename Name of the file
+ * @param vertices vertex coordinates, each value contains 3 floats
+ * @param indices per-face list of vertices, each value is a vector of ints
+ * @param normals per-vertex normals, each value contains 3 floats
+ * @param colors per-vertex colors, each value contains 3 floats
+ * @param texCoords per-vertex texture coordinates, each value contains 2 or 3 floats
+ */
+CV_EXPORTS_W void loadMesh(const String &filename, OutputArray vertices, OutputArrayOfArrays indices,
+                           OutputArray normals = noArray(), OutputArray colors = noArray(),
+                           OutputArray texCoords = noArray());
+
+/** @brief Saves a mesh to a specified file.
+ *
+ * The function saves mesh to the specified file.
+ * File format is chosen based on the filename extension.
+ *
+ * @param filename Name of the file.
+ * @param vertices vertex coordinates, each value contains 3 floats
+ * @param indices per-face list of vertices, each value is a vector of ints
+ * @param normals per-vertex normals, each value contains 3 floats
+ * @param colors per-vertex colors, each value contains 3 floats
+ * @param texCoords per-vertex texture coordinates, each value contains 2 or 3 floats
+ */
+CV_EXPORTS_W void saveMesh(const String &filename, InputArray vertices, InputArrayOfArrays indices,
+                           InputArray normals = noArray(), InputArray colors = noArray(), InputArray texCoords = noArray());
+
+
+//! Triangle fill settings
+enum TriangleShadingType
+{
+    RASTERIZE_SHADING_WHITE  = 0, //!< a white color is used for the whole triangle
+    RASTERIZE_SHADING_FLAT   = 1, //!< a color of 1st vertex of each triangle is used
+    RASTERIZE_SHADING_SHADED = 2  //!< a color is interpolated between 3 vertices with perspective correction
+};
+
+//! Face culling settings: what faces are drawn after face culling
+enum TriangleCullingMode
+{
+    RASTERIZE_CULLING_NONE = 0, //!< all faces are drawn, no culling is actually performed
+    RASTERIZE_CULLING_CW   = 1, //!< triangles which vertices are given in clockwork order are drawn
+    RASTERIZE_CULLING_CCW  = 2  //!< triangles which vertices are given in counterclockwork order are drawn
+};
+
+//! GL compatibility settings
+enum TriangleGlCompatibleMode
+{
+    RASTERIZE_COMPAT_DISABLED = 0, //!< Color and depth have their natural values and converted to internal formats if needed
+    RASTERIZE_COMPAT_INVDEPTH = 1  //!< Color is natural, Depth is transformed from [-zNear; -zFar] to [0; 1]
+    //!< by the following formula: \f$ \frac{z_{far} \left(z + z_{near}\right)}{z \left(z_{far} - z_{near}\right)} \f$ \n
+    //!< In this mode the input/output depthBuf is considered to be in this format,
+    //!< therefore it's faster since there're no conversions performed
+};
+
+/**
+ * @brief Structure to keep settings for rasterization
+ */
+struct CV_EXPORTS_W_SIMPLE TriangleRasterizeSettings
+{
+    TriangleRasterizeSettings();
+
+    CV_WRAP TriangleRasterizeSettings& setShadingType(TriangleShadingType st) { shadingType = st; return *this; }
+    CV_WRAP TriangleRasterizeSettings& setCullingMode(TriangleCullingMode cm) { cullingMode = cm; return *this; }
+    CV_WRAP TriangleRasterizeSettings& setGlCompatibleMode(TriangleGlCompatibleMode gm) { glCompatibleMode = gm; return *this; }
+
+    TriangleShadingType shadingType;
+    TriangleCullingMode cullingMode;
+    TriangleGlCompatibleMode glCompatibleMode;
+};
+
+
+/** @brief Renders a set of triangles on a depth and color image
+ *
+ * Triangles can be drawn white (1.0, 1.0, 1.0), flat-shaded or with a color interpolation between vertices.
+ * In flat-shaded mode the 1st vertex color of each triangle is used to fill the whole triangle.
+ *
+ * The world2cam is an inverted camera pose matrix in fact. It transforms vertices from world to
+ * camera coordinate system.
+ *
+ * The camera coordinate system emulates the OpenGL's coordinate system having coordinate origin in a screen center,
+ * X axis pointing right, Y axis pointing up and Z axis pointing towards the viewer
+ * except that image is vertically flipped after the render.
+ * This means that all visible objects are placed in z-negative area, or exactly in -zNear > z > -zFar since
+ * zNear and zFar are positive.
+ * For example, at fovY = PI/2 the point (0, 1, -1) will be projected to (width/2, 0) screen point,
+ * (1, 0, -1) to (width/2 + height/2, height/2). Increasing fovY makes projection smaller and vice versa.
+ *
+ * The function does not create or clear output images before the rendering. This means that it can be used
+ * for drawing over an existing image or for rendering a model into a 3D scene using pre-filled Z-buffer.
+ *
+ * Empty scene results in a depth buffer filled by the maximum value since every pixel is infinitely far from the camera.
+ * Therefore, before rendering anything from scratch the depthBuf should be filled by zFar values (or by ones in INVDEPTH mode).
+ *
+ * There are special versions of this function named triangleRasterizeDepth and triangleRasterizeColor
+ * for cases if a user needs a color image or a depth image alone; they may run slightly faster.
+ *
+ * @param vertices vertices coordinates array. Should contain values of CV_32FC3 type or a compatible one (e.g. cv::Vec3f, etc.)
+ * @param indices triangle vertices index array, 3 per triangle. Each index indicates a vertex in a vertices array.
+ * Should contain CV_32SC3 values or compatible
+ * @param colors per-vertex colors of CV_32FC3 type or compatible. Can be empty or the same size as vertices array.
+ * If the values are out of [0; 1] range, the result correctness is not guaranteed
+ * @param colorBuf an array representing the final rendered image. Should containt CV_32FC3 values and be the same size as depthBuf.
+ * Not cleared before rendering, i.e. the content is reused as there is some pre-rendered scene.
+ * @param depthBuf an array of floats containing resulting Z buffer. Should contain float values and be the same size as colorBuf.
+ * Not cleared before rendering, i.e. the content is reused as there is some pre-rendered scene.
+ * Empty scene corresponds to all values set to zFar (or to 1.0 in INVDEPTH mode)
+ * @param world2cam a 4x3 or 4x4 float or double matrix containing inverted (sic!) camera pose
+ * @param fovY field of view in vertical direction, given in radians
+ * @param zNear minimum Z value to render, everything closer is clipped
+ * @param zFar maximum Z value to render, everything farther is clipped
+ * @param settings see TriangleRasterizeSettings. By default the smooth shading is on,
+ * with CW culling and with disabled GL compatibility
+ */
+CV_EXPORTS_W void triangleRasterize(InputArray vertices, InputArray indices, InputArray colors,
+                                    InputOutputArray colorBuf, InputOutputArray depthBuf,
+                                    InputArray world2cam, double fovY, double zNear, double zFar,
+                                    const TriangleRasterizeSettings& settings = TriangleRasterizeSettings());
+
+/** @brief Overloaded version of triangleRasterize() with depth-only rendering
+ *
+ * @param vertices vertices coordinates array. Should contain values of CV_32FC3 type or a compatible one (e.g. cv::Vec3f, etc.)
+ * @param indices triangle vertices index array, 3 per triangle. Each index indicates a vertex in a vertices array.
+ * Should contain CV_32SC3 values or compatible
+ * @param depthBuf an array of floats containing resulting Z buffer. Should contain float values and be the same size as colorBuf.
+ * Not cleared before rendering, i.e. the content is reused as there is some pre-rendered scene.
+ * Empty scene corresponds to all values set to zFar (or to 1.0 in INVDEPTH mode)
+ * @param world2cam a 4x3 or 4x4 float or double matrix containing inverted (sic!) camera pose
+ * @param fovY field of view in vertical direction, given in radians
+ * @param zNear minimum Z value to render, everything closer is clipped
+ * @param zFar maximum Z value to render, everything farther is clipped
+ * @param settings see TriangleRasterizeSettings. By default the smooth shading is on,
+ * with CW culling and with disabled GL compatibility
+ */
+CV_EXPORTS_W void triangleRasterizeDepth(InputArray vertices, InputArray indices, InputOutputArray depthBuf,
+                                         InputArray world2cam, double fovY, double zNear, double zFar,
+                                         const TriangleRasterizeSettings& settings = TriangleRasterizeSettings());
+
+/** @brief Overloaded version of triangleRasterize() with color-only rendering
+ *
+ * @param vertices vertices coordinates array. Should contain values of CV_32FC3 type or a compatible one (e.g. cv::Vec3f, etc.)
+ * @param indices triangle vertices index array, 3 per triangle. Each index indicates a vertex in a vertices array.
+ * Should contain CV_32SC3 values or compatible
+ * @param colors per-vertex colors of CV_32FC3 type or compatible. Can be empty or the same size as vertices array.
+ * If the values are out of [0; 1] range, the result correctness is not guaranteed
+ * @param colorBuf an array representing the final rendered image. Should containt CV_32FC3 values and be the same size as depthBuf.
+ * Not cleared before rendering, i.e. the content is reused as there is some pre-rendered scene.
+ * @param world2cam a 4x3 or 4x4 float or double matrix containing inverted (sic!) camera pose
+ * @param fovY field of view in vertical direction, given in radians
+ * @param zNear minimum Z value to render, everything closer is clipped
+ * @param zFar maximum Z value to render, everything farther is clipped
+ * @param settings see TriangleRasterizeSettings. By default the smooth shading is on,
+ * with CW culling and with disabled GL compatibility
+ */
+CV_EXPORTS_W void triangleRasterizeColor(InputArray vertices, InputArray indices, InputArray colors, InputOutputArray colorBuf,
+                                         InputArray world2cam, double fovY, double zNear, double zFar,
+                                         const TriangleRasterizeSettings& settings = TriangleRasterizeSettings());
+
+/** @brief Octree for 3D vision.
+ *
+ * In 3D vision filed, the Octree is used to process and accelerate the pointcloud data. The class Octree represents
+ * the Octree data structure. Each Octree will have a fixed depth. The depth of Octree refers to the distance from
+ * the root node to the leaf node.All OctreeNodes will not exceed this depth.Increasing the depth will increase
+ * the amount of calculation exponentially. And the small number of depth refers low resolution of Octree.
+ * Each node contains 8 children, which are used to divide the space cube into eight parts. Each octree node represents
+ * a cube. And these eight children will have a fixed order, the order is described as follows:
+ *
+ * For illustration, assume,
+ *
+ * rootNode: origin == (0, 0, 0), size == 2
+ *
+ * Then,
+ *
+ * children[0]: origin == (0, 0, 0), size == 1
+ *
+ * children[1]: origin == (1, 0, 0), size == 1, along X-axis next to child 0
+ *
+ * children[2]: origin == (0, 1, 0), size == 1, along Y-axis next to child 0
+ *
+ * children[3]: origin == (1, 1, 0), size == 1, in X-Y plane
+ *
+ * children[4]: origin == (0, 0, 1), size == 1, along Z-axis next to child 0
+ *
+ * children[5]: origin == (1, 0, 1), size == 1, in X-Z plane
+ *
+ * children[6]: origin == (0, 1, 1), size == 1, in Y-Z plane
+ *
+ * children[7]: origin == (1, 1, 1), size == 1, furthest from child 0
+ */
+
+class CV_EXPORTS_W Octree
+{
+public:
+    //! Default constructor.
+    Octree();
+
+    /** @overload
+     * @brief Creates an empty Octree with given maximum depth
+     *
+     * @param maxDepth The max depth of the Octree
+     * @param size bounding box size for the Octree
+     * @param origin Initial center coordinate
+     * @param withColors Whether to keep per-point colors or not
+     * @return resulting Octree
+     */
+    CV_WRAP static Ptr<Octree> createWithDepth(int maxDepth, double size, const Point3f& origin = { }, bool withColors = false);
+
+    /** @overload
+     * @brief Create an Octree from the PointCloud data with the specific maxDepth
+     *
+     * @param maxDepth Max depth of the octree
+     * @param pointCloud point cloud data, should be 3-channel float array
+     * @param colors color attribute of point cloud in the same 3-channel float format
+     * @return resulting Octree
+     */
+    CV_WRAP static Ptr<Octree> createWithDepth(int maxDepth, InputArray pointCloud, InputArray colors = noArray());
+
+    /** @overload
+     * @brief Creates an empty Octree with given resolution
+     *
+     * @param resolution The size of the octree leaf node
+     * @param size bounding box size for the Octree
+     * @param origin Initial center coordinate
+     * @param withColors Whether to keep per-point colors or not
+     * @return resulting Octree
+     */
+    CV_WRAP static Ptr<Octree> createWithResolution(double resolution, double size, const Point3f& origin = { }, bool withColors = false);
+
+    /** @overload
+     * @brief Create an Octree from the PointCloud data with the specific resolution
+     *
+     * @param resolution The size of the octree leaf node
+     * @param pointCloud point cloud data, should be 3-channel float array
+     * @param colors color attribute of point cloud in the same 3-channel float format
+     * @return resulting octree
+     */
+    CV_WRAP static Ptr<Octree> createWithResolution(double resolution, InputArray pointCloud, InputArray colors = noArray());
+
+    //! Default destructor
+    ~Octree();
+
+    /** @overload
+     * @brief Insert a point data with color to a OctreeNode.
+     *
+     * @param point The point data in Point3f format.
+     * @param color The color attribute of point in Point3f format.
+     * @return Returns whether the insertion is successful.
+     */
+    CV_WRAP bool insertPoint(const Point3f& point, const Point3f& color = { });
+
+    /** @brief Determine whether the point is within the space range of the specific cube.
+     *
+     * @param point The point coordinates.
+     * @return If point is in bound, return ture. Otherwise, false.
+     */
+    CV_WRAP bool isPointInBound(const Point3f& point) const;
+
+    //! returns true if the rootnode is NULL.
+    CV_WRAP bool empty() const;
+
+    /** @brief Reset all octree parameter.
+     *
+     *  Clear all the nodes of the octree and initialize the parameters.
+     */
+    CV_WRAP void clear();
+
+    /** @brief Delete a given point from the Octree.
+     *
+     * Delete the corresponding element from the pointList in the corresponding leaf node. If the leaf node
+     * does not contain other points after deletion, this node will be deleted. In the same way,
+     * its parent node may also be deleted if its last child is deleted.
+     * @param point The point coordinates, comparison is epsilon-based
+     * @return return ture if the point is deleted successfully.
+     */
+    CV_WRAP bool deletePoint(const Point3f& point);
+
+    /** @brief restore point cloud data from Octree.
+     *
+     * Restore the point cloud data from existing octree. The points in same leaf node will be seen as the same point.
+     * This point is the center of the leaf node. If the resolution is small, it will work as a downSampling function.
+     * @param restoredPointCloud The output point cloud data, can be replaced by noArray() if not needed
+     * @param restoredColor The color attribute of point cloud data, can be omitted if not needed
+     */
+    CV_WRAP void getPointCloudByOctree(OutputArray restoredPointCloud, OutputArray restoredColor = noArray());
+
+    /** @brief Radius Nearest Neighbor Search in Octree.
+     *
+     * Search all points that are less than or equal to radius.
+     * And return the number of searched points.
+     * @param query Query point.
+     * @param radius Retrieved radius value.
+     * @param points Point output. Contains searched points in 3-float format, and output vector is not in order,
+     * can be replaced by noArray() if not needed
+     * @param squareDists Dist output. Contains searched squared distance in floats, and output vector is not in order,
+     * can be omitted if not needed
+     * @return the number of searched points.
+     */
+    CV_WRAP int radiusNNSearch(const Point3f& query, float radius, OutputArray points, OutputArray squareDists = noArray()) const;
+
+    /** @overload
+     *  @brief Radius Nearest Neighbor Search in Octree.
+     *
+     * Search all points that are less than or equal to radius.
+     * And return the number of searched points.
+     * @param query Query point.
+     * @param radius Retrieved radius value.
+     * @param points Point output. Contains searched points in 3-float format, and output vector is not in order,
+     * can be replaced by noArray() if not needed
+     * @param colors Color output. Contains colors corresponding to points in pointSet, can be replaced by noArray() if not needed
+     * @param squareDists Dist output. Contains searched squared distance in floats, and output vector is not in order,
+     * can be replaced by noArray() if not needed
+     * @return the number of searched points.
+     */
+    CV_WRAP int radiusNNSearch(const Point3f& query, float radius, OutputArray points, OutputArray colors, OutputArray squareDists) const;
+
+    /** @brief K Nearest Neighbor Search in Octree.
+     *
+     * Find the K nearest neighbors to the query point.
+     * @param query Query point.
+     * @param K amount of nearest neighbors to find
+     * @param points Point output. Contains K points in 3-float format, arranged in order of distance from near to far,
+     * can be replaced by noArray() if not needed
+     * @param squareDists Dist output. Contains K squared distance in floats, arranged in order of distance from near to far,
+     * can be omitted if not needed
+     */
+    CV_WRAP void KNNSearch(const Point3f& query, const int K, OutputArray points, OutputArray squareDists = noArray()) const;
+
+    /** @overload
+     *  @brief K Nearest Neighbor Search in Octree.
+     *
+     * Find the K nearest neighbors to the query point.
+     * @param query Query point.
+     * @param K amount of nearest neighbors to find
+     * @param points Point output. Contains K points in 3-float format, arranged in order of distance from near to far,
+     * can be replaced by noArray() if not needed
+     * @param colors Color output. Contains colors corresponding to points in pointSet, can be replaced by noArray() if not needed
+     * @param squareDists Dist output. Contains K squared distance in floats, arranged in order of distance from near to far,
+     * can be replaced by noArray() if not needed
+     */
+    CV_WRAP void KNNSearch(const Point3f& query, const int K, OutputArray points, OutputArray colors, OutputArray squareDists) const;
+
+protected:
+    struct Impl;
+    Ptr<Impl> p;
+};
+
+} // namespace cv
+
+//! @} ptcloud
+
+#endif

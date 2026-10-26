@@ -361,13 +361,13 @@ shared_ptr<ContourScanner_> ContourScanner_::create(ContourPointsStorage::storag
     scanner->ctable.fill(-1);
     scanner->approx_method2 = scanner->approx_method1 = method;
     if (method == CHAIN_APPROX_TC89_L1 || method == CHAIN_APPROX_TC89_KCOS)
-        scanner->approx_method1 = CV_CHAIN_CODE;
+        scanner->approx_method1 = CHAIN_CODE;
     return scanner;
 }
 
 CNode& ContourScanner_::makeContour(schar& nbd_, const bool is_hole, const int x, const int y)
 {
-    const bool isChain = (this->approx_method1 == CV_CHAIN_CODE);  // TODO: get rid of old constant
+    const bool isChain = (this->approx_method1 == CHAIN_CODE);  // TODO: get rid of old constant
     const bool isDirect = (this->approx_method1 == CHAIN_APPROX_NONE);
 
     const Point start_pt(x - (is_hole ? 1 : 0), y);

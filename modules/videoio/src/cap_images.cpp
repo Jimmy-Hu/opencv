@@ -141,7 +141,7 @@ double CvCapture_Images::getProperty(int id) const
     {
     case cv::CAP_PROP_POS_MSEC:
         CV_WARN("collections of images don't have framerates");
-        return 0;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_POS_FRAMES:
         return currentframe;
     case cv::CAP_PROP_FRAME_COUNT:
@@ -154,12 +154,12 @@ double CvCapture_Images::getProperty(int id) const
         return frame.rows;
     case cv::CAP_PROP_FPS:
         CV_WARN("collections of images don't have framerates");
-        return 1;
+        return CAP_PROP_UNKNOWN;
     case cv::CAP_PROP_FOURCC:
         CV_WARN("collections of images don't have 4-character codes");
-        return 0;
+        return CAP_PROP_UNKNOWN;
     }
-    return 0;
+    return CAP_PROP_UNKNOWN;
 }
 
 bool CvCapture_Images::setProperty(int id, double value)
@@ -383,10 +383,10 @@ public:
     void close();
 
     ~CvVideoWriter_Images() CV_OVERRIDE { close(); }
-    double getProperty(int) const CV_OVERRIDE { return 0; }
+    double getProperty(int) const CV_OVERRIDE { return VIDEOWRITER_PROP_UNKNOWN; }
     bool setProperty( int, double ) CV_OVERRIDE; // FIXIT doesn't work: IVideoWriter interface only!
     bool isOpened() const CV_OVERRIDE { return !filename_pattern.empty(); }
-    void write( InputArray ) CV_OVERRIDE;
+    bool write( InputArray ) CV_OVERRIDE;
     int getCaptureDomain() const CV_OVERRIDE { return cv::CAP_IMAGES; }
 protected:
     std::string filename_pattern;
@@ -394,15 +394,16 @@ protected:
     std::vector<int> params;
 };
 
-void CvVideoWriter_Images::write(InputArray image)
+bool CvVideoWriter_Images::write(InputArray image)
 {
     CV_Assert(!filename_pattern.empty());
     cv::String filename = cv::format(filename_pattern.c_str(), (int)currentframe);
     CV_Assert(!filename.empty());
 
     cv::Mat img = image.getMat();
-    cv::imwrite(filename, img);
+    const bool ok = cv::imwrite(filename, img);
     currentframe++;
+    return ok;
 }
 
 void CvVideoWriter_Images::close()

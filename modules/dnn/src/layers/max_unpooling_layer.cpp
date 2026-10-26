@@ -12,7 +12,6 @@ Implementation of Batch Normalization layer.
 #include "../precomp.hpp"
 #include "layers_common.hpp"
 #include "../op_cuda.hpp"
-#include "../op_halide.hpp"
 #include "../ie_ngraph.hpp"
 #include <opencv2/dnn/shape_utils.hpp>
 #include <opencv2/core/utils/logger.hpp>
@@ -42,8 +41,7 @@ public:
     {
         return backendId == DNN_BACKEND_OPENCV ||
                backendId == DNN_BACKEND_CUDA ||
-               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH ||
-               (backendId == DNN_BACKEND_HALIDE && haveHalide() && !poolPad.width && !poolPad.height);
+               backendId == DNN_BACKEND_INFERENCE_ENGINE_NGRAPH;
     }
 
     bool getMemoryShapes(const std::vector<MatShape> &inputs,
@@ -70,16 +68,23 @@ public:
         return false;
     }
 
+    virtual void getTypes(const std::vector<MatType>& inputs,
+        const int requiredOutputs,
+        const int requiredInternals,
+        std::vector<MatType>& outputs,
+        std::vector<MatType>& internals) const CV_OVERRIDE
+    {
+        CV_CheckGE(inputs.size(), (size_t)2, "");
+        CV_CheckType(inputs[0], inputs[0] == CV_32F || inputs[0] == CV_64F || inputs[0] == CV_16F || inputs[0] == CV_32S || inputs[0] == CV_64S || inputs[0] == CV_8S || inputs[0] == CV_8U, "");
+        CV_CheckType(inputs[1], inputs[1] == CV_64S || inputs[1] == CV_32S, "");
+        outputs.assign(1, inputs[0]);
+    }
+
+
     void forward(InputArrayOfArrays inputs_arr, OutputArrayOfArrays outputs_arr, OutputArrayOfArrays internals_arr) CV_OVERRIDE
     {
         CV_TRACE_FUNCTION();
         CV_TRACE_ARG_VALUE(name, "name", name.c_str());
-
-        if (inputs_arr.depth() == CV_16F)
-        {
-            forward_fallback(inputs_arr, outputs_arr, internals_arr);
-            return;
-        }
 
         std::vector<Mat> inputs, outputs;
         inputs_arr.getMatVector(inputs);
@@ -89,6 +94,48 @@ public:
         Mat& input = inputs[0];
         Mat& indices = inputs[1];
 
+        if (indices.depth() == CV_32S)
+            typeDispatch<int32_t>(input.type(), input, indices, outputs);
+        else if (indices.depth() == CV_64S)
+            typeDispatch<int64_t>(input.type(), input, indices, outputs);
+        else
+            CV_Error(cv::Error::BadDepth, "Unsupported type.");
+    }
+
+    template<typename T_INDEX, typename... Args>
+    inline void typeDispatch(const int type, Args&&... args)
+    {
+        switch (type)
+        {
+            case CV_8S:
+                run<int8_t, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            case CV_8U:
+                run<uint8_t, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            case CV_32S:
+                run<int32_t, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            case CV_64S:
+                run<int64_t, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            case CV_32F:
+                run<float, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            case CV_64F:
+                run<double, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            case CV_16F:
+                run<int16_t, T_INDEX>(std::forward<Args>(args)...);
+                break;
+            default:
+                CV_Error(cv::Error::BadDepth, "Unsupported type.");
+        };
+    }
+
+    template<typename T, typename INDEX_TYPE>
+    void run(cv::Mat& input, cv::Mat& indices, std::vector<cv::Mat>& outputs)
+    {
         CV_Assert(input.total() == indices.total());
         CV_Assert(input.size[0] == 1);
         CV_Assert(input.isContinuous());
@@ -104,9 +151,9 @@ public:
             {
                 Mat outPlane = getPlane(outBlob, 0, i_c);
                 int wh_area = input.size[2]*input.size[3];
-                const float* inptr = input.ptr<float>(0, i_c);
-                const float* idxptr = indices.ptr<float>(0, i_c);
-                float* outptr = outPlane.ptr<float>();
+                const T* inptr = input.ptr<T>(0, i_c);
+                const INDEX_TYPE* idxptr = indices.ptr<INDEX_TYPE>(0, i_c);
+                T* outptr = outPlane.ptr<T>();
 
                 for(int i_wh = 0; i_wh < wh_area; i_wh++)
                 {
@@ -114,8 +161,8 @@ public:
                     if (!(0 <= index && index < outPlaneTotal))
                     {
                         CV_LOG_ERROR(NULL, cv::format(
-                            "i_n=%d\ni_c=%d\ni_wh=%d\nindex=%d\nmaxval=%lf\noutPlaneTotal=%d\n",
-                            i_n, i_c, i_wh, index, inptr[i_wh], outPlaneTotal));
+                            "i_n=%d\ni_c=%d\ni_wh=%d\nindex=%d\noutPlaneTotal=%d\n",
+                            i_n, i_c, i_wh, index, outPlaneTotal));
                         CV_LOG_ERROR(NULL, "input.size=" << input.size);
                         CV_LOG_ERROR(NULL, "indices.size=" << indices.size);
                         CV_LOG_ERROR(NULL, "outBlob=" << outBlob.size);
@@ -126,6 +173,7 @@ public:
             }
         }
     }
+
 
 #ifdef HAVE_CUDA
     Ptr<BackendNode> initCUDA(
@@ -152,37 +200,18 @@ public:
         pads_begin[0] = poolPad.height;
         pads_begin[1] = poolPad.width;
 
-        return make_cuda_node<cuda4dnn::MaxUnpoolingOp>(preferableTarget, std::move(context->stream), config);
-    }
-#endif
+        int indicesType = inputs[1]->getHostMatDepth();
+        CV_CheckType(indicesType, indicesType == CV_32S || indicesType == CV_64S, "Unsupported indices type");
 
-    virtual Ptr<BackendNode> initHalide(const std::vector<Ptr<BackendWrapper> > &input) CV_OVERRIDE
-    {
-#ifdef HAVE_HALIDE
-        // Meaningless operation if false because if kernel > stride
-        // it is not deterministic and if kernel < stride we just
-        // skip a part of input data (you'd better change your model).
-        if (poolKernel.width != poolStride.width ||
-            poolKernel.height != poolStride.height)
-            CV_Error(cv::Error::StsNotImplemented,
-                     "Halide backend for maximum unpooling "
-                     "is not support cases when kernel != stride");
+        if (indicesType == CV_32S)
+            return make_cuda_node_with_indices<cuda4dnn::MaxUnpoolingOp, int32_t>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), config);
+        else if (indicesType == CV_64S)
+            return make_cuda_node_with_indices<cuda4dnn::MaxUnpoolingOp, int64_t>(preferableTarget, inputs[0]->getHostMatDepth(), std::move(context->stream), config);
 
-        Halide::Var x("x"), y("y"), c("c"), n("n");
-        Halide::Func top = (name.empty() ? Halide::Func() : Halide::Func(name));
-        Halide::Buffer<float> inputBuffer = halideBuffer(input[0]);
-        Halide::Buffer<float> indices = halideBuffer(input[1]);
-
-        Halide::Expr pooledX = x / poolKernel.width;
-        Halide::Expr pooledY = y / poolKernel.height;
-
-        const int outW = inputBuffer.width() * poolKernel.width;
-        top(x, y, c, n) = select(y * outW + x == indices(pooledX, pooledY, c, n),
-                                 inputBuffer(pooledX, pooledY, c, n), 0.0f);
-        return Ptr<BackendNode>(new HalideBackendNode(top));
-#endif  // HAVE_HALIDE
+        CV_Error(Error::BadDepth, "Unsupported indices type");
         return Ptr<BackendNode>();
     }
+#endif
 
 #ifdef HAVE_DNN_NGRAPH
     virtual Ptr<BackendNode> initNgraph(const std::vector<Ptr<BackendWrapper> >& inputs,
@@ -195,11 +224,11 @@ public:
         std::vector<MatShape> outShapes, internals;
         for (int i = 0; i < nodes.size(); ++i) {
             std::vector<size_t> shape = nodes[i].dynamicCast<InfEngineNgraphNode>()->node.get_shape();
-            inpShapes[i] = std::vector<int>(shape.begin(), shape.end());
+            inpShapes[i] = MatShape(shape.begin(), shape.end());
         }
         getMemoryShapes(inpShapes, 1, outShapes, internals);
 
-        Mat zeros = Mat::zeros(1, total(outShapes[0]), CV_32F);
+        Mat zeros = Mat::zeros(1, (int)total(outShapes[0]), CV_32F);
         auto zeroInp = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{zeros.total()}, zeros.data);
 
         int newShape = -1;
