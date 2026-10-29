@@ -1855,6 +1855,35 @@ INSTANTIATE_TEST_CASE_P(Core_MinMaxLoc, ElemWiseTest, ::testing::Values(ElemWise
 INSTANTIATE_TEST_CASE_P(Core_reduceArgMinMax, ElemWiseTest, ::testing::Values(ElemWiseOpPtr(new reduceArgMinMaxOp)));
 INSTANTIATE_TEST_CASE_P(Core_CartToPolarToCart, ElemWiseTest, ::testing::Values(ElemWiseOpPtr(new CartToPolarToCartOp)));
 
+// reduceArgMax / reduceArgMin on CV_Bool and the fp8 depths, which ElemWiseTest does not generate.
+// Values: 1, -2, 3, 3, -2, 0, -1 (CV_Bool stores every non-zero value as 1).
+typedef testing::TestWithParam<int> ReduceArgNewTypes;
+
+TEST_P(ReduceArgNewTypes, accuracy)
+{
+    const int depth = GetParam();
+    float v[] = { 1.f, -2.f, 3.f, 3.f, -2.f, 0.f, -1.f };
+    Mat src;
+    Mat(1, 7, CV_32F, v).convertTo(src, depth);
+
+    // expected indices: first max, last max, first min, last min
+    const int bool_idx[] = { 0, 6, 5, 5 };
+    const int fp8_idx[]  = { 2, 3, 1, 4 };
+    const int* expected = depth == CV_Bool ? bool_idx : fp8_idx;
+
+    Mat idx;
+    cv::reduceArgMax(src, idx, 1);
+    EXPECT_EQ(expected[0], idx.at<int>(0));
+    cv::reduceArgMax(src, idx, 1, true);
+    EXPECT_EQ(expected[1], idx.at<int>(0));
+    cv::reduceArgMin(src, idx, 1);
+    EXPECT_EQ(expected[2], idx.at<int>(0));
+    cv::reduceArgMin(src, idx, 1, true);
+    EXPECT_EQ(expected[3], idx.at<int>(0));
+}
+
+INSTANTIATE_TEST_CASE_P(Core, ReduceArgNewTypes, testing::Values(CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ));
+
 // Mixed Type Arithmetic Operations
 
 typedef std::tuple<ElemWiseOpPtr, std::tuple<cvtest::MatDepth, cvtest::MatDepth>, int> SomeType;
@@ -4167,7 +4196,7 @@ TEST_P(MinMaxSupportedMatDepth, minMaxIdx)
 INSTANTIATE_TEST_CASE_P(
     MinMaxLoc,
     MinMaxSupportedMatDepth,
-    testing::Values(perf::MatDepth(CV_16F), CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U)
+    testing::Values(perf::MatDepth(CV_16F), CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U, CV_8F_E4M3FN, CV_8F_E4M3FNUZ)
 );
 
 typedef testing::TestWithParam<perf::MatDepth> MinMaxAccuracyNewTypes;
@@ -4189,6 +4218,8 @@ TEST_P(MinMaxAccuracyNewTypes, accuracy)
                       max_val = (double)std::numeric_limits<uint32_t>::max() - 1.0; break;
         case CV_64U:  fill_val = 1e15; min_val = 0.0; max_val = 1e18; break;
         case CV_64S:  fill_val = 0.0; min_val = -1e17; max_val = 1e17; break;
+        case CV_8F_E4M3FN:   fill_val = 1.5; min_val = -96.0; max_val = 448.0; break;
+        case CV_8F_E4M3FNUZ: fill_val = 1.5; min_val = -96.0; max_val = 240.0; break;
         default: FAIL() << "Unexpected depth " << depth;
     }
 
@@ -4205,6 +4236,8 @@ TEST_P(MinMaxAccuracyNewTypes, accuracy)
             case CV_32U:  src.at<uint32_t>(p.y, p.x) = (uint32_t)v; break;
             case CV_64U:  src.at<uint64_t>(p.y, p.x) = (uint64_t)v; break;
             case CV_64S:  src.at<int64_t>(p.y, p.x)  = (int64_t)v; break;
+            case CV_8F_E4M3FN:   src.at<cv::fp8_t>(p.y, p.x)  = cv::fp8_t((float)v); break;
+            case CV_8F_E4M3FNUZ: src.at<cv::fp8a_t>(p.y, p.x) = cv::fp8a_t((float)v); break;
             default: FAIL() << "Unexpected depth " << depth;
         }
     };
@@ -4270,6 +4303,10 @@ TEST_P(MinMaxAccuracyNewTypes, accuracy_with_mask)
         case CV_64S:
             fill_val = 0.0; masked_min = -1e10; masked_max = 1e10;
             outlier_min = -1e17; outlier_max = 1e17; break;
+        case CV_8F_E4M3FN:
+        case CV_8F_E4M3FNUZ:
+            fill_val = 1.0; masked_min = -10.0; masked_max = 10.0;
+            outlier_min = -200.0; outlier_max = 200.0; break;
         default: FAIL() << "Unexpected depth " << depth;
     }
 
@@ -4284,6 +4321,8 @@ TEST_P(MinMaxAccuracyNewTypes, accuracy_with_mask)
             case CV_32U:  src.at<uint32_t>(p.y, p.x) = (uint32_t)v; break;
             case CV_64U:  src.at<uint64_t>(p.y, p.x) = (uint64_t)v; break;
             case CV_64S:  src.at<int64_t>(p.y, p.x)  = (int64_t)v; break;
+            case CV_8F_E4M3FN:   src.at<cv::fp8_t>(p.y, p.x)  = cv::fp8_t((float)v); break;
+            case CV_8F_E4M3FNUZ: src.at<cv::fp8a_t>(p.y, p.x) = cv::fp8a_t((float)v); break;
             default: FAIL() << "Unexpected depth " << depth;
         }
     };
@@ -4315,7 +4354,7 @@ TEST_P(MinMaxAccuracyNewTypes, accuracy_with_mask)
 INSTANTIATE_TEST_CASE_P(
     MinMaxAcc,
     MinMaxAccuracyNewTypes,
-    testing::Values(CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U)
+    testing::Values(CV_16BF, CV_Bool, CV_64U, CV_64S, CV_32U, CV_8F_E4M3FN, CV_8F_E4M3FNUZ)
 );
 
 typedef testing::TestWithParam<perf::MatDepth> LUTAccuracyNewDstTypes;
