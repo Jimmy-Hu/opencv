@@ -1884,6 +1884,32 @@ TEST_P(ReduceArgNewTypes, accuracy)
 
 INSTANTIATE_TEST_CASE_P(Core, ReduceArgNewTypes, testing::Values(CV_Bool, CV_8F_E4M3FN, CV_8F_E4M3FNUZ));
 
+// bitwise_not and operator~ on CV_Bool are a logical NOT: 0 -> 1, non-zero -> 0 (not 255/254)
+TEST(Core_Bitwise, not_bool)
+{
+    Mat src(1, 67, CV_Bool);   // wide enough for the SIMD loop, odd for the scalar tail
+    for (int i = 0; i < src.cols; i++)
+        src.at<uchar>(i) = (uchar)(i % 3 == 0);
+    src.at<uchar>(3) = 255;    // a non-0/1 byte is still true, in the SIMD part...
+    src.at<uchar>(66) = 255;   // ...and in the scalar tail
+
+    Mat dst1, dst2 = ~src, dst3;
+    cv::bitwise_not(src, dst1);
+    UMat usrc = src.getUMat(ACCESS_READ), udst;
+    cv::bitwise_not(usrc, udst);
+    udst.copyTo(dst3);
+
+    ASSERT_EQ(CV_Bool, dst1.type());
+    ASSERT_EQ(CV_Bool, dst2.type());
+    ASSERT_EQ(CV_Bool, dst3.type());
+    for (int i = 0; i < src.cols; i++)
+    {
+        EXPECT_EQ(i % 3 != 0, dst1.at<uchar>(i)) << i;
+        EXPECT_EQ(i % 3 != 0, dst2.at<uchar>(i)) << i;
+        EXPECT_EQ(i % 3 != 0, dst3.at<uchar>(i)) << i;
+    }
+}
+
 // Mixed Type Arithmetic Operations
 
 typedef std::tuple<ElemWiseOpPtr, std::tuple<cvtest::MatDepth, cvtest::MatDepth>, int> SomeType;
@@ -5075,5 +5101,32 @@ TEST(Core_Arithm, addWeighted_8u_8s_uses_fp32_intermediate)
         EXPECT_EQ(0, cv::countNonZero(dst != 127));
     }
 }
+
+// patchNaNs replaces every NaN (either sign) and keeps numbers and infinities, including the 16-bit float depths
+typedef testing::TestWithParam<int> Core_PatchNaNs;
+
+TEST_P(Core_PatchNaNs, replaces_only_nans)
+{
+    const int depth = GetParam();
+    Mat src64(3, 37, CV_64F);   // 111 values: wide enough for the SIMD loop, odd for the scalar tail
+    for (int i = 0; i < (int)src64.total(); i++)
+        src64.at<double>(i) = i % 5 == 0 ? (i % 2 ? NAN : -NAN) :
+                              i % 7 == 0 ? (i % 2 ? INFINITY : -INFINITY) : i - 50.0;
+
+    Mat a;
+    src64.convertTo(a, depth);
+    cv::patchNaNs(a, 7.5);
+    ASSERT_EQ(depth, a.depth());
+
+    Mat res;
+    a.convertTo(res, CV_64F);
+    for (int i = 0; i < (int)src64.total(); i++)
+    {
+        double expected = cvIsNaN(src64.at<double>(i)) ? 7.5 : src64.at<double>(i);
+        EXPECT_EQ(expected, res.at<double>(i)) << i;
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Core_PatchNaNs, testing::Values(CV_16F, CV_16BF, CV_32F, CV_64F));
 
 }} // namespace
