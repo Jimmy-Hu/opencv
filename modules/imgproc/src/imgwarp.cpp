@@ -1553,6 +1553,10 @@ void cv::remap( InputArray _src, OutputArray _dst,
                (map1.type() == CV_32FC2 && map2.empty()) );
     CV_Assert( _map2.empty() || (_map2.size() == _map1.size()));
 
+    borderType &= ~BORDER_ISOLATED;
+    if (borderType < 0 || borderType > BORDER_TRANSPARENT)
+      CV_Error(Error::StsBadArg, "Unknown/unsupported border type");
+
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat(),
                ocl_remap(_src, _dst, _map1, _map2, interpolation, borderType, borderValue))
 
@@ -2609,6 +2613,10 @@ void cv::warpAffine( InputArray _src, OutputArray _dst,
     CV_Assert( _src.channels() <= 4 || (interpolation != INTER_LANCZOS4 &&
                                         interpolation != INTER_CUBIC) );
 
+    borderType &= ~BORDER_ISOLATED;
+    if (borderType < 0 || borderType > BORDER_TRANSPARENT)
+      CV_Error(Error::StsBadArg, "Unknown/unsupported border type");
+
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat() &&
                _src.cols() <= SHRT_MAX && _src.rows() <= SHRT_MAX,
                ocl_warpTransform_cols4(_src, _dst, _M0, dsize, flags, borderType,
@@ -3172,6 +3180,10 @@ void cv::warpPerspective( InputArray _src, OutputArray _dst, InputArray _M0,
 
     int interpolation = flags & INTER_MAX;
 
+    borderType &= ~BORDER_ISOLATED;
+    if (borderType < 0 || borderType > BORDER_TRANSPARENT)
+      CV_Error(Error::StsBadArg, "Unknown/unsupported border type");
+
     CV_OCL_RUN(_src.dims() <= 2 && _dst.isUMat() &&
                _src.cols() <= SHRT_MAX && _src.rows() <= SHRT_MAX,
                ocl_warpTransform_cols4(_src, _dst, _M0, dsize, flags, borderType, borderValue,
@@ -3278,8 +3290,11 @@ void cv::warpPolar(InputArray _src, OutputArray _dst, Size dsize,
     }
     else
     {
-        const int ANGLE_BORDER = 1;
-        cv::copyMakeBorder(_src, _dst, ANGLE_BORDER, ANGLE_BORDER, 0, 0, BORDER_WRAP);
+        // The angle is periodic, so the source is extended with wrapped rows.
+        // Their number has to cover the interpolation kernel: 2 taps for linear, 4 for cubic, 8 for Lanczos.
+        const int interpolation = flags & cv::INTER_MAX;
+        const int ANGLE_BORDER = interpolation == INTER_LANCZOS4 ? 4 : interpolation == INTER_CUBIC ? 2 : 1;
+        cv::copyMakeBorder(_src, _dst, ANGLE_BORDER, ANGLE_BORDER, 0, 0, BORDER_WRAP | BORDER_ISOLATED);
         Mat src = _dst.getMat();
         Size ssize = _dst.size();
         ssize.height -= 2 * ANGLE_BORDER;
