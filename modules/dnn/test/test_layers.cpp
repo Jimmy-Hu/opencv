@@ -5099,4 +5099,103 @@ TEST(Layer_Test_Clip, DynamicMinGreaterThanMax_Float64)
     testClipMinGreaterThanMax(CV_64F, true);
 }
 
+static Mat runOneHot(const Mat& values)
+{
+    LayerParams lp;
+    lp.type = "OneHot";
+    lp.name = "test_onehot";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    CV_Assert(layer);
+
+    std::vector<int64_t> idx = {0, 2, 1};
+    std::vector<int64_t> depth = {3};
+    std::vector<Mat> inputs{Mat(idx).reshape(1, std::vector<int>{3}),
+                            Mat(depth).reshape(1, std::vector<int>{1}),
+                            values};
+    std::vector<Mat> outputs, internals;
+    layer->forward(inputs, outputs, internals);
+    return outputs[0];
+}
+
+TEST(Layer_Test_OneHot, Int8Values)
+{
+    std::vector<int8_t> v = {-1, 1};  // off, on
+    Mat out = runOneHot(Mat(v).reshape(1, std::vector<int>{2}));
+    EXPECT_EQ((int)out.at<int8_t>(0, 0), 1);
+    EXPECT_EQ((int)out.at<int8_t>(0, 1), -1);
+}
+
+TEST(Layer_Test_OneHot, UInt16Values)
+{
+    std::vector<uint16_t> v = {0, 300};  // off, on
+    Mat out = runOneHot(Mat(v).reshape(1, std::vector<int>{2}));
+    EXPECT_EQ((int)out.at<uint16_t>(0, 0), 300);
+    EXPECT_EQ((int)out.at<uint16_t>(0, 1), 0);
+}
+
+typedef testing::TestWithParam<tuple<MatDepth, double> > Layer_Test_Clip_Unsigned;
+TEST_P(Layer_Test_Clip_Unsigned, MinOnly)
+{
+    const int depth = get<0>(GetParam());
+    const double typeMax = get<1>(GetParam());
+
+    LayerParams lp;
+    lp.type = "Clip";
+    lp.name = "test_clip";
+    lp.set("min", 2.f);  // no "max": the upper bound is the largest value of the type
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+
+    // The largest value checks that the missing max does not clip anything
+    const double inVals[]  = {0, 1, 3, typeMax};
+    const double refVals[] = {2, 2, 3, typeMax};
+    Mat input, ref;
+    Mat(1, 4, CV_64F, (void*)inVals).convertTo(input, depth);
+    Mat(1, 4, CV_64F, (void*)refVals).convertTo(ref, depth);
+
+    std::vector<Mat> inputs{input}, outputs;
+    runLayer(layer, inputs, outputs);
+
+    ASSERT_EQ(outputs.size(), (size_t)1);
+    EXPECT_EQ(depth, outputs[0].depth());
+    EXPECT_EQ(0, cvtest::norm(outputs[0], ref, NORM_INF));
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_Clip_Unsigned, Values(
+    make_tuple(CV_32U, (double)std::numeric_limits<uint32_t>::max()),
+    make_tuple(CV_64U, (double)std::numeric_limits<uint64_t>::max())
+));
+
+static void testEyeLikeUnsigned(int depth)
+{
+    LayerParams lp;
+    lp.type = "EyeLike";
+    lp.name = "testEyeLike";
+    Ptr<Layer> layer = LayerFactory::createLayerInstance("EyeLike", lp);
+    ASSERT_TRUE(layer);
+
+    std::vector<Mat> inputs(1, Mat(3, 3, depth, Scalar(0)));
+    std::vector<Mat> outputs;
+    runLayer(layer, inputs, outputs);
+
+    ASSERT_EQ(outputs.size(), 1u);
+    EXPECT_EQ(depth, outputs[0].depth());
+
+    Mat ref = Mat::eye(3, 3, CV_64F);
+    Mat out64f;
+    outputs[0].convertTo(out64f, CV_64F);
+    EXPECT_EQ(0, cvtest::norm(ref, out64f, NORM_INF));
+}
+
+TEST(Layer_Test_EyeLike, Unsigned32)
+{
+    testEyeLikeUnsigned(CV_32U);
+}
+
+TEST(Layer_Test_EyeLike, Unsigned64)
+{
+    testEyeLikeUnsigned(CV_64U);
+}
+
 }} // namespace
