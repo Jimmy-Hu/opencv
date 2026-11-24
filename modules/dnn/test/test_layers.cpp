@@ -5137,6 +5137,39 @@ TEST(Layer_Test_Clip, DynamicMinGreaterThanMax_Float64)
     testClipMinGreaterThanMax(CV_64F, true);
 }
 
+typedef testing::TestWithParam<tuple<int, MatDepth> > Layer_Test_Cast_Unsigned;
+TEST_P(Layer_Test_Cast_Unsigned, FloatTruncates)
+{
+    const int onnxType = get<0>(GetParam());
+    const int depth = get<1>(GetParam());
+
+    LayerParams lp;
+    lp.type = "Cast2";
+    lp.name = "test_cast";
+    lp.set("to", onnxType);
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance(lp.type, lp);
+    ASSERT_TRUE(layer);
+
+    // ONNX Cast truncates toward zero: 2.7 -> 2 and 5.9 -> 5, not rounded up
+    const float inVals[]   = {0.f, 1.2f, 2.7f, 5.9f};
+    const double refVals[] = {0, 1, 2, 5};
+    Mat input(1, 4, CV_32F, (void*)inVals), ref;
+    Mat(1, 4, CV_64F, (void*)refVals).convertTo(ref, depth);
+
+    std::vector<Mat> inputs{input}, outputs;
+    runLayer(layer, inputs, outputs);
+
+    ASSERT_EQ(outputs.size(), (size_t)1);
+    EXPECT_EQ(depth, outputs[0].depth());
+    EXPECT_EQ(0, cvtest::norm(outputs[0], ref, NORM_INF));
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_Cast_Unsigned, Values(
+    make_tuple(12, CV_32U),  // ONNX UINT32
+    make_tuple(13, CV_64U)   // ONNX UINT64
+));
+
 static Mat runOneHot(const Mat& values)
 {
     LayerParams lp;
@@ -5235,7 +5268,6 @@ TEST(Layer_Test_EyeLike, Unsigned64)
 {
     testEyeLikeUnsigned(CV_64U);
 }
-
 
 typedef testing::TestWithParam<int> Test_Col2Im_ShapeType;
 
@@ -5682,5 +5714,85 @@ TEST(Test_Col2Im, TapRangeBoundaryAndStridedRows)
         normAssert(ref, outputs[0], cv::format("tap_range_case_%zu", caseIdx).c_str());
     }
 }
+
+static void testReduceUnsigned(int depth, const std::string& op, const std::vector<int>& axes,
+                               const Mat& input, const Mat& expectedRef)
+{
+    LayerParams lp;
+    lp.type = "Reduce2";
+    lp.name = "testReduce";
+    lp.set("reduce", op);
+    lp.set("keepdims", true);
+    if (!axes.empty())
+        lp.set("axes", DictValue::arrayInt(axes.data(), (int)axes.size()));
+
+    Ptr<Layer> layer = LayerFactory::createLayerInstance("Reduce2", lp);
+    ASSERT_TRUE(layer);
+
+    std::vector<Mat> inputs(1, input);
+    std::vector<Mat> outputs;
+    runLayer(layer, inputs, outputs);
+
+    ASSERT_EQ(outputs.size(), 1u);
+    EXPECT_EQ(depth, outputs[0].depth());
+    EXPECT_EQ(shape(expectedRef), shape(outputs[0]));
+
+    Mat ref64, out64;
+    expectedRef.convertTo(ref64, CV_64F);
+    outputs[0].convertTo(out64, CV_64F);
+    EXPECT_EQ(0, cvtest::norm(ref64, out64, NORM_INF));
+}
+
+typedef testing::TestWithParam<MatDepth> Layer_Test_Reduce_Unsigned;
+
+TEST_P(Layer_Test_Reduce_Unsigned, MaxMinSum)
+{
+    const int depth = GetParam();
+
+    // Values > 2^31 verify unsigned comparison logic (not treated as negative int32)
+    const double inVals[2][3] = {
+        {1000000000.0, 3000000000.0, 2000000000.0},
+        {4000000000.0,  500000000.0, 2500000000.0}
+    };
+    Mat input(2, 3, CV_64F, (void*)inVals);
+    input.convertTo(input, depth);
+
+    // Max along axis 0: [4000000000, 3000000000, 2500000000]
+    {
+        const double refVals[1][3] = {
+            {4000000000.0, 3000000000.0, 2500000000.0}
+        };
+        Mat ref(1, 3, CV_64F, (void*)refVals);
+        ref.convertTo(ref, depth);
+        testReduceUnsigned(depth, "MAX", {0}, input, ref);
+    }
+
+    // Min along axis 1: [[1000000000], [500000000]]
+    {
+        const double refVals[2][1] = {
+            {1000000000.0},
+            { 500000000.0}
+        };
+        Mat ref(2, 1, CV_64F, (void*)refVals);
+        ref.convertTo(ref, depth);
+        testReduceUnsigned(depth, "MIN", {1}, input, ref);
+    }
+
+    // Sum along axis 0: [5000000000, 3500000000, 4500000000]
+    if (depth == CV_64U)
+    {
+        const double refVals[1][3] = {
+            {5000000000.0, 3500000000.0, 4500000000.0}
+        };
+        Mat ref(1, 3, CV_64F, (void*)refVals);
+        ref.convertTo(ref, depth);
+        testReduceUnsigned(depth, "SUM", {0}, input, ref);
+    }
+}
+
+INSTANTIATE_TEST_CASE_P(/**/, Layer_Test_Reduce_Unsigned, Values(
+    CV_32U,
+    CV_64U
+));
 
 }} // namespace
