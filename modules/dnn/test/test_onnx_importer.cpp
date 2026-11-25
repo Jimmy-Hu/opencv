@@ -325,6 +325,12 @@ TEST_P(Test_ONNX_layers, MaxUnpool_non_square)
     testONNXModels("maxunpool_non_square", npy, 0, 0, false, false, 2);
 }
 
+// Opset 20 removed DFT's axis attribute; with no axis input, the axis defaults to -2.
+TEST_P(Test_ONNX_layers, DFT_opset20_default_axis)
+{
+    testONNXModels("dft_opset20_default_axis", npy, 0, 0, false, false);
+}
+
 TEST_P(Test_ONNX_layers, Convolution)
 {
     testONNXModels("convolution");
@@ -4121,7 +4127,7 @@ TEST_P(Test_ONNX_layers, getUnconnectedOutLayers)
     if (engine_forced == cv::dnn::ENGINE_ORT)
         applyTestTag(CV_TEST_TAG_DNN_SKIP_PARSER);
 
-    Net net = readNetFromONNX(_tf("models/yolov8x.onnx", false));
+    Net net = readNetFromONNX(_tf("models/yolov8n.onnx", false));
     ASSERT_FALSE(net.empty());
     net.setPreferableBackend(backend);
     net.setPreferableTarget(target);
