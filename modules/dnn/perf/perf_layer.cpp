@@ -480,151 +480,6 @@ PERF_TEST_P_(Layer_LayerNorm, LayerNorm_Large)
     test_layer({1, 512, 768});
 }
 
-struct Layer_LayerNormExpanded : public TestBaseWithParam<tuple<Backend, Target> >
-{
-    void test_layer(const std::vector<int>& x_shape)
-    {
-        int backendId = get<0>(GetParam());
-        int targetId = get<1>(GetParam());
-
-        Mat x(x_shape, CV_32FC1);
-        Mat scale(1, x_shape.back(), CV_32FC1); // transpose to pass shape check
-        Mat b(1, x_shape.back(), CV_32FC1);     // transpose to pass shape check
-
-        randu(x, 0.f, 1.f);
-        randu(scale, 0.f, 1.f);
-        randu(b, 0.f, 1.f);
-
-        // sub graph structure:
-        //   -> ReduceMean ->     -> Pow(2) -> ReduceMean -> Add(epsilon) -> Sqrt ->
-        // x                  Sub                                                    Div -> Mul(scale) -> Add(bias)
-        //   --------------->     ------------------------------------------------->
-
-        Net net;
-
-        LayerParams lp_rm;
-        lp_rm.type = "Reduce";
-        lp_rm.name = "reducemean1";
-        lp_rm.set("reduce", "AVE");
-        std::vector<int> deleteDims(1, x_shape.back());
-        lp_rm.set("deleted_dims", DictValue::arrayInt(&deleteDims[0], deleteDims.size()));
-        std::vector<int> targetDims(x_shape.begin(), x_shape.end());
-        targetDims[x_shape.size() - 1] = 1;
-        lp_rm.set("target_dims", DictValue::arrayInt(&targetDims[0], targetDims.size()));
-        int id_rm = net.addLayerToPrev(lp_rm.name, lp_rm.type, lp_rm);
-        net.connect(0, 0, id_rm, 0);
-
-        LayerParams lp_sub;
-        lp_sub.type = "NaryEltwise";
-        lp_sub.name = "sub1";
-        lp_sub.set("operation", "sub");
-        int id_sub = net.addLayer(lp_sub.name, lp_sub.type, lp_sub);
-        net.connect(0, 0, id_sub, 0);
-        net.connect(id_rm, 0, id_sub, 1);
-
-        Mat pow_const(1, 1, CV_32FC1);
-        pow_const.at<float>(0) = 2.f;
-        LayerParams lp_pow_const;
-        lp_pow_const.type = "Const";
-        lp_pow_const.name = "const1";
-        lp_pow_const.blobs.push_back(pow_const);
-        int id_pow_const = net.addLayer(lp_pow_const.name, lp_pow_const.type, lp_pow_const);
-        LayerParams lp_pow;
-        lp_pow.type = "NaryEltwise";
-        lp_pow.name = "pow1";
-        lp_pow.set("operation", "pow");
-        int id_pow = net.addLayer(lp_pow.name, lp_pow.type, lp_pow);
-        net.connect(id_sub, 0, id_pow, 0);
-        net.connect(id_pow_const, 0, id_pow, 1);
-
-        LayerParams lp_rm1;
-        lp_rm1.type = "Reduce";
-        lp_rm1.name = "reducemean2";
-        lp_rm1.set("reduce", "AVE");
-        lp_rm1.set("deleted_dims", DictValue::arrayInt(&deleteDims[0], deleteDims.size()));
-        lp_rm1.set("target_dims", DictValue::arrayInt(&targetDims[0], targetDims.size()));
-        int id_rm1 = net.addLayer(lp_rm1.name, lp_rm1.type, lp_rm1);
-        net.connect(id_pow, 0, id_rm1, 0);
-
-        Mat add_const(1, 1, CV_32F);
-        add_const.at<float>(0) = 1e-5;
-        LayerParams lp_add_const;
-        lp_add_const.type = "Const";
-        lp_add_const.name = "const2";
-        lp_add_const.blobs.push_back(add_const);
-        int id_add_const = net.addLayer(lp_add_const.name, lp_add_const.type, lp_add_const);
-        LayerParams lp_add;
-        lp_add.type = "NaryEltwise";
-        lp_add.name = "add1";
-        lp_add.set("operation", "add");
-        int id_add = net.addLayer(lp_add.name, lp_add.type, lp_add);
-        net.connect(id_rm1, 0, id_add, 0);
-        net.connect(id_add_const, 0, id_add, 1);
-
-        LayerParams lp_sqrt;
-        lp_sqrt.type = "Sqrt";
-        lp_sqrt.name = "sqrt1";
-        int id_sqrt = net.addLayer(lp_sqrt.name, lp_sqrt.type, lp_sqrt);
-        net.connect(id_add, 0, id_sqrt, 0);
-
-        LayerParams lp_div;
-        lp_div.type = "NaryEltwise";
-        lp_div.name = "div1";
-        lp_div.set("operation", "div");
-        int id_div = net.addLayer(lp_div.name, lp_div.type, lp_div);
-        net.connect(id_sub, 0, id_div, 0);
-        net.connect(id_sqrt, 0, id_div, 1);
-
-        LayerParams lp_mul;
-        lp_mul.type = "NaryEltwise";
-        lp_mul.name = "mul1";
-        lp_mul.set("operation", "mul");
-        int id_mul = net.addLayer(lp_mul.name, lp_mul.type, lp_mul);
-        net.connect(id_div, 0, id_mul, 0);
-        net.connect(0, 1, id_mul, 1);
-
-        LayerParams lp_add1;
-        lp_add1.type = "NaryEltwise";
-        lp_add1.name = "add2";
-        lp_add1.set("operation", "add");
-        int id_add1 = net.addLayer(lp_add1.name, lp_add1.type, lp_add1);
-        net.connect(id_mul, 0, id_add1, 0);
-        net.connect(0, 2, id_add1, 1);
-
-        // warmup
-        {
-            std::vector<String> inpNames(3);
-            inpNames[0] = "x";
-            inpNames[1] = "scale";
-            inpNames[2] = "b";
-            net.setInputsNames(inpNames);
-            net.setInput(x, inpNames[0]);
-            net.setInput(scale, inpNames[1]);
-            net.setInput(b, inpNames[2]);
-
-            net.setPreferableBackend(backendId);
-            net.setPreferableTarget(targetId);
-            Mat out = net.forward();
-        }
-
-        TEST_CYCLE()
-        {
-            Mat res = net.forward();
-        }
-
-        SANITY_CHECK_NOTHING();
-    }
-
-    int N = 1;
-    int H = 50;
-    int W = 768;
-};
-
-PERF_TEST_P_(Layer_LayerNormExpanded, DISABLED_LayerNormExpanded)
-{
-    test_layer({N, H ,W});
-}
-
 struct Layer_GatherElements : public TestBaseWithParam<tuple<Backend, Target> >
 {
     void test_layer(const std::vector<int>& data_shape, const std::vector<int>& indices_shape, int axis = 0)
@@ -733,7 +588,7 @@ PERF_TEST_P_(Layer_InstanceNorm, InstanceNorm)
 
 struct Layer_Attention : public TestBaseWithParam<tuple<Backend, Target>> {
     void test_layer(const std::vector<int> x_shape, const std::vector<int> qkv_hidden_sizes, const int num_heads,
-                    bool const_weights = false) {
+                    bool const_weights = false, const std::vector<int>& mask_shape = std::vector<int>()) {
         int backendId = get<0>(GetParam());
         int targetId = get<1>(GetParam());
 
@@ -762,8 +617,20 @@ struct Layer_Attention : public TestBaseWithParam<tuple<Backend, Target>> {
             // Weights as blobs: packed once, then every forward() takes the prepacked path.
             lp.blobs.push_back(weight);
             lp.blobs.push_back(bias);
-            net.addLayerToPrev(lp.name, lp.type, lp);
-            net.setInput(x);
+            if (mask_shape.empty()) {
+                net.addLayerToPrev(lp.name, lp.type, lp);
+                net.setInput(x);
+            } else {
+                // Additive attention mask as the second input.
+                Mat mask(mask_shape, CV_32F);
+                randu(mask, -1.f, 1.f);
+                int id = net.addLayerToPrev(lp.name, lp.type, lp);
+                net.connect(0, 1, id, 1);
+                std::vector<std::string> input_names{"x", "mask"};
+                net.setInputsNames(input_names);
+                net.setInput(x, input_names[0]);
+                net.setInput(mask, input_names[1]);
+            }
         } else {
             int id = net.addLayerToPrev(lp.name, lp.type, lp);
             net.connect(0, 0, id, 0);
@@ -809,6 +676,22 @@ PERF_TEST_P_(Layer_Attention, LongSequence_1024) {
 
 PERF_TEST_P_(Layer_Attention, LongSequence_4096) {
     test_layer({1, 4096, 192}, {192, 192, 192}, 12, /*const_weights=*/true);
+}
+
+PERF_TEST_P_(Layer_Attention, FewHeads_197) {
+    test_layer({1, 197, 192}, {192, 192, 192}, 3, /*const_weights=*/true);
+}
+
+PERF_TEST_P_(Layer_Attention, FewHeads_1024) {
+    test_layer({1, 1024, 192}, {192, 192, 192}, 3, /*const_weights=*/true);
+}
+
+PERF_TEST_P_(Layer_Attention, Masked_197) {
+    test_layer({1, 197, 768}, {768, 768, 768}, 12, /*const_weights=*/true, {197, 197});
+}
+
+PERF_TEST_P_(Layer_Attention, Masked_1024) {
+    test_layer({1, 1024, 192}, {192, 192, 192}, 12, /*const_weights=*/true, {1, 1, 1, 1024});
 }
 
 // GroupQueryAttention runs on AttentionOnnxAi; these flags are what the ONNX importer sets.
@@ -1110,7 +993,6 @@ INSTANTIATE_TEST_CASE_P(CUDA, Layer_NaryEltwise, testing::Values(std::make_tuple
 INSTANTIATE_TEST_CASE_P(VULKAN, Layer_NaryEltwise, testing::Values(std::make_tuple(DNN_BACKEND_VKCOM, DNN_TARGET_VULKAN)));
 #endif
 INSTANTIATE_TEST_CASE_P(/**/, Layer_LayerNorm, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
-INSTANTIATE_TEST_CASE_P(/**/, Layer_LayerNormExpanded, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_GatherElements, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_InstanceNorm, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
 INSTANTIATE_TEST_CASE_P(/**/, Layer_Attention, testing::Values(std::make_tuple(DNN_BACKEND_OPENCV, DNN_TARGET_CPU)));
